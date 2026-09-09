@@ -1,0 +1,43 @@
+name: Apply Local Vision Upgrade
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/apply-local-vision-upgrade.yml'
+      - 'tools/apply_local_vision_upgrade.py'
+      - 'app/src/main/java/com/aarishkhan/aarishai/LocalVisionLocator.kt'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Apply deterministic patch
+        run: python3 tools/apply_local_vision_upgrade.py
+
+      - name: Verify markers
+        run: |
+          grep -q 'AARISH_LOCAL_VISION_FALLBACK_V1_FIELDS' app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt
+          grep -q 'AARISH_LOCAL_VISION_AI_WAIT_V1' app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt
+          grep -q 'AARISH_LOCAL_VISION_SHORT_SETTLE_V1' app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt
+
+      - name: Commit patched service
+        run: |
+          if git diff --quiet; then
+            echo 'No patch needed'
+            exit 0
+          fi
+          git config user.name 'AarishAI Upgrade Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt
+          git commit -m 'Wire local vision fallback into magnetic search'
+          git push
