@@ -1,5 +1,6 @@
 name: Apply Local Vision Upgrade
 
+# Second push intentionally triggers the already-registered one-shot patch workflow.
 on:
   push:
     branches: [ main ]
