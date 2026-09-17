@@ -84,6 +84,7 @@ class AiSidecarController(private val service: AutoActionService) {
     private var lastTargetPackage = ""
     private var rescueCallback: ((Boolean) -> Unit)? = null
     private var rescueMode = false
+    private var rescueExpectedAction = ""
     private val actionHistory = java.util.ArrayDeque<String>()
 
     // Mission-local provider health keeps AUTO from retrying a broken provider forever.
@@ -97,12 +98,33 @@ class AiSidecarController(private val service: AutoActionService) {
 
     fun isRunning(): Boolean = missionRunning || waitingForAi
 
+    private fun inferRecordedAction(gesture: RecordedGesture): String {
+        val points = gesture.points
+            .filter { !it.x.isNaN() && !it.x.isInfinite() && !it.y.isNaN() && !it.y.isInfinite() }
+            .sortedBy { it.t.coerceAtLeast(0L) }
+        if (points.isEmpty()) return "TAP"
+
+        val first = points.first()
+        var maxDx = 0f
+        var maxDy = 0f
+        for (i in 1 until points.size) {
+            maxDx = kotlin.math.max(maxDx, abs(points[i].x - first.x))
+            maxDy = kotlin.math.max(maxDy, abs(points[i].y - first.y))
+        }
+        val slop = kotlin.math.max(10f, 6f * service.resources.displayMetrics.density)
+        if (maxDx > slop || maxDy > slop) return "SCROLL"
+
+        val duration = points.maxOfOrNull { it.t.coerceAtLeast(0L) } ?: 0L
+        return if (duration >= 450L) "LONG_TAP" else "TAP"
+    }
+
     fun startMission(goal: String, provider: String = "AUTO"): Boolean {
         val clean = goal.replace(Regex("[\\u0000-\\u001F]+"), " ").trim().take(6000)
         if (clean.isBlank()) return false
         stop("restart")
         missionRunning = true
         rescueMode = false
+        rescueExpectedAction = ""
         missionGoal = clean
         providerPreference = normalizeProviderPreference(provider)
         missionStep = 0
@@ -126,11 +148,13 @@ class AiSidecarController(private val service: AutoActionService) {
             gesture.targetClass,
             gesture.targetContextText
         ).filter { it.isNotBlank() }.joinToString(" | ").take(1800)
+        rescueExpectedAction = inferRecordedAction(gesture)
 
         missionGoal = buildString {
             append("Recover one failed recorded automation step. ")
             append("The user had previously recorded a step and the local matcher could not find/execute it now. ")
-            append("Choose exactly one safe next UI action that best reproduces the recorded intent. ")
+            append("Recover using bounded steps until the recorded action can actually be reproduced. ")
+            append("Recorded action type: $rescueExpectedAction. ")
             append("Recorded target: ")
             append(target.ifBlank { "unknown target" })
         }
@@ -157,6 +181,7 @@ class AiSidecarController(private val service: AutoActionService) {
         missionRunning = false
         waitingForAi = false
         rescueMode = false
+        rescueExpectedAction = ""
         rescueCallback = null
         handler.removeCallbacksAndMessages(null)
         try { pendingRescue?.invoke(false) } catch (_: Throwable) {}
@@ -165,8 +190,10 @@ class AiSidecarController(private val service: AutoActionService) {
 
     private fun nextMissionTurn(run: Int) {
         if (!alive(run)) return
-        if (missionStep >= 40 || failureCount >= 8) {
-            finishMission(false, "retry/step limit")
+        val maxSteps = if (rescueMode) 6 else 40
+        val maxFailures = if (rescueMode) 3 else 8
+        if (missionStep >= maxSteps || failureCount >= maxFailures) {
+            if (rescueMode) finishRescue(false) else finishMission(false, "retry/step limit")
             return
         }
         captureTargetScreen(run) { state ->
@@ -216,11 +243,16 @@ class AiSidecarController(private val service: AutoActionService) {
                 }
 
                 if (command.action == "DONE") {
-                    finishMission(true, command.payload.ifBlank { "Task complete" })
+                    if (rescueMode) {
+                        failTurn(run, "Rescue must reproduce the recorded $rescueExpectedAction before DONE")
+                    } else {
+                        finishMission(true, command.payload.ifBlank { "Task complete" })
+                    }
                     return@askPhysicalAi
                 }
                 if (command.action == "FAIL") {
-                    finishMission(false, command.payload.ifBlank { "AI could not continue" })
+                    if (rescueMode) finishRescue(false)
+                    else finishMission(false, command.payload.ifBlank { "AI could not continue" })
                     return@askPhysicalAi
                 }
                 returnToTarget(run, lastTargetPackage) {
@@ -240,11 +272,12 @@ class AiSidecarController(private val service: AutoActionService) {
                             if (!verified) failureCount++ else failureCount = (failureCount - 1).coerceAtLeast(0)
                             missionStep++
                             if (rescueMode) {
-                                val cb = rescueCallback
-                                rescueCallback = null
-                                missionRunning = false
-                                rescueMode = false
-                                cb?.invoke(verified)
+                                val reproduced = verified && command.action == rescueExpectedAction
+                                when {
+                                    reproduced -> finishRescue(true)
+                                    failureCount >= 3 || missionStep >= 6 -> finishRescue(false)
+                                    else -> handler.postDelayed({ nextMissionTurn(run) }, 450L)
+                                }
                             } else {
                                 handler.postDelayed({ nextMissionTurn(run) }, 450L)
                             }
@@ -261,23 +294,30 @@ class AiSidecarController(private val service: AutoActionService) {
         lastOutcome = "FAILED: $reason"
         rememberHistory("STEP $missionStep -> $lastOutcome")
         missionStep++
-        if (rescueMode) {
-            val cb = rescueCallback
-            rescueCallback = null
-            missionRunning = false
-            rescueMode = false
-            cb?.invoke(false)
-        } else if (failureCount >= 8) {
-            finishMission(false, reason)
+        val maxFailures = if (rescueMode) 3 else 8
+        val maxSteps = if (rescueMode) 6 else 40
+        if (failureCount >= maxFailures || missionStep >= maxSteps) {
+            if (rescueMode) finishRescue(false) else finishMission(false, reason)
         } else {
             handler.postDelayed({ nextMissionTurn(run) }, 700L)
         }
+    }
+
+    private fun finishRescue(ok: Boolean) {
+        missionRunning = false
+        waitingForAi = false
+        val cb = rescueCallback
+        rescueCallback = null
+        rescueMode = false
+        rescueExpectedAction = ""
+        cb?.invoke(ok)
     }
 
     private fun finishMission(ok: Boolean, message: String) {
         missionRunning = false
         waitingForAi = false
         rescueMode = false
+        rescueExpectedAction = ""
         val cb = rescueCallback
         rescueCallback = null
         toast(if (ok) "✅ $message" else "⚠️ $message")
@@ -365,6 +405,10 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine("STEP: $missionStep")
             appendLine("CURRENT PACKAGE: ${state.packageName}")
             appendLine("LAST OUTCOME: $lastOutcome")
+            if (rescueMode) {
+                appendLine("RESCUE MODE: reproduce the recorded $rescueExpectedAction. You may use intermediate BACK, OPEN_APP, SCROLL or WAIT actions when needed.")
+                appendLine("Do NOT return DONE in rescue mode. The executor will finish rescue only after a verified $rescueExpectedAction action.")
+            }
             appendLine("RECENT ACTION HISTORY:")
             appendLine(history.ifBlank { "- none" })
             appendLine("VISIBLE ACTIONABLE ELEMENTS:")
@@ -603,9 +647,17 @@ class AiSidecarController(private val service: AutoActionService) {
         waitForTargetWindow(run, pkg, 0, callback)
     }
 
+    private fun isPackageForeground(pkg: String): Boolean = try {
+        service.windows.any { window ->
+            window.root?.packageName?.toString() == pkg && (window.isActive || window.isFocused)
+        } || service.rootInActiveWindow?.packageName?.toString() == pkg
+    } catch (_: Throwable) {
+        false
+    }
+
     private fun waitForTargetWindow(run: Int, pkg: String, attempt: Int, callback: () -> Unit) {
         if (!alive(run)) return
-        if (findRootForPackage(pkg) != null) {
+        if (isPackageForeground(pkg)) {
             handler.postDelayed({ if (alive(run)) callback() }, 180L)
             return
         }

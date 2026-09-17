@@ -3383,16 +3383,22 @@ private fun trySmartTargetAfterShortSettle(
                     // AARISH_AI_RESCUE_ON_REPLAY_MISS_V1
                     val rescueStarted = try {
                         aiSidecarController.rescueRecordedFailure(recordedGesture) { ok ->
-                            if (ok) showTinyToast("AI rescue complete")
-                            else showTinyToast("AI rescue failed")
-                            finishOnce()
+                            if (ok) {
+                                showTinyToast("AI rescue complete")
+                                finishOnce()
+                            } else {
+                                showTinyToast("AI rescue failed — playback stopped")
+                                finishOnce()
+                                if (isSamePlaybackRun(runId)) stopPlaybackInternal(showToast = false)
+                            }
                         }
                     } catch (_: Throwable) {
                         false
                     }
                     if (!rescueStarted) {
-                        showTinyToast("Target 10s me nahi mila")
+                        showTinyToast("Target nahi mila — playback stopped")
                         finishOnce()
+                        if (isSamePlaybackRun(runId)) stopPlaybackInternal(showToast = false)
                     }
                     return
                 }
