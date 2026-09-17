@@ -30,9 +30,46 @@ class FloatingControlService : Service() {
         // Android 14 specialUse foreground-service type = 0x40000000.
         // Literal rakha hai taaki compileSdk mismatch par ServiceInfo constant unresolved na ho.
         private const val FGS_TYPE_SPECIAL_USE_COMPAT = 0x40000000
+
+        // AARISH_AI_CLEAN_CAPTURE_V1: Android 11-13 screenshots include overlay chrome.
+        // Hide only our visual chrome for the tiny capture window; touch/recording state is untouched.
+        fun setAiScreenshotChromeHidden(hidden: Boolean) {
+            instance?.applyAiScreenshotChromeHidden(hidden)
+        }
     }
 
     fun isRecordingActive(): Boolean = isRecording
+
+    // AARISH_AI_CLEAN_CAPTURE_V1_OVERLAY
+    private var aiCapturePanelAlpha: Float? = null
+    private var aiCaptureMemoryPopupAlpha: Float? = null
+    private var aiCaptureMemoryStripAlpha: Float? = null
+
+    private fun applyAiScreenshotChromeHidden(hidden: Boolean) {
+        fun applyNow() {
+            if (hidden) {
+                if (aiCapturePanelAlpha == null) aiCapturePanelAlpha = panelView?.alpha
+                if (aiCaptureMemoryPopupAlpha == null) aiCaptureMemoryPopupAlpha = memoryPopupView?.alpha
+                if (aiCaptureMemoryStripAlpha == null) aiCaptureMemoryStripAlpha = memoryStrip?.alpha
+                try { panelView?.alpha = 0f } catch (_: Throwable) {}
+                try { memoryPopupView?.alpha = 0f } catch (_: Throwable) {}
+                try { memoryStrip?.alpha = 0f } catch (_: Throwable) {}
+            } else {
+                try { panelView?.alpha = aiCapturePanelAlpha ?: 1f } catch (_: Throwable) {}
+                try { memoryPopupView?.alpha = aiCaptureMemoryPopupAlpha ?: 1f } catch (_: Throwable) {}
+                try { memoryStrip?.alpha = aiCaptureMemoryStripAlpha ?: 1f } catch (_: Throwable) {}
+                aiCapturePanelAlpha = null
+                aiCaptureMemoryPopupAlpha = null
+                aiCaptureMemoryStripAlpha = null
+            }
+        }
+
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            applyNow()
+        } else {
+            handler.post { applyNow() }
+        }
+    }
 
 
     // AARISH_MEMORY_SCOPE_FIX_V2_MEMBER_HELPERS
