@@ -1,4 +1,4 @@
-name: Clean target screenshot hardening
+name: Semantic-first direct AI handoff hardening
 
 on:
   push:
@@ -36,15 +36,17 @@ jobs:
           git reset --hard origin/main
           echo "BASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Apply clean capture patch
+      - name: Apply semantic-first direct handoff patch
         run: python3 .github/scripts/apply_clean_target_capture_patch.py
 
       - name: Static diff checks
         run: |
           git diff --check
           git diff --stat
-          grep -n 'AARISH_AI_CAPTURE_TRANSACTION_V2' app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
-          grep -n 'AARISH_AI_TARGET_WINDOW_CROP_V1' app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
+          grep -n 'AARISH_AI_SEMANTIC_FIRST_V1' app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
+          grep -n 'AARISH_AI_CAPTURE_TRANSACTION_V3' app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
+          grep -n 'AARISH_AI_DIRECT_COMPOSER_V1' app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
+          grep -n 'AARISH_AI_DIRECT_CONTENT_HANDOFF_V1' app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
           grep -n 'AARISH_AI_CLEAN_CAPTURE_V1_OVERLAY' app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt
 
       - name: Build debug APK
@@ -65,5 +67,5 @@ jobs:
                   app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt \
                   .github/scripts/apply_clean_target_capture_patch.py \
                   .github/workflows/clean-target-capture-hardening.yml
-          git commit -m "Lock AI screenshots to the live target state [skip ci]"
+          git commit -m "Make AI handoff semantic-first and coordinate-free [skip ci]"
           git push origin HEAD:main
