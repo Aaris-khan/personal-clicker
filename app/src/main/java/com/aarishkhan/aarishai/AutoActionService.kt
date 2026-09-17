@@ -1080,6 +1080,8 @@ class AutoActionService : AccessibilityService() {
     }
 
 private fun stopPlaybackInternal(showToast: Boolean = true) {
+        // AARISH_AI_CANCEL_WITH_PLAYBACK_V2: STOP means rescue/mission callbacks must not continue stale work.
+        try { if (aiSidecarController.isRunning()) aiSidecarController.stop("stopped") } catch (_: Throwable) {}
     isPlayingInternal = false
     aarishVisionCache = null // AARISH_LOCAL_VISION_FALLBACK_V1_STOP_CLEAR
         releasePlaybackWakeLocks()

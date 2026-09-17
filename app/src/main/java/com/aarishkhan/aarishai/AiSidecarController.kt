@@ -133,12 +133,15 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     fun stop(reason: String = "stopped") {
+        // AARISH_AI_RESCUE_STOP_RELEASE_V3: stopping rescue must release playback waiter too.
+        val pendingRescue = if (rescueMode) rescueCallback else null
         generation.incrementAndGet()
         missionRunning = false
         waitingForAi = false
         rescueMode = false
         rescueCallback = null
         handler.removeCallbacksAndMessages(null)
+        try { pendingRescue?.invoke(false) } catch (_: Throwable) {}
         if (reason != "restart") toast("AI agent $reason")
     }
 
@@ -167,7 +170,10 @@ class AiSidecarController(private val service: AutoActionService) {
             askPhysicalAi(run, provider, requestId, prompt, state.screenshot) { command ->
                 if (!alive(run)) return@askPhysicalAi
                 if (command == null) {
-                    failTurn(run, "AI response parse/timeout")
+                    // AARISH_AI_NULL_RESPONSE_RETURN_V3: timeout/parse failure must not strand provider UI.
+                    returnToTarget(run, lastTargetPackage) {
+                        if (alive(run)) failTurn(run, "AI response parse/timeout")
+                    }
                     return@askPhysicalAi
                 }
                 if (command.action == "DONE") {
@@ -180,13 +186,15 @@ class AiSidecarController(private val service: AutoActionService) {
                 }
                 returnToTarget(run, lastTargetPackage) {
                     if (!alive(run)) return@returnToTarget
+                    // AARISH_AI_CLIPBOARD_PROOF_V2: action se pehle clipboard baseline lo.
+                    val clipboardBefore = readClipboard()
                     executeCommand(run, command, state) { executed, outcome ->
                         if (!alive(run)) return@executeCommand
                         if (!executed) {
                             failTurn(run, outcome)
                             return@executeCommand
                         }
-                        verifyAfterAction(run, state, command) { verified, proof ->
+                        verifyAfterAction(run, state, command, clipboardBefore) { verified, proof ->
                             if (!alive(run)) return@verifyAfterAction
                             lastOutcome = if (verified) "SUCCESS: $proof" else "UNCERTAIN: $proof"
                             if (!verified) failureCount++ else failureCount = (failureCount - 1).coerceAtLeast(0)
@@ -265,8 +273,11 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine(elements.ifBlank { "(no accessible actionable nodes)" })
             appendLine("A screenshot of this exact target state is attached when Android/provider sharing allows it.")
             appendLine("Choose ONE next action only. Prefer a listed element key over guessing coordinates.")
-            appendLine("Allowed actions: TAP an element, SET_TEXT into an editable element, BACK, WAIT milliseconds, OPEN_APP by human app name, DONE, FAIL.")
+            appendLine("Allowed actions: TAP, LONG_TAP, SET_TEXT, SCROLL (UP/DOWN), BACK, HOME, WAIT milliseconds, OPEN_APP by human app name, DONE, FAIL.")
+            appendLine("For SCROLL use an element key when a scrollable container is listed; otherwise leave element empty and put UP or DOWN in the final field.")
             appendLine("Do not perform payments, purchases, money transfers, account deletion, installs/uninstalls, or permission/security changes autonomously.")
+            // AARISH_AI_DONE_EVIDENCE_V3
+            appendLine("Use DONE only when the CURRENT visible screen/state provides evidence that the user's goal is complete; never mark DONE from assumption or an earlier screen.")
             appendLine("Reply with ONE single machine line and no prose. Construct it as: word AARIS, two colons, request identifier, two colons, action name, two colons, element key or empty, two colons, payload/expected text.")
             appendLine("For SET_TEXT put the text to type in the final field. For WAIT put milliseconds in the final field. For OPEN_APP put the app name in the final field. For DONE/FAIL put a short reason in the final field.")
         }.take(15000)
@@ -433,7 +444,7 @@ class AiSidecarController(private val service: AutoActionService) {
         val action = parts[2].trim().uppercase(Locale.US)
         val element = parts.getOrNull(3).orEmpty().trim()
         val payload = parts.getOrNull(4).orEmpty().trim()
-        if (action !in setOf("TAP", "SET_TEXT", "BACK", "WAIT", "OPEN_APP", "DONE", "FAIL")) return null
+        if (action !in setOf("TAP", "LONG_TAP", "SET_TEXT", "SCROLL", "BACK", "HOME", "WAIT", "OPEN_APP", "DONE", "FAIL")) return null
         return AiCommand(action = action, elementKey = element, payload = payload, expected = payload)
     }
 
@@ -442,14 +453,31 @@ class AiSidecarController(private val service: AutoActionService) {
         if (pkg.isBlank() || pkg == service.packageName) {
             callback(); return
         }
+
+        // AARISH_AI_RETURN_TASK_V2: existing task ko front lana first choice; launcher intent fallback.
+        var moved = false
         try {
-            val launch = service.packageManager.getLaunchIntentForPackage(pkg)
-            if (launch != null) {
-                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                service.startActivity(launch)
+            val am = service.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+            @Suppress("DEPRECATION")
+            val tasks = am?.getRecentTasks(50, android.app.ActivityManager.RECENT_IGNORE_UNAVAILABLE).orEmpty()
+            val hit = tasks.firstOrNull { info ->
+                info.baseIntent?.component?.packageName == pkg || info.origActivity?.packageName == pkg
+            }
+            if (hit != null && am != null) {
+                try { am.moveTaskToFront(hit.id, 0); moved = true } catch (_: Throwable) {}
             }
         } catch (_: Throwable) {}
-        handler.postDelayed({ if (alive(run)) callback() }, 800L)
+
+        if (!moved) {
+            try {
+                val launch = service.packageManager.getLaunchIntentForPackage(pkg)
+                if (launch != null) {
+                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    service.startActivity(launch)
+                }
+            } catch (_: Throwable) {}
+        }
+        handler.postDelayed({ if (alive(run)) callback() }, if (moved) 500L else 850L)
     }
 
     private fun executeCommand(run: Int, command: AiCommand, state: ScreenState, callback: (Boolean, String) -> Unit) {
@@ -460,13 +488,15 @@ class AiSidecarController(private val service: AutoActionService) {
             return
         }
         when (command.action) {
+            // AARISH_AI_RICH_ACTIONS_V2
             "BACK" -> callback(service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK), "Back")
+            "HOME" -> callback(service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME), "Home")
             "WAIT" -> {
                 val ms = command.payload.filter { it.isDigit() }.toLongOrNull()?.coerceIn(250L, 15_000L) ?: 1000L
                 handler.postDelayed({ if (alive(run)) callback(true, "Waited ${ms}ms") }, ms)
             }
             "OPEN_APP" -> callback(openAppByLabel(command.payload), "Open app ${command.payload}")
-            "TAP", "SET_TEXT" -> {
+            "TAP", "LONG_TAP", "SET_TEXT" -> {
                 val saved = state.elements.firstOrNull { it.key.equals(command.elementKey, true) }
                 if (saved == null) {
                     callback(false, "Unknown element ${command.elementKey}")
@@ -483,23 +513,44 @@ class AiSidecarController(private val service: AutoActionService) {
                     }
                     val ok = try { live.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args) } catch (_: Throwable) { false }
                     callback(ok, "Set text ${saved.key}")
+                } else if (command.action == "LONG_TAP") {
+                    callback(longClickNode(live), "Long tapped ${saved.key}")
                 } else {
                     callback(clickNode(live), "Tapped ${saved.key}")
+                }
+            }
+            "SCROLL" -> {
+                val direction = command.payload.trim().uppercase(Locale.US)
+                val saved = state.elements.firstOrNull { it.key.equals(command.elementKey, true) }
+                val live = saved?.let { findBestLiveMatch(it) } ?: findScrollableNode()
+                if (live == null) {
+                    callback(false, "Scrollable container not found")
+                } else {
+                    val action = if (direction.contains("UP") || direction.contains("BACK"))
+                        AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                    else AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                    val ok = try { live.performAction(action) } catch (_: Throwable) { false }
+                    callback(ok, "Scrolled ${if (action == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) "UP" else "DOWN"}")
                 }
             }
             else -> callback(false, "Unsupported action")
         }
     }
 
-    private fun verifyAfterAction(run: Int, before: ScreenState, command: AiCommand, callback: (Boolean, String) -> Unit) {
+    private fun verifyAfterAction(
+        run: Int,
+        before: ScreenState,
+        command: AiCommand,
+        clipboardBefore: String,
+        callback: (Boolean, String) -> Unit
+    ) {
         if (!alive(run)) return
-        val beforeClip = readClipboard()
         val started = SystemClock.elapsedRealtime()
         fun poll(attempt: Int) {
             if (!alive(run)) return
             val now = captureStateWithoutScreenshot()
             val changed = now != null && now.fingerprint != before.fingerprint
-            val clipChanged = readClipboard().let { it.isNotBlank() && it != beforeClip }
+            val clipChanged = readClipboard().let { it.isNotBlank() && it != clipboardBefore }
             if (changed || clipChanged || command.action in setOf("WAIT", "OPEN_APP")) {
                 callback(true, when {
                     changed -> "screen state changed"
@@ -597,18 +648,42 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun findBestTargetRoot(): AccessibilityNodeInfo? {
+        // AARISH_AI_TARGET_ROOT_RANKING_V3: active/focused app windows beat incidental overlays.
         val forbidden = setOf(service.packageName, Provider.CHATGPT.packageName, Provider.GEMINI.packageName)
         return try {
-            service.windows.asSequence()
-                .mapNotNull { it.root }
-                .firstOrNull { root ->
-                    val pkg = root.packageName?.toString().orEmpty()
-                    pkg.isNotBlank() && pkg !in forbidden && !pkg.contains("inputmethod", true) && !pkg.contains("keyboard", true)
+            val screenArea = (service.resources.displayMetrics.widthPixels.toLong().coerceAtLeast(1L) *
+                service.resources.displayMetrics.heightPixels.toLong().coerceAtLeast(1L)).coerceAtLeast(1L)
+            var best: AccessibilityNodeInfo? = null
+            var bestScore = Int.MIN_VALUE
+
+            for (window in service.windows) {
+                val root = window.root ?: continue
+                val pkg = root.packageName?.toString().orEmpty()
+                if (pkg.isBlank() || pkg in forbidden || pkg.contains("inputmethod", true) || pkg.contains("keyboard", true)) continue
+
+                val b = Rect()
+                try { root.getBoundsInScreen(b) } catch (_: Throwable) {}
+                if (b.width() <= 0 || b.height() <= 0) continue
+                val area = b.width().toLong() * b.height().toLong()
+                val areaRatio = (area.toDouble() / screenArea.toDouble()).coerceIn(0.0, 1.0)
+
+                var score = (areaRatio * 3000.0).toInt()
+                if (window.isActive) score += 10000
+                if (window.isFocused) score += 12000
+                if (window.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION) score += 2500
+                score += window.layer.coerceIn(-100, 100) * 20
+                if (pkg == "com.android.systemui" && areaRatio < 0.55) score -= 9000
+
+                if (score > bestScore) {
+                    bestScore = score
+                    best = root
                 }
-                ?: service.rootInActiveWindow?.takeIf {
-                    val pkg = it.packageName?.toString().orEmpty()
-                    pkg.isNotBlank() && pkg !in forbidden
-                }
+            }
+
+            best ?: service.rootInActiveWindow?.takeIf {
+                val pkg = it.packageName?.toString().orEmpty()
+                pkg.isNotBlank() && pkg !in forbidden && !pkg.contains("inputmethod", true) && !pkg.contains("keyboard", true)
+            }
         } catch (_: Throwable) { null }
     }
 
@@ -689,6 +764,8 @@ class AiSidecarController(private val service: AutoActionService) {
             if (Regex("(^|\\W)(send|submit)(\\W|$)").containsMatchIn(label)) score += 500
             if (label.contains("arrow_up") || label.contains("send_message")) score += 360
             if (label.contains("voice") || label.contains("mic") || label.contains("attach")) score -= 260
+            // AARISH_AI_SEND_GUARD_V2: unrelated send/share controls ko composer Send se neeche rakho.
+            if (label.contains("feedback") || label.contains("share") || label.contains("send to")) score -= 420
             val b = Rect(); try { n.getBoundsInScreen(b) } catch (_: Throwable) {}
             if (!cb.isEmpty) {
                 val dx = abs(b.centerX() - cb.right)
@@ -705,7 +782,11 @@ class AiSidecarController(private val service: AutoActionService) {
         walk(root, 2500) { n ->
             if (found) return@walk
             val label = (n.text?.toString().orEmpty() + " " + n.contentDescription?.toString().orEmpty()).lowercase(Locale.US)
-            if (label.contains("stop generating") || label.contains("stop response") || label.contains("cancel response") || label.contains("interrupt response")) {
+            val exact = label.trim()
+            val clickable = try { n.isClickable } catch (_: Throwable) { false }
+            // AARISH_AI_GENERATION_DETECT_V2
+            if (label.contains("stop generating") || label.contains("stop response") || label.contains("cancel response") ||
+                label.contains("interrupt response") || (clickable && exact == "stop")) {
                 found = true
             }
         }
@@ -731,6 +812,33 @@ class AiSidecarController(private val service: AutoActionService) {
             val c = try { n.childCount } catch (_: Throwable) { 0 }
             for (i in 0 until c) try { n.getChild(i)?.let(stack::add) } catch (_: Throwable) {}
         }
+    }
+
+    private fun findScrollableNode(): AccessibilityNodeInfo? {
+        val root = findBestTargetRoot() ?: return null
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = -1
+        walk(root, 4500) { n ->
+            val scrollable = try { n.isScrollable && n.isVisibleToUser && n.isEnabled } catch (_: Throwable) { false }
+            if (!scrollable) return@walk
+            val b = Rect(); try { n.getBoundsInScreen(b) } catch (_: Throwable) {}
+            val area = b.width().coerceAtLeast(0) * b.height().coerceAtLeast(0)
+            if (area > bestArea) { bestArea = area; best = n }
+        }
+        return best
+    }
+
+    private fun longClickNode(node: AccessibilityNodeInfo): Boolean {
+        try { if (node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)) return true } catch (_: Throwable) {}
+        val b = Rect(); try { node.getBoundsInScreen(b) } catch (_: Throwable) { return false }
+        if (b.isEmpty || Build.VERSION.SDK_INT < 24) return false
+        val path = Path().apply { moveTo(b.exactCenterX(), b.exactCenterY()) }
+        return try {
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0L, 650L))
+                .build()
+            service.dispatchGesture(gesture, null, null)
+        } catch (_: Throwable) { false }
     }
 
     private fun clickNode(node: AccessibilityNodeInfo): Boolean {
