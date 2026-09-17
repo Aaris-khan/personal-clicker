@@ -34,9 +34,154 @@ jobs:
           python3 .github/ai_sidecar_integration_patch.py
           git diff --check
 
+      - name: Repair hardening patcher compatibility
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/ai_sidecar_hardening.py')
+          text = p.read_text(encoding='utf-8')
+          old_anchor = "anchor = '''    private fun stopPlaybackInternal() {\\n'''"
+          new_anchor = "anchor = '''private fun stopPlaybackInternal(showToast: Boolean = true) {\\n'''"
+          old_repl = "replacement = '''    private fun stopPlaybackInternal() {\\n"
+          new_repl = "replacement = '''private fun stopPlaybackInternal(showToast: Boolean = true) {\\n"
+          if old_anchor not in text or old_repl not in text:
+              raise SystemExit('Expected stopPlayback patcher anchor not found')
+          text = text.replace(old_anchor, new_anchor, 1).replace(old_repl, new_repl, 1)
+          p.write_text(text, encoding='utf-8')
+          PY
+
       - name: Apply AI sidecar hardening
         run: |
           python3 .github/ai_sidecar_hardening.py
+          git diff --check
+
+      - name: Apply final runtime guards
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt')
+          s = p.read_text(encoding='utf-8')
+
+          def once(old, new, label):
+              global s
+              c = s.count(old)
+              if c != 1:
+                  raise SystemExit(f'{label}: expected 1 occurrence, found {c}')
+              s = s.replace(old, new, 1)
+
+          if 'AARISH_AI_RESCUE_STOP_RELEASE_V3' not in s:
+              old = '''    fun stop(reason: String = "stopped") {
+        generation.incrementAndGet()
+        missionRunning = false
+        waitingForAi = false
+        rescueMode = false
+        rescueCallback = null
+        handler.removeCallbacksAndMessages(null)
+        if (reason != "restart") toast("AI agent $reason")
+    }
+'''
+              new = '''    fun stop(reason: String = "stopped") {
+        // AARISH_AI_RESCUE_STOP_RELEASE_V3: stopping rescue must release playback waiter too.
+        val pendingRescue = if (rescueMode) rescueCallback else null
+        generation.incrementAndGet()
+        missionRunning = false
+        waitingForAi = false
+        rescueMode = false
+        rescueCallback = null
+        handler.removeCallbacksAndMessages(null)
+        try { pendingRescue?.invoke(false) } catch (_: Throwable) {}
+        if (reason != "restart") toast("AI agent $reason")
+    }
+'''
+              once(old, new, 'rescue stop release')
+
+          if 'AARISH_AI_TARGET_ROOT_RANKING_V3' not in s:
+              old = '''    private fun findBestTargetRoot(): AccessibilityNodeInfo? {
+        val forbidden = setOf(service.packageName, Provider.CHATGPT.packageName, Provider.GEMINI.packageName)
+        return try {
+            service.windows.asSequence()
+                .mapNotNull { it.root }
+                .firstOrNull { root ->
+                    val pkg = root.packageName?.toString().orEmpty()
+                    pkg.isNotBlank() && pkg !in forbidden && !pkg.contains("inputmethod", true) && !pkg.contains("keyboard", true)
+                }
+                ?: service.rootInActiveWindow?.takeIf {
+                    val pkg = it.packageName?.toString().orEmpty()
+                    pkg.isNotBlank() && pkg !in forbidden
+                }
+        } catch (_: Throwable) { null }
+    }
+'''
+              new = '''    private fun findBestTargetRoot(): AccessibilityNodeInfo? {
+        // AARISH_AI_TARGET_ROOT_RANKING_V3: rank real active/focused app windows instead of taking first layer blindly.
+        val forbidden = setOf(service.packageName, Provider.CHATGPT.packageName, Provider.GEMINI.packageName)
+        return try {
+            val screenArea = (service.resources.displayMetrics.widthPixels.toLong().coerceAtLeast(1L) *
+                service.resources.displayMetrics.heightPixels.toLong().coerceAtLeast(1L)).coerceAtLeast(1L)
+            var best: AccessibilityNodeInfo? = null
+            var bestScore = Int.MIN_VALUE
+
+            for (window in service.windows) {
+                val root = window.root ?: continue
+                val pkg = root.packageName?.toString().orEmpty()
+                if (pkg.isBlank() || pkg in forbidden || pkg.contains("inputmethod", true) || pkg.contains("keyboard", true)) continue
+
+                val b = Rect()
+                try { root.getBoundsInScreen(b) } catch (_: Throwable) {}
+                if (b.width() <= 0 || b.height() <= 0) continue
+                val area = b.width().toLong() * b.height().toLong()
+                val areaRatio = (area.toDouble() / screenArea.toDouble()).coerceIn(0.0, 1.0)
+
+                var score = (areaRatio * 3000.0).toInt()
+                if (window.isActive) score += 10000
+                if (window.isFocused) score += 12000
+                if (window.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION) score += 2500
+                score += window.layer.coerceIn(-100, 100) * 20
+                if (pkg == "com.android.systemui" && areaRatio < 0.55) score -= 9000
+
+                if (score > bestScore) {
+                    bestScore = score
+                    best = root
+                }
+            }
+
+            best ?: service.rootInActiveWindow?.takeIf {
+                val pkg = it.packageName?.toString().orEmpty()
+                pkg.isNotBlank() && pkg !in forbidden && !pkg.contains("inputmethod", true) && !pkg.contains("keyboard", true)
+            }
+        } catch (_: Throwable) { null }
+    }
+'''
+              once(old, new, 'target root ranking')
+
+          if 'AARISH_AI_DONE_EVIDENCE_V3' not in s:
+              old = '''            appendLine("Reply with ONE single machine line and no prose. Construct it as: word AARIS, two colons, request identifier, two colons, action name, two colons, element key or empty, two colons, payload/expected text.")
+'''
+              new = '''            // AARISH_AI_DONE_EVIDENCE_V3
+            appendLine("Use DONE only when the CURRENT visible screen/state provides evidence that the user's goal is complete; never mark DONE from assumption or an earlier screen.")
+            appendLine("Reply with ONE single machine line and no prose. Construct it as: word AARIS, two colons, request identifier, two colons, action name, two colons, element key or empty, two colons, payload/expected text.")
+'''
+              once(old, new, 'done evidence')
+
+          if 'AARISH_AI_NULL_RESPONSE_RETURN_V3' not in s:
+              old = '''                if (command == null) {
+                    failTurn(run, "AI response parse/timeout")
+                    return@askPhysicalAi
+                }
+'''
+              new = '''                if (command == null) {
+                    // AARISH_AI_NULL_RESPONSE_RETURN_V3: never strand the user inside provider UI on timeout/parse failure.
+                    returnToTarget(run, lastTargetPackage) {
+                        if (alive(run)) failTurn(run, "AI response parse/timeout")
+                    }
+                    return@askPhysicalAi
+                }
+'''
+              once(old, new, 'null response return')
+
+          p.write_text(s, encoding='utf-8')
+          PY
           git diff --check
 
       - name: Compile Kotlin without APK
