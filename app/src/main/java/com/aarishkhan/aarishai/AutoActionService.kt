@@ -1408,11 +1408,11 @@ private fun aarishAiWaitForNextRecordedTarget(
         if (cached.key != aarishVisionKey(g)) return null
 
         val age = android.os.SystemClock.elapsedRealtime() - cached.atMs
-        if (age < 0L || age > 30_000L) {
+        if (age < 0L || age > 1_800L) {
             aarishVisionCache = null
             return null
         }
-        if (cached.confidence < 0.50f || !aarishVisionPackageLooksSafe(g)) {
+        if (cached.confidence < 0.72f || !aarishVisionPackageLooksSafe(g)) {
             aarishVisionCache = null
             return null
         }
@@ -4654,6 +4654,11 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
 
             val actionNode = findClickableParent(node) ?: node
 
+            val savedPackageForScore = aarishSavedPackageFromId(gesture)
+            val packageMismatchForScore = savedPackageForScore.isNotBlank() &&
+                aarishNodePackage(node) != savedPackageForScore &&
+                aarishNodePackage(actionNode) != savedPackageForScore
+
             val nodeText = safeText(node)?.trim()
             val nodeDesc = safeDesc(node)?.trim()
             val nodeId = safeId(node)?.trim()
@@ -4670,6 +4675,7 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
             val parentText = collectNodeTextLimited(safeParent(actionNode), 46, 520)
 
             var score = 0
+            if (packageMismatchForScore) score -= 180
             var primaryHits = 0
 
             val savedId = gesture.targetId?.trim()
@@ -5120,7 +5126,7 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
                 )
 
         val savedText = gesture.targetText?.trim()
-        val textOk = !savedText.isNullOrBlank() &&
+        val textOk = packageOk && !savedText.isNullOrBlank() &&
             (
                 labelsEqual(nodeText, savedText) ||
                     labelsEqual(actionText, savedText) ||
@@ -5131,7 +5137,7 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
                 )
 
         val savedDesc = gesture.targetDesc?.trim()
-        val descOk = !savedDesc.isNullOrBlank() &&
+        val descOk = packageOk && !savedDesc.isNullOrBlank() &&
             (
                 labelsEqual(nodeDesc, savedDesc) ||
                     labelsEqual(actionDesc, savedDesc) ||
@@ -5653,51 +5659,60 @@ private fun performGestureAt(
 }
 
 
+    // AARISH_PRECISION_TARGET_ENGINE_V3
     private fun getRealAppRootForPoint(tapX: Int?, tapY: Int?): AccessibilityNodeInfo? {
         val myPackage = packageName
         var bestRoot: AccessibilityNodeInfo? = null
-        var bestScore = Int.MIN_VALUE
+        var bestFocusRank = Int.MIN_VALUE
+        var bestLayer = Int.MIN_VALUE
+        var bestArea = Long.MAX_VALUE
 
         fun isBadPackage(pkg: String): Boolean {
-            return pkg == myPackage ||
-                pkg.contains("inputmethod", ignoreCase = true) ||
-                pkg.contains("keyboard", ignoreCase = true)
+            val p = pkg.lowercase(java.util.Locale.US)
+            return p.isBlank() ||
+                p == myPackage.lowercase(java.util.Locale.US) ||
+                p.contains("inputmethod") ||
+                p.contains("keyboard")
         }
 
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
             try {
                 for (window in windows) {
-val root = window.root ?: continue
-                    val pkg = root.packageName?.toString() ?: ""
-
+                    val root = try { window.root } catch (_: Throwable) { null } ?: continue
+                    val pkg = try { root.packageName?.toString().orEmpty() } catch (_: Throwable) { "" }
                     if (isBadPackage(pkg)) continue
 
                     val bounds = Rect()
-                    root.getBoundsInScreen(bounds)
+                    if (!safeBounds(root, bounds) || bounds.width() <= 0 || bounds.height() <= 0) continue
+                    if (tapX != null && tapY != null && !bounds.contains(tapX, tapY)) continue
 
-                    if (bounds.width() <= 0 || bounds.height() <= 0) continue
+                    val focused = try { window.isFocused } catch (_: Throwable) { false }
+                    val active = try { window.isActive } catch (_: Throwable) { false }
+                    val focusRank = (if (focused) 2 else 0) + (if (active) 1 else 0)
+                    val layer = try { window.layer } catch (_: Throwable) { 0 }
+                    val area = bounds.width().toLong().coerceAtLeast(1L) * bounds.height().toLong().coerceAtLeast(1L)
 
-                    if (tapX != null && tapY != null && !bounds.contains(tapX, tapY)) {
-                        continue
-                    }
+                    val better =
+                        bestRoot == null ||
+                            focusRank > bestFocusRank ||
+                            (focusRank == bestFocusRank && layer > bestLayer) ||
+                            (focusRank == bestFocusRank && layer == bestLayer && area < bestArea)
 
-                    val area = bounds.width() * bounds.height()
-                    val activeBonus = if (window.isActive || window.isFocused) 1_000_000 else 0
-                    val score = area + activeBonus
-
-                    if (score > bestScore) {
-                        bestScore = score
+                    if (better) {
                         bestRoot = root
+                        bestFocusRank = focusRank
+                        bestLayer = layer
+                        bestArea = area
                     }
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
         }
 
         if (bestRoot != null) return bestRoot
 
         val fallbackRoot = rootInActiveWindow ?: return null
-        val fallbackPkg = fallbackRoot.packageName?.toString() ?: ""
+        val fallbackPkg = try { fallbackRoot.packageName?.toString().orEmpty() } catch (_: Throwable) { "" }
         return if (isBadPackage(fallbackPkg)) null else fallbackRoot
     }
 
@@ -5756,15 +5771,24 @@ private fun captureTargetSnapshotInternal(
     val primaryText = firstClean(clickText, touchText, clickDesc, touchDesc, idTail(clickId), idTail(touchId))
     val primaryDesc = firstClean(clickDesc, touchDesc, clickText, touchText)
 
-    val aarishFilesWordPrimaryV2 = aarishFindFilesWordNearTapV2(
-        root = root,
-        touchedNode = touchedNode,
-        clickNode = clickNode,
-        tapX = x,
-        tapY = y,
-        screenW = safeW,
-        screenH = safeH
-    ) // AARISH_UNIVERSAL_FILES_WORD_RECORD_PRIMARY_V2
+    // AARISH_PRECISION_FILES_IDENTITY_V3
+    val directFilesWordPrimaryV3 =
+        aarishNodeFilesLabelV2(touchedNode) ?: aarishNodeFilesLabelV2(clickNode)
+    val aarishFilesWordPrimaryV2 = directFilesWordPrimaryV3 ?: if (
+        primaryText.isNullOrBlank() && primaryDesc.isNullOrBlank()
+    ) {
+        aarishFindFilesWordNearTapV2(
+            root = root,
+            touchedNode = touchedNode,
+            clickNode = clickNode,
+            tapX = x,
+            tapY = y,
+            screenW = safeW,
+            screenH = safeH
+        )
+    } else {
+        null
+    }
     val aarishPrimaryTextV2 = aarishFilesWordPrimaryV2 ?: primaryText
     val aarishPrimaryDescV2 = aarishFilesWordPrimaryV2 ?: primaryDesc
 
@@ -5828,6 +5852,7 @@ private fun captureTargetSnapshotInternal(
                 val node = item.first
                 val depth = item.second
 
+                if (!safeVisible(node) || !safeEnabled(node)) continue
                 val bounds = Rect()
                 if (!safeBounds(node, bounds) || !bounds.contains(x, y)) continue
 
@@ -6454,21 +6479,19 @@ val root = window.root ?: continue
     }
 
     private fun aarishFileManagerPackageV1(pkg: String?): Boolean {
-        // AARISH_FILE_MANAGER_RESCUE_V1
+        // AARISH_FILE_MANAGER_RESCUE_V3_STRICT
         val p = pkg.orEmpty().trim().lowercase(java.util.Locale.US)
         if (p.isBlank()) return false
 
-        return p.contains("documentsui") ||
-            p.contains("providers.media") ||
-            p.contains("media.module") ||
-            p.contains("permissioncontroller") ||
-            p.contains("packageinstaller") ||
-            p.contains("systemui") ||
+        return p == "com.android.documentsui" ||
+            p == "com.google.android.documentsui" ||
+            p.contains(".documentsui") ||
             p.contains("filemanager") ||
-            p.contains(".files") ||
+            p.contains("fileexplorer") ||
+            p.contains("globalfileexplorer") ||
+            p.contains(".myfiles") ||
             p.endsWith(".files") ||
-            p.contains("documents") ||
-            p.contains("storage")
+            p == "com.google.android.apps.nbu.files"
     }
 
     private fun aarishFileNodeActionCandidateV1(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
@@ -6491,40 +6514,35 @@ val root = window.root ?: continue
         runId: Int?,
         label: String = "File picker clicked"
     ): Boolean {
-        // AARISH_FILE_MANAGER_RESCUE_V1
+        // AARISH_FILE_MANAGER_RESCUE_V3_STRICT
         if (runId != null && !isSamePlaybackRun(runId)) return false
 
         val targetX = x.toInt()
         val targetY = y.toInt()
         val roots = mutableListOf<AccessibilityNodeInfo>()
 
-        try {
-            rootInActiveWindow?.let { roots.add(it) }
-        } catch (_: Throwable) {}
+        fun addFileRoot(root: AccessibilityNodeInfo?) {
+            if (root == null) return
+            val pkg = try { root.packageName?.toString() } catch (_: Throwable) { null }
+            if (!aarishFileManagerPackageV1(pkg)) return
+            val b = Rect()
+            if (safeBounds(root, b) && b.width() > 0 && b.height() > 0 && !b.contains(targetX, targetY)) return
+            if (roots.none { it === root }) roots.add(root)
+        }
+
+        try { addFileRoot(rootInActiveWindow) } catch (_: Throwable) {}
 
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
             try {
                 for (w in windows) {
-                    val root = try { w.root } catch (_: Throwable) { null }
-                    if (root != null && roots.none { it === root }) {
-                        roots.add(root)
-                    }
+                    val activeOrFocused = try { w.isActive || w.isFocused } catch (_: Throwable) { false }
+                    if (!activeOrFocused) continue
+                    addFileRoot(try { w.root } catch (_: Throwable) { null })
                 }
             } catch (_: Throwable) {}
         }
 
         if (roots.isEmpty()) return false
-
-        var fileUiFound = false
-        for (root in roots) {
-            val pkg = try { root.packageName?.toString() } catch (_: Throwable) { null }
-            if (aarishFileManagerPackageV1(pkg)) {
-                fileUiFound = true
-                break
-            }
-        }
-
-        if (!fileUiFound) return false
 
         var bestNode: AccessibilityNodeInfo? = null
         var bestArea = Int.MAX_VALUE
@@ -6533,17 +6551,10 @@ val root = window.root ?: continue
 
         fun remember(candidate: AccessibilityNodeInfo?, depth: Int) {
             if (candidate == null || !safeVisible(candidate) || !safeEnabled(candidate) || !safeClickable(candidate)) return
-
             val b = Rect()
-            if (!safeBounds(candidate, b)) return
-            if (b.width() <= 0 || b.height() <= 0) return
-
-            val area = (b.width().coerceAtLeast(1) * b.height().coerceAtLeast(1))
-            val better =
-                bestNode == null ||
-                    area < bestArea ||
-                    (area == bestArea && depth > bestDepth)
-
+            if (!safeBounds(candidate, b) || b.width() <= 0 || b.height() <= 0 || !b.contains(targetX, targetY)) return
+            val area = b.width().coerceAtLeast(1) * b.height().coerceAtLeast(1)
+            val better = bestNode == null || area < bestArea || (area == bestArea && depth > bestDepth)
             if (better) {
                 bestNode = candidate
                 bestArea = area
@@ -6555,7 +6566,6 @@ val root = window.root ?: continue
             for (root in roots) {
                 val stack = java.util.ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
                 stack.add(Pair(root, 0))
-
                 while (!stack.isEmpty() && scanned < 2600) {
                     val item = stack.removeLast()
                     val node = item.first
@@ -6563,45 +6573,35 @@ val root = window.root ?: continue
                     scanned++
 
                     val bounds = Rect()
-                    val boundsOk = safeBounds(node, bounds)
-                    val containsPoint = boundsOk &&
-                        bounds.width() > 0 &&
-                        bounds.height() > 0 &&
-                        bounds.contains(targetX, targetY)
-
-                    if (containsPoint) {
-                        remember(aarishFileNodeActionCandidateV1(node), depth)
-                    }
+                    if (!safeBounds(node, bounds) || bounds.width() <= 0 || bounds.height() <= 0 || !bounds.contains(targetX, targetY)) continue
+                    remember(aarishFileNodeActionCandidateV1(node), depth)
 
                     val count = safeChildCount(node)
-                    if (count > 0) {
-                        for (i in 0 until count) {
-                            val child = safeChild(node, i)
-                            if (child != null) {
-                                stack.add(Pair(child, depth + 1))
-                            }
-                        }
+                    for (i in count - 1 downTo 0) {
+                        val child = safeChild(node, i)
+                        if (child != null) stack.add(Pair(child, depth + 1))
                     }
                 }
             }
         } catch (_: Throwable) {}
 
         val node = bestNode ?: return false
-
         val clicked = try {
             node.performAction(AccessibilityNodeInfo.ACTION_CLICK) ||
                 node.performAction(AccessibilityNodeInfo.ACTION_SELECT)
         } catch (_: Throwable) {
             false
         }
+        if (!clicked) return false
 
-        if (clicked) {
-            try { android.util.Log.d("AarishAI_FileRescue", "Node rescue click x=$targetX y=$targetY area=$bestArea depth=$bestDepth scanned=$scanned") } catch (_: Throwable) {}
-            showTinyToast(label)
-            return true
-        }
-
-        return false
+        try {
+            android.util.Log.d(
+                "AarishAI_FileRescue",
+                "Strict file-node click x=$targetX y=$targetY area=$bestArea depth=$bestDepth scanned=$scanned"
+            )
+        } catch (_: Throwable) {}
+        showTinyToast(label)
+        return true
     }
 
     private fun aarishShowVisualClickIndicator(x: Float, y: Float) {

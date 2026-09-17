@@ -6751,6 +6751,32 @@ private fun normalizePointsForSave(points: List<GesturePoint>): List<GesturePoin
 
 
 
+    // AARISH_PRECISION_RECORDING_V3
+    private fun chooseBestRecordingSnapshotV3(
+        downSnapshot: TargetSnapshot?,
+        freshSnapshot: TargetSnapshot?
+    ): TargetSnapshot? {
+        fun score(s: TargetSnapshot?): Int {
+            if (s == null) return Int.MIN_VALUE
+            var value = 0
+            if (!s.targetId.isNullOrBlank() && !s.targetId!!.startsWith("ocr:")) value += 140
+            if (!s.targetDesc.isNullOrBlank() && s.targetDesc != "OCR_TEXT_TARGET") value += 115
+            if (!s.targetText.isNullOrBlank() && !s.targetText!!.startsWith("OCR:")) value += 105
+            if (!s.targetPackage.isNullOrBlank()) value += 80
+            if (!s.targetTreePath.isNullOrBlank() && s.targetTreePath != "OCR") value += 75
+            if (!s.targetRoleFlags.isNullOrBlank() && s.targetRoleFlags != "OCR_VISIBLE_TEXT") value += 45
+            if (!s.targetContextText.isNullOrBlank()) value += 28
+            if (!s.targetSiblingText.isNullOrBlank()) value += 18
+            if (s.targetRight > s.targetLeft && s.targetBottom > s.targetTop) value += 35
+            if (s.targetWPercent > 0f && s.targetHPercent > 0f) value += 20
+            return value
+        }
+
+        val downScore = score(downSnapshot)
+        val freshScore = score(freshSnapshot)
+        return if (freshScore >= downScore) freshSnapshot ?: downSnapshot else downSnapshot ?: freshSnapshot
+    }
+
     private fun snapshotHasUsefulIdentity(snapshot: TargetSnapshot?): Boolean {
         // AARISH_OCR_ALWAYS_PRIORITY_RECORD_V28
         // Is function ko ab OCR gate/blocker ke liye use nahi karna.
@@ -6800,6 +6826,15 @@ private fun normalizePointsForSave(points: List<GesturePoint>): List<GesturePoin
         fun realTree(v: String?): Boolean = !v.isNullOrBlank() && v != "OCR"
         fun realRole(v: String?): Boolean = !v.isNullOrBlank() && v != "OCR_VISIBLE_TEXT"
         fun realSibling(v: String?): Boolean = !v.isNullOrBlank() && !v.startsWith("ocr_bounds=")
+        fun realText(v: String?): Boolean {
+            if (v.isNullOrBlank() || v.startsWith("OCR:")) return false
+            val n = v.trim().lowercase(java.util.Locale.US)
+                .replace(Regex("[^a-z0-9\u0600-\u06FF\u0750-\u077F\u0900-\u097F]+"), " ")
+                .replace(Regex("\s+"), " ")
+                .trim()
+            if (n.length < 2) return false
+            return n !in setOf("view", "text", "button", "image", "layout", "android", "widget", "item")
+        }
         fun clean(v: String?): String? = v?.takeIf { it.isNotBlank() }
 
         val snapContext = snapshot.targetContextText.orEmpty()
@@ -6813,7 +6848,11 @@ private fun normalizePointsForSave(points: List<GesturePoint>): List<GesturePoin
         }.ifBlank { clean(snapshot.targetContextText) ?: gesture.targetContextText }
 
         return gesture.copy(
-            targetText = clean(snapshot.targetText) ?: gesture.targetText,
+            targetText = if (realId(gesture.targetId) || realDesc(gesture.targetDesc) || realText(gesture.targetText)) {
+                clean(gesture.targetText) ?: clean(snapshot.targetText)
+            } else {
+                clean(snapshot.targetText) ?: gesture.targetText
+            },
             targetContextText = mergedContext,
             targetChildText = clean(snapshot.targetChildText) ?: gesture.targetChildText,
 
@@ -6998,9 +7037,9 @@ private fun normalizePointsForSave(points: List<GesturePoint>): List<GesturePoin
         val snapshot = if (forceXyOnly) {
             null
         } else {
-            currentSnapshot ?: captureSnapshotFor(
-                firstP.x.toInt(),
-                firstP.y.toInt()
+            chooseBestRecordingSnapshotV3(
+                currentSnapshot,
+                captureSnapshotFor(firstP.x.toInt(), firstP.y.toInt())
             )
         }
 
