@@ -141,9 +141,6 @@ object LocalVisionLocator {
 
     private fun encodeScreenshot(bitmap: Bitmap): EncodedScreenshot? {
         if (bitmap.width <= 0 || bitmap.height <= 0) return null
-
-        // VLM UI localization does not need native phone resolution. Downscaling cuts
-        // prompt size, RAM pressure and vision-encoder latency considerably.
         val maxSide = max(bitmap.width, bitmap.height)
         val scale = if (maxSide > 1280) 1280f / maxSide.toFloat() else 1f
         val width = (bitmap.width * scale).toInt().coerceAtLeast(1)
@@ -235,8 +232,6 @@ Rules:
                 return true
             }
 
-            // Defensive check for alternate textual loopback addresses. DNS names that merely
-            // resolve to loopback are intentionally rejected to prevent external redirection.
             val address = InetAddress.getByName(host)
             address.isLoopbackAddress && host.all { it.isDigit() || it == '.' || it == ':' }
         } catch (_: Throwable) {
@@ -248,6 +243,7 @@ Rules:
         val connection = (URL(endpoint).openConnection() as? HttpURLConnection) ?: return null
         return try {
             connection.requestMethod = "POST"
+            connection.instanceFollowRedirects = false
             connection.connectTimeout = 1_800
             connection.readTimeout = 12_000
             connection.doInput = true
@@ -326,8 +322,6 @@ Rules:
             }
 
             if (x.isNaN() || y.isNaN()) return null
-
-            // Be forgiving if a model disobeys the prompt and emits image pixels.
             if (x > 1f && x <= imageW.toFloat()) x /= imageW.toFloat().coerceAtLeast(1f)
             if (y > 1f && y <= imageH.toFloat()) y /= imageH.toFloat().coerceAtLeast(1f)
 
