@@ -36,7 +36,9 @@ jobs:
           git reset --hard origin/main
 
       - name: Apply source patch
-        run: python3 .github/scripts/apply_ai_rescue_patch.py
+        run: |
+          python3 .github/scripts/apply_ai_rescue_patch.py
+          python3 .github/scripts/fix_ai_rescue_escape.py
 
       - name: Check diff
         run: |
@@ -54,6 +56,7 @@ jobs:
           rm -f .github/workflows/agent-button-provider-hotfix.yml
           rm -f .github/workflows/ai-recorded-evidence-rescue-hotfix.yml
           rm -f .github/scripts/apply_ai_rescue_patch.py
+          rm -f .github/scripts/fix_ai_rescue_escape.py
           git config user.name 'Aarish Automation'
           git config user.email 'actions@users.noreply.github.com'
           git add -A
