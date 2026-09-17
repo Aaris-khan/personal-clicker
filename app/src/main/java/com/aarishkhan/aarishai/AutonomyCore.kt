@@ -243,7 +243,7 @@ internal object GoalParser {
         val patterns = listOf(
             Regex("(?is)(?:message|msg|text|संदेश|मैसेज)\\s*(?:is|this|ye|यह)?\\s*[:=\\-]\\s*(.+)$"),
             Regex("(?is)(?:send|bhej(?:o)?|भेज(?:ो)?)\\s+(?:this\\s+)?(?:message|msg|text)?\\s*[:=\\-]\\s*(.+)$"),
-            Regex("(?is)(?:and|then|aur|और)?\\s*(?:send|bhej(?:o)?|भेज(?:ो)?)\\s+(?:(?:him|her|them|isko|use|उसको|उसे)\\s+)?(?:(?:a|the|this)\\s+)?(?:message|msg|text|मैसेज|संदेश)?\\s*(?:saying|that|ki|कि)?\\s+(.+)$")
+            Regex("(?is)(?:and|then|aur|और)?\\s*(?:send|bhej(?:o)?|भेज(?:ो)?)\\s+(?:(?:him|her|them|isko|use|उसको|उसे)\\s+)?(?:(?:a|the|this)\\s+)?(?:(?:message|msg|text|मैसेज|संदेश)\\s+)?(?:(?:saying|that|ki|कि)\\s+)?(.+)$")
         )
         for (pattern in patterns) {
             val hit = pattern.find(clean)?.groupValues?.getOrNull(1)?.trim().orEmpty()
