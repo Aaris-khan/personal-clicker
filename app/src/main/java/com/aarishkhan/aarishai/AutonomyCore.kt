@@ -109,11 +109,58 @@ internal object AutonomyText {
 
         val aTokens = a.split(' ').filter { it.isNotBlank() }.toSet()
         val bTokens = b.split(' ').filter { it.isNotBlank() }.toSet()
-        if (aTokens.isEmpty() || bTokens.isEmpty()) return 0f
         val common = aTokens.intersect(bTokens).size.toFloat()
-        val coverage = common / minOf(aTokens.size, bTokens.size).toFloat().coerceAtLeast(1f)
-        val union = common / aTokens.union(bTokens).size.toFloat().coerceAtLeast(1f)
-        return max(union, coverage * 0.92f).coerceIn(0f, 1f)
+        val tokenScore = if (aTokens.isEmpty() || bTokens.isEmpty()) {
+            0f
+        } else {
+            val coverage = common / minOf(aTokens.size, bTokens.size).toFloat().coerceAtLeast(1f)
+            val union = common / aTokens.union(bTokens).size.toFloat().coerceAtLeast(1f)
+            max(union, coverage * 0.92f)
+        }
+
+        val compactA = a.replace(" ", "")
+        val compactB = b.replace(" ", "")
+        val charScore = if (
+            minOf(compactA.length, compactB.length) >= 4 &&
+            maxOf(compactA.length, compactB.length) <= 80 &&
+            minOf(compactA.length, compactB.length).toFloat() / maxOf(compactA.length, compactB.length).toFloat() >= 0.55f
+        ) {
+            editSimilarity(compactA, compactB) * 0.94f
+        } else 0f
+
+        return max(tokenScore, charScore).coerceIn(0f, 1f)
+    }
+
+    fun editSimilarity(aRaw: String, bRaw: String): Float {
+        val a = normalize(aRaw).replace(" ", "").take(80)
+        val b = normalize(bRaw).replace(" ", "").take(80)
+        if (a.isEmpty() || b.isEmpty()) return 0f
+        if (a == b) return 1f
+        val distance = damerauLevenshtein(a, b)
+        return (1f - distance.toFloat() / maxOf(a.length, b.length).toFloat()).coerceIn(0f, 1f)
+    }
+
+    private fun damerauLevenshtein(a: String, b: String): Int {
+        val rows = a.length + 1
+        val cols = b.length + 1
+        val d = Array(rows) { IntArray(cols) }
+        for (i in 0 until rows) d[i][0] = i
+        for (j in 0 until cols) d[0][j] = j
+        for (i in 1 until rows) {
+            for (j in 1 until cols) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                var value = minOf(
+                    d[i - 1][j] + 1,
+                    d[i][j - 1] + 1,
+                    d[i - 1][j - 1] + cost
+                )
+                if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) {
+                    value = minOf(value, d[i - 2][j - 2] + cost)
+                }
+                d[i][j] = value
+            }
+        }
+        return d[a.length][b.length]
     }
 
     fun containsAny(raw: String, words: Collection<String>): Boolean {
@@ -146,9 +193,10 @@ internal object GoalParser {
             .toList()
 
         val mentionsSend = sendWords.any { normalized.contains(AutonomyText.normalize(it)) }
+        val mentionsOpen = openWords.any { normalized.contains(AutonomyText.normalize(it)) }
         val kind = when {
             mentionsSend -> GoalKind.SEND_MESSAGE
-            app != null && openWords.any { normalized.contains(AutonomyText.normalize(it)) } -> GoalKind.OPEN_APP
+            app != null && mentionsOpen -> GoalKind.OPEN_APP
             else -> GoalKind.GENERIC
         }
 
@@ -169,13 +217,23 @@ internal object GoalParser {
     private fun appMentionScore(normalizedGoal: String, labelRaw: String): Int {
         val label = AutonomyText.normalize(labelRaw)
         if (label.length < 2) return 0
-        return when {
-            normalizedGoal == label -> 1000
-            normalizedGoal.contains(" $label ") -> 950
-            normalizedGoal.startsWith("$label ") || normalizedGoal.endsWith(" $label") -> 900
-            normalizedGoal.contains(label) && label.length >= 4 -> 760
-            else -> 0
+        when {
+            normalizedGoal == label -> return 1000
+            normalizedGoal.contains(" $label ") -> return 950
+            normalizedGoal.startsWith("$label ") || normalizedGoal.endsWith(" $label") -> return 900
+            normalizedGoal.contains(label) && label.length >= 4 -> return 860
         }
+
+        val goalTokens = normalizedGoal.split(' ').filter { it.length >= 3 }
+        val labelTokens = label.split(' ').filter { it.length >= 3 }
+        if (goalTokens.isEmpty() || labelTokens.isEmpty()) return 0
+
+        val scores = labelTokens.map { wanted ->
+            goalTokens.maxOfOrNull { candidate -> AutonomyText.editSimilarity(wanted, candidate) } ?: 0f
+        }
+        if (scores.any { it < 0.78f }) return 0
+        val average = scores.average().toFloat()
+        return if (average >= 0.84f) (650 + average * 180f).toInt() else 0
     }
 
     private fun extractMessage(clean: String, quoted: List<String>, mentionsSend: Boolean): String {
@@ -184,15 +242,21 @@ internal object GoalParser {
 
         val patterns = listOf(
             Regex("(?is)(?:message|msg|text|संदेश|मैसेज)\\s*(?:is|this|ye|यह)?\\s*[:=\\-]\\s*(.+)$"),
-            Regex("(?is)(?:send|bhej(?:o)?|भेज(?:ो)?)\\s+(?:this\\s+)?(?:message|msg|text)?\\s*[:=\\-]\\s*(.+)$")
+            Regex("(?is)(?:send|bhej(?:o)?|भेज(?:ो)?)\\s+(?:this\\s+)?(?:message|msg|text)?\\s*[:=\\-]\\s*(.+)$"),
+            Regex("(?is)(?:and|then|aur|और)?\\s*(?:send|bhej(?:o)?|भेज(?:ो)?)\\s+(?:(?:him|her|them|isko|use|उसको|उसे)\\s+)?(?:(?:a|the|this)\\s+)?(?:message|msg|text|मैसेज|संदेश)?\\s*(?:saying|that|ki|कि)?\\s+(.+)$")
         )
         for (pattern in patterns) {
             val hit = pattern.find(clean)?.groupValues?.getOrNull(1)?.trim().orEmpty()
-            if (hit.isNotBlank()) return stripQuotes(hit).take(4000)
+            if (hit.isNotBlank() && !isOnlyMessageNoun(hit)) return stripQuotes(hit).take(4000)
         }
 
         if (quoted.size == 1) return quoted.first().take(4000)
         return ""
+    }
+
+    private fun isOnlyMessageNoun(value: String): Boolean {
+        val n = AutonomyText.normalize(value)
+        return n in setOf("message", "msg", "text", "मैसेज", "संदेश")
     }
 
     private fun extractContact(clean: String, quoted: List<String>, message: String, appLabel: String): String {
@@ -301,7 +365,6 @@ internal object LocalMissionPlanner {
             .maxByOrNull { it.second }
             ?.first
 
-        // A conversation composer is strong evidence that the desired chat is already open.
         if (composer != null) {
             val current = composer.text.trim()
             if (AutonomyText.normalize(current) != AutonomyText.normalize(goal.message)) {
