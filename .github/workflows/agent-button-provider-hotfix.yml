@@ -1,0 +1,165 @@
+name: Agent button and provider hotfix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/agent-button-provider-hotfix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Sync latest main
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+
+      - name: Patch permanent AI button and safe provider selection
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          fcs_path = Path('app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt')
+          ai_path = Path('app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt')
+
+          fcs = fcs_path.read_text(encoding='utf-8')
+          marker = '    // Future buttons yahin bottomRow me add honge. AARISH_PANEL_PERMANENT_TWO_ROWS_V13_FUTURE_SLOT'
+          if 'AARISH_AI_AGENT_BOTTOM_ROW_V1' not in fcs:
+              if marker not in fcs:
+                  raise SystemExit('bottom-row marker not found; refusing unsafe patch')
+              block = '''    // AARISH_AI_AGENT_BOTTOM_ROW_V1: permanent autonomous-agent button beside phone launcher.
+              if (::btnAgent.isInitialized) {
+                  btnAgent.text = "🤖"
+                  btnAgent.contentDescription = "Autonomous AI Mission"
+                  btnAgent.visibility = View.VISIBLE
+                  try { stylePanelButton(btnAgent, Color.rgb(124, 58, 237), Color.WHITE, 34) } catch (_: Throwable) {}
+                  addPanelChildKeepSizeV13(bottomRow, btnAgent)
+              }
+
+              // Future buttons yahin bottomRow me add honge. AARISH_PANEL_PERMANENT_TWO_ROWS_V13_FUTURE_SLOT'''
+              fcs = fcs.replace(marker, block, 1)
+          fcs_path.write_text(fcs, encoding='utf-8')
+
+          ai = ai_path.read_text(encoding='utf-8')
+
+          old_call = '            val provider = selectProvider()'
+          new_call = '            val provider = selectProvider(state.packageName)'
+          if old_call in ai:
+              ai = ai.replace(old_call, new_call, 1)
+          elif new_call not in ai:
+              raise SystemExit('provider call site not found; refusing unsafe patch')
+
+          old_null = '''            if (provider == null) {
+                finishMission(false, "ChatGPT/Gemini installed nahi mila")
+                return@captureTargetScreen
+            }'''
+          new_null = '''            if (provider == null) {
+                val targetAi = Provider.values().firstOrNull { it.packageName == state.packageName }
+                finishMission(
+                    false,
+                    if (targetAi != null) {
+                        "Target app ${targetAi.name} hai. Agent brain ke liye doosra AI install/select karo."
+                    } else {
+                        "ChatGPT/Gemini installed nahi mila"
+                    }
+                )
+                return@captureTargetScreen
+            }'''
+          if old_null in ai:
+              ai = ai.replace(old_null, new_null, 1)
+          elif 'val targetAi = Provider.values().firstOrNull { it.packageName == state.packageName }' not in ai:
+              raise SystemExit('provider-null block not found; refusing unsafe patch')
+
+          pattern = re.compile(
+              r'    private fun selectProvider\(\): Provider\? \{.*?\n    \}\n\n    private fun buildPlannerPrompt',
+              re.S,
+          )
+          replacement = '''    private fun selectProvider(targetPackage: String = ""): Provider? {
+              val installed = Provider.values().filter(::providerInstalled)
+              if (installed.isEmpty()) return null
+
+              // Never use the app currently being automated as the planner brain.
+              // Example: while automating ChatGPT, use Gemini; while automating Gemini, use ChatGPT.
+              val candidates = installed.filterNot {
+                  targetPackage.isNotBlank() && it.packageName == targetPackage
+              }
+              if (candidates.isEmpty()) return null
+
+              when (providerPreference) {
+                  "CHATGPT" -> {
+                      Provider.CHATGPT.takeIf { it in candidates }?.let { return it }
+                      // Explicit choice became unsafe because ChatGPT itself is the target.
+                      // Fall back to another installed planner instead of reopening the target app.
+                      return candidates.minByOrNull { it.ordinal }
+                  }
+                  "GEMINI" -> {
+                      Provider.GEMINI.takeIf { it in candidates }?.let { return it }
+                      // Same self-target protection for Gemini.
+                      return candidates.minByOrNull { it.ordinal }
+                  }
+              }
+
+              val now = SystemClock.elapsedRealtime()
+              val ready = candidates.filter { (providerCooldownUntil[it] ?: 0L) <= now }
+              if (ready.isNotEmpty()) {
+                  return ready.minWithOrNull(
+                      compareBy<Provider>(
+                          { providerFailureStreak[it] ?: 0 },
+                          { if (it == lastProviderAttempt) 0 else 1 },
+                          { it.ordinal }
+                      )
+                  )
+              }
+
+              return candidates.minByOrNull { providerCooldownUntil[it] ?: Long.MAX_VALUE }
+          }
+
+          private fun buildPlannerPrompt'''
+
+          if 'private fun selectProvider(targetPackage: String = "")' not in ai:
+              ai, count = pattern.subn(replacement, ai, count=1)
+              if count != 1:
+                  raise SystemExit(f'selectProvider replacement count={count}; refusing unsafe patch')
+
+          ai_path.write_text(ai, encoding='utf-8')
+
+          # Safety assertions: exactly the intended features must exist after patching.
+          fcs_check = fcs_path.read_text(encoding='utf-8')
+          ai_check = ai_path.read_text(encoding='utf-8')
+          assert 'AARISH_AI_AGENT_BOTTOM_ROW_V1' in fcs_check
+          assert 'addPanelChildKeepSizeV13(bottomRow, btnAgent)' in fcs_check
+          assert 'selectProvider(state.packageName)' in ai_check
+          assert 'filterNot {' in ai_check and 'it.packageName == targetPackage' in ai_check
+          PY
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Commit verified fix and remove temporary workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/agent-button-provider-hotfix.yml
+          git config user.name "Aarish Automation"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Show AI agent beside phone and avoid planner self-target [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
