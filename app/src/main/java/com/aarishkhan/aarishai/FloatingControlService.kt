@@ -6830,7 +6830,7 @@ private fun normalizePointsForSave(points: List<GesturePoint>): List<GesturePoin
             if (v.isNullOrBlank() || v.startsWith("OCR:")) return false
             val n = v.trim().lowercase(java.util.Locale.US)
                 .replace(Regex("[^a-z0-9\u0600-\u06FF\u0750-\u077F\u0900-\u097F]+"), " ")
-                .replace(Regex("\s+"), " ")
+                .replace(Regex("\\s+"), " ")
                 .trim()
             if (n.length < 2) return false
             return n !in setOf("view", "text", "button", "image", "layout", "android", "widget", "item")
