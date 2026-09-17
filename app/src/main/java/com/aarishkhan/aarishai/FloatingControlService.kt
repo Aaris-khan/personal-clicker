@@ -955,6 +955,15 @@ private fun ensurePanelPermanentTwoRowsV13() {
     try { stylePanelButton(btnApps, Color.rgb(37, 99, 235), Color.WHITE, 34) } catch (_: Throwable) {}
     addPanelChildKeepSizeV13(bottomRow, btnApps)
 
+    // AARISH_AI_AGENT_BOTTOM_ROW_V2: permanent autonomous-agent button immediately right of phone launcher.
+    if (::btnAgent.isInitialized) {
+        btnAgent.text = "🤖"
+        btnAgent.contentDescription = "Autonomous AI Mission"
+        btnAgent.visibility = if (!AutoActionService.isPlaying()) View.VISIBLE else View.GONE
+        try { stylePanelButton(btnAgent, Color.rgb(124, 58, 237), Color.WHITE, 34) } catch (_: Throwable) {}
+        addPanelChildKeepSizeV13(bottomRow, btnAgent)
+    }
+
     // Future buttons yahin bottomRow me add honge. AARISH_PANEL_PERMANENT_TWO_ROWS_V13_FUTURE_SLOT
 
     bottomRow.visibility = View.VISIBLE
@@ -6648,6 +6657,8 @@ class TouchCaptureView(private val owner: FloatingControlService) : android.view
     private var ocrPrefetchDownTime = 0L
     private var ocrPendingGestureIndex = -1
     private var ocrPendingGestureSerial = 0
+    // AARISH_RECORDING_EVIDENCE_V1
+    private var recordingEvidencePrefetchPath: String? = null
 
     // AARISH_ENGINE_TRACE_TEXT_TOAST_V25B
     private fun aarishTraceTextToast(msg: String) {
@@ -6990,6 +7001,7 @@ private fun normalizePointsForSave(points: List<GesturePoint>): List<GesturePoin
         val screenW = metrics.widthPixels.toFloat().coerceAtLeast(1f)
         val screenH = metrics.heightPixels.toFloat().coerceAtLeast(1f)
 
+        recordingEvidencePrefetchPath = null // AARISH_RECORDING_EVIDENCE_V1_NEW_TAP
         ocrSaveSerial++
         val serial = ocrSaveSerial
         ocrActiveSerial = serial
@@ -6999,7 +7011,7 @@ private fun normalizePointsForSave(points: List<GesturePoint>): List<GesturePoin
         ocrPendingGestureIndex = -1
         ocrPendingGestureSerial = 0
 
-        val started = AutoActionService.captureOcrTextSnapshot(x, y, screenW, screenH) { ocrSnapshot ->
+        val started = AutoActionService.captureRecordingEvidenceSnapshot(x, y, screenW, screenH) { ocrSnapshot, evidencePath ->
             ocrSaveHandler.post {
                 val isActiveTap = serial == ocrActiveSerial
                 val isPendingSavedGesture = serial == ocrPendingGestureSerial && ocrPendingGestureIndex >= 0
@@ -7008,19 +7020,21 @@ private fun normalizePointsForSave(points: List<GesturePoint>): List<GesturePoin
 
                 if (isActiveTap) {
                     ocrSavePending = false
+                    recordingEvidencePrefetchPath = evidencePath ?: recordingEvidencePrefetchPath
                     if (ocrSnapshot != null) {
                         ocrPrefetchSnapshot = ocrSnapshot
                     }
                 }
 
                 if (isPendingSavedGesture) {
-                    if (ocrSnapshot != null) {
-                        val idx = ocrPendingGestureIndex
-                        val old = recordedGestures.getOrNull(idx)
-                        if (old != null) {
-                            recordedGestures[idx] = applyOcrSnapshotToGestureV5(old, ocrSnapshot)
-                            aarishTraceTextToast(aarishTraceOcrLabel(ocrSnapshot.targetText))
-                        }
+                    val idx = ocrPendingGestureIndex
+                    val old = recordedGestures.getOrNull(idx)
+                    if (old != null) {
+                        val merged = if (ocrSnapshot != null) applyOcrSnapshotToGestureV5(old, ocrSnapshot) else old
+                        recordedGestures[idx] = merged.copy(
+                            recordingEvidencePath = evidencePath ?: merged.recordingEvidencePath
+                        )
+                        if (ocrSnapshot != null) aarishTraceTextToast(aarishTraceOcrLabel(ocrSnapshot.targetText))
                     }
                     clearOcrPendingGestureV5(serial)
                 }
@@ -7157,7 +7171,8 @@ private fun normalizePointsForSave(points: List<GesturePoint>): List<GesturePoin
             insideXPercent = snapshot?.insideXPercent ?: 0.5f,
             insideYPercent = snapshot?.insideYPercent ?: 0.5f,
             recordedScreenW = snapshot?.recordedScreenW ?: metrics.widthPixels,
-            recordedScreenH = snapshot?.recordedScreenH ?: metrics.heightPixels
+            recordedScreenH = snapshot?.recordedScreenH ?: metrics.heightPixels,
+            recordingEvidencePath = if (forceXyOnly) null else recordingEvidencePrefetchPath
         )
 
         // AARISH_OCR_NON_BLOCKING_RECORD_V5_FINAL_GESTURE
@@ -7169,6 +7184,7 @@ private fun normalizePointsForSave(points: List<GesturePoint>): List<GesturePoin
         }
         recordedGestures.add(finalGesture)
         if (!forceXyOnly) rememberPendingOcrForLastSavedGestureV5(finalGesture)
+        recordingEvidencePrefetchPath = null // AARISH_RECORDING_EVIDENCE_V1_AFTER_SAVE
 
         // Tap, double tap, swipe, long press sab raw gesture ke form me live replay hoga.
         owner.triggerLiveReplaySafe(finalGesture)

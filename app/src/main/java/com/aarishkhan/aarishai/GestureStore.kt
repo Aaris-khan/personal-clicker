@@ -60,6 +60,7 @@ data class RecordedGesture(
     val insideYPercent: Float = 0.5f,
     val recordedScreenW: Int = 0,
     val recordedScreenH: Int = 0,
+    val recordingEvidencePath: String? = null,
 )
 
 object GestureStore {
@@ -297,6 +298,7 @@ object GestureStore {
             gestureObject.put("insideYPercent", cleanPercent(gesture.insideYPercent, 0.5f).toDouble())
             gestureObject.put("recordedScreenW", gesture.recordedScreenW.coerceAtLeast(0))
             gestureObject.put("recordedScreenH", gesture.recordedScreenH.coerceAtLeast(0))
+            gestureObject.put("recordingEvidencePath", gesture.recordingEvidencePath.orEmpty())
 
             val pointsArray = JSONArray()
             // AARISH_POINT_TIME_NORMALIZE_V1: imported/edited gestures me first point ka t > 0 ho
@@ -383,7 +385,8 @@ object GestureStore {
                         insideXPercent = cleanPercent(gestureObject.optDouble("insideXPercent", 0.5).toFloat(), 0.5f),
                         insideYPercent = cleanPercent(gestureObject.optDouble("insideYPercent", 0.5).toFloat(), 0.5f),
                         recordedScreenW = gestureObject.optInt("recordedScreenW", 0).coerceAtLeast(0),
-                        recordedScreenH = gestureObject.optInt("recordedScreenH", 0).coerceAtLeast(0)
+                        recordedScreenH = gestureObject.optInt("recordedScreenH", 0).coerceAtLeast(0),
+                        recordingEvidencePath = cleanOpt(gestureObject, "recordingEvidencePath")
                     )
                 )
             }

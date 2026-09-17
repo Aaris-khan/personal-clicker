@@ -87,6 +87,8 @@ class AiSidecarController(private val service: AutoActionService) {
     private var rescueCallback: ((Boolean) -> Unit)? = null
     private var rescueMode = false
     private var rescueExpectedAction = ""
+    // AARISH_AI_RESCUE_EVIDENCE_V2
+    private var rescueEvidenceSteps: List<RecordedGesture> = emptyList()
     private val actionHistory = java.util.ArrayDeque<String>()
 
     // Mission-local provider health keeps AUTO from retrying a broken provider forever.
@@ -127,6 +129,7 @@ class AiSidecarController(private val service: AutoActionService) {
         missionRunning = true
         rescueMode = false
         rescueExpectedAction = ""
+        rescueEvidenceSteps = emptyList() // AARISH_AI_RESCUE_EVIDENCE_V2_START_CLEAR
         missionGoal = clean
         providerPreference = normalizeProviderPreference(provider)
         missionStep = 0
@@ -141,7 +144,11 @@ class AiSidecarController(private val service: AutoActionService) {
         return true
     }
 
-    fun rescueRecordedFailure(gesture: RecordedGesture, callback: (Boolean) -> Unit): Boolean {
+    fun rescueRecordedFailure(
+        gesture: RecordedGesture,
+        contextSteps: List<RecordedGesture> = emptyList(),
+        callback: (Boolean) -> Unit
+    ): Boolean {
         if (isRunning()) return false
         val target = listOfNotNull(
             gesture.targetText,
@@ -151,6 +158,21 @@ class AiSidecarController(private val service: AutoActionService) {
             gesture.targetContextText
         ).filter { it.isNotBlank() }.joinToString(" | ").take(1800)
         rescueExpectedAction = inferRecordedAction(gesture)
+        rescueEvidenceSteps = (contextSteps + gesture)
+            .distinctBy { g ->
+                listOf(g.delayFromStart.toString(), g.targetId.orEmpty(), g.targetText.orEmpty(), g.targetDesc.orEmpty()).joinToString("|")
+            }
+            .takeLast(4)
+        val recordedContextSummary = rescueEvidenceSteps.mapIndexed { index, g ->
+            val action = inferRecordedAction(g)
+            val label = listOfNotNull(g.targetText, g.targetDesc, g.targetId?.substringAfterLast('/'))
+                .filter { it.isNotBlank() }
+                .distinct()
+                .joinToString(" / ")
+                .take(220)
+            val ctx = g.targetContextText.orEmpty().replace(Regex("\\s+"), " ").trim().take(220)
+            "Recorded context ${index + 1}: action=$action package=${g.targetPackage.orEmpty()} target=${label.ifBlank { "unknown" }} x=${g.xPercent} y=${g.yPercent} context=$ctx"
+        }.joinToString(" || ")
 
         missionGoal = buildString {
             append("Recover one failed recorded automation step. ")
@@ -159,6 +181,9 @@ class AiSidecarController(private val service: AutoActionService) {
             append("Recorded action type: $rescueExpectedAction. ")
             append("Recorded target: ")
             append(target.ifBlank { "unknown target" })
+            append(". AARISH_AI_RESCUE_CONTEXT_SUMMARY_V2: ")
+            append(recordedContextSummary.take(3200))
+            append(". The attached rescue evidence may show prior RECORDED steps with marked click points plus the CURRENT screen. Recover ONLY the missing recorded step; do not repeat already-completed steps.")
         }
         providerPreference = "AUTO"
         missionStep = 0
@@ -205,14 +230,19 @@ class AiSidecarController(private val service: AutoActionService) {
                 return@captureTargetScreen
             }
             lastTargetPackage = state.packageName
-            val provider = selectProvider()
+            val provider = selectProvider(state.packageName)
             if (provider == null) {
-                finishMission(false, "ChatGPT/Gemini installed nahi mila")
+                val targetAi = Provider.values().firstOrNull { it.packageName == state.packageName }
+                finishMission(
+                    false,
+                    if (targetAi != null) "Target app ${targetAi.name} hai; agent brain ke liye doosra AI install/select karo" else "ChatGPT/Gemini installed nahi mila"
+                )
                 return@captureTargetScreen
             }
             val requestId = "A${System.currentTimeMillis().toString(36)}${missionStep.toString(36)}"
             val prompt = buildPlannerPrompt(requestId, state)
-            askPhysicalAi(run, provider, requestId, prompt, state.screenshot) { command ->
+            val aiAttachment = if (rescueMode) buildRescueEvidenceAttachment(state.screenshot) else state.screenshot
+            askPhysicalAi(run, provider, requestId, prompt, aiAttachment) { command ->
                 if (!alive(run)) return@askPhysicalAi
                 if (command == null) {
                     markProviderFailure(provider, "open/send/response failure")
@@ -370,17 +400,23 @@ class AiSidecarController(private val service: AutoActionService) {
         lastProviderAttempt = provider
     }
 
-    private fun selectProvider(): Provider? {
+    private fun selectProvider(targetPackage: String = ""): Provider? {
         val installed = Provider.values().filter(::providerInstalled)
         if (installed.isEmpty()) return null
 
+        // AARISH_PROVIDER_SELF_TARGET_GUARD_V2
+        val candidates = installed.filterNot {
+            targetPackage.isNotBlank() && it.packageName == targetPackage
+        }
+        if (candidates.isEmpty()) return null
+
         when (providerPreference) {
-            "CHATGPT" -> return Provider.CHATGPT.takeIf(::providerInstalled)
-            "GEMINI" -> return Provider.GEMINI.takeIf(::providerInstalled)
+            "CHATGPT" -> Provider.CHATGPT.takeIf { it in candidates }?.let { return it }
+            "GEMINI" -> Provider.GEMINI.takeIf { it in candidates }?.let { return it }
         }
 
         val now = SystemClock.elapsedRealtime()
-        val ready = installed.filter { (providerCooldownUntil[it] ?: 0L) <= now }
+        val ready = candidates.filter { (providerCooldownUntil[it] ?: 0L) <= now }
         if (ready.isNotEmpty()) {
             return ready.minWithOrNull(
                 compareBy<Provider>(
@@ -390,8 +426,7 @@ class AiSidecarController(private val service: AutoActionService) {
                 )
             )
         }
-
-        return installed.minByOrNull { providerCooldownUntil[it] ?: Long.MAX_VALUE }
+        return candidates.minByOrNull { providerCooldownUntil[it] ?: Long.MAX_VALUE }
     }
 
     private fun buildPlannerPrompt(requestId: String, state: ScreenState): String {
@@ -410,7 +445,7 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine("CURRENT PACKAGE: ${state.packageName}")
             appendLine("LAST OUTCOME: $lastOutcome")
             if (rescueMode) {
-                appendLine("RESCUE MODE: reproduce the recorded $rescueExpectedAction. You may use intermediate BACK, OPEN_APP, SCROLL or WAIT actions when needed.")
+                appendLine("RESCUE MODE: reproduce the recorded $rescueExpectedAction. You may use intermediate BACK, OPEN_APP, SCROLL (including LEFT/RIGHT) or WAIT actions when needed.")
                 appendLine("Do NOT return DONE in rescue mode. The executor will finish rescue only after a verified $rescueExpectedAction action.")
             }
             appendLine("RECENT ACTION HISTORY:")
@@ -422,7 +457,7 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine("A screenshot of this exact target state is attached when Android/provider sharing allows it.")
             appendLine("Clickable/editable candidates in the screenshot are visually marked with their E-number (E1, E2, ...). Use those markers plus the element list to ground your choice.")
             appendLine("Choose ONE next action only. Prefer a listed element key over guessing coordinates.")
-            appendLine("Allowed actions: TAP, TAP_XY, LONG_TAP, SET_TEXT, SCROLL (UP/DOWN), BACK, HOME, WAIT milliseconds, OPEN_APP by human app name, DONE, FAIL.")
+            appendLine("Allowed actions: TAP, TAP_XY, LONG_TAP, SET_TEXT, SCROLL (UP/DOWN/LEFT/RIGHT), BACK, HOME, WAIT milliseconds, OPEN_APP by human app name, DONE, FAIL.")
             appendLine("For SCROLL use an element key when a scrollable container is listed; otherwise leave element empty and put UP or DOWN in the final field.")
             appendLine("Use TAP_XY only when the intended control is clearly visible in the attached screenshot but no suitable E-number exists. For TAP_XY leave element empty and put normalized screenshot coordinates x,y (both 0..1) in the final field. Never use TAP_XY when uncertain or for a sensitive action.")
             appendLine("Do not perform payments, purchases, money transfers, account deletion, installs/uninstalls, or permission/security changes autonomously.")
@@ -431,6 +466,89 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine("Reply with ONE single machine line and no prose. Construct it as: word AARIS, two colons, request identifier, two colons, action name, two colons, element key or empty, two colons, payload/expected text.")
             appendLine("For SET_TEXT put the text to type in the final field. For WAIT put milliseconds in the final field. For OPEN_APP put the app name in the final field. For DONE/FAIL put a short reason in the final field.")
         }.take(15000)
+    }
+
+    // AARISH_AI_RESCUE_EVIDENCE_GRID_V2
+    private fun buildRescueEvidenceAttachment(currentScreenshot: File?): File? {
+        val recent = rescueEvidenceSteps.takeLast(3)
+        val items = mutableListOf<Pair<String, File>>()
+        recent.forEachIndexed { index, g ->
+            val path = g.recordingEvidencePath.orEmpty()
+            if (path.isNotBlank()) {
+                val file = File(path)
+                if (file.exists() && file.isFile) {
+                    val label = if (index == recent.lastIndex) "FAILED RECORDED STEP" else "RECORDED CONTEXT ${index + 1}"
+                    items.add(label to file)
+                }
+            }
+        }
+        if (currentScreenshot != null && currentScreenshot.exists()) {
+            items.add("CURRENT SCREEN" to currentScreenshot)
+        }
+        if (items.isEmpty()) return currentScreenshot
+        if (items.size == 1 && items.first().second == currentScreenshot) return currentScreenshot
+
+        val decoded = items.mapNotNull { item ->
+            try {
+                android.graphics.BitmapFactory.decodeFile(item.second.absolutePath)?.let { item.first to it }
+            } catch (_: Throwable) { null }
+        }.take(4)
+        if (decoded.isEmpty()) return currentScreenshot
+
+        return try {
+            val cellW = 480
+            val cellH = 900
+            val labelH = 54
+            val cols = 2
+            val rows = ((decoded.size + cols - 1) / cols).coerceAtLeast(1)
+            val output = Bitmap.createBitmap(cellW * cols, cellH * rows, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(output)
+            canvas.drawColor(Color.rgb(18, 18, 18))
+            val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                textSize = 25f
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.rgb(90, 90, 90)
+                style = Paint.Style.STROKE
+                strokeWidth = 2f
+            }
+
+            decoded.forEachIndexed { i, pair ->
+                val col = i % cols
+                val row = i / cols
+                val left = col * cellW
+                val top = row * cellH
+                canvas.drawText(pair.first.take(28), left + 12f, top + 35f, labelPaint)
+                val src = pair.second
+                val availW = (cellW - 20).coerceAtLeast(1)
+                val availH = (cellH - labelH - 20).coerceAtLeast(1)
+                val scale = minOf(
+                    availW.toFloat() / src.width.coerceAtLeast(1),
+                    availH.toFloat() / src.height.coerceAtLeast(1)
+                )
+                val width = (src.width * scale).toInt().coerceAtLeast(1)
+                val height = (src.height * scale).toInt().coerceAtLeast(1)
+                val dstLeft = left + (cellW - width) / 2
+                val dstTop = top + labelH + (availH - height) / 2
+                val dst = Rect(dstLeft, dstTop, dstLeft + width, dstTop + height)
+                canvas.drawBitmap(src, null, dst, null)
+                canvas.drawRect(left.toFloat(), top.toFloat(), (left + cellW - 1).toFloat(), (top + cellH - 1).toFloat(), borderPaint)
+            }
+
+            val dir = File(service.cacheDir, "ai_sidecar").apply { mkdirs() }
+            val file = File(dir, "rescue_${UUID.randomUUID()}.png")
+            FileOutputStream(file).use { stream ->
+                output.compress(Bitmap.CompressFormat.PNG, 92, stream)
+            }
+            decoded.forEach { try { it.second.recycle() } catch (_: Throwable) {} }
+            try { output.recycle() } catch (_: Throwable) {}
+            file
+        } catch (_: Throwable) {
+            decoded.forEach { try { it.second.recycle() } catch (_: Throwable) {} }
+            currentScreenshot
+        }
     }
 
     private fun askPhysicalAi(
@@ -675,6 +793,28 @@ class AiSidecarController(private val service: AutoActionService) {
         handler.postDelayed({ waitForTargetWindow(run, pkg, attempt + 1, callback) }, 250L)
     }
 
+    private fun performDirectionalSwipe(directionRaw: String): Boolean {
+        if (Build.VERSION.SDK_INT < 24) return false
+        val direction = directionRaw.trim().uppercase(Locale.US)
+        val width = service.resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(2f)
+        val height = service.resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(2f)
+        val cx = width * 0.50f
+        val cy = height * 0.52f
+        val path = Path()
+        when {
+            direction.contains("LEFT") -> { path.moveTo(width * 0.78f, cy); path.lineTo(width * 0.22f, cy) }
+            direction.contains("RIGHT") -> { path.moveTo(width * 0.22f, cy); path.lineTo(width * 0.78f, cy) }
+            direction.contains("UP") || direction.contains("BACK") -> { path.moveTo(cx, height * 0.72f); path.lineTo(cx, height * 0.28f) }
+            else -> { path.moveTo(cx, height * 0.28f); path.lineTo(cx, height * 0.72f) }
+        }
+        return try {
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0L, 430L))
+                .build()
+            service.dispatchGesture(gesture, null, null)
+        } catch (_: Throwable) { false }
+    }
+
     private fun executeCommand(run: Int, command: AiCommand, state: ScreenState, callback: (Boolean, String) -> Unit) {
         if (!alive(run)) return
         if (isSensitive(command, state)) {
@@ -732,16 +872,17 @@ class AiSidecarController(private val service: AutoActionService) {
             }
             "SCROLL" -> {
                 val direction = command.payload.trim().uppercase(Locale.US)
-                val saved = state.elements.firstOrNull { it.key.equals(command.elementKey, true) }
-                val live = saved?.let { findBestLiveMatch(it) } ?: findScrollableNode()
-                if (live == null) {
-                    callback(false, "Scrollable container not found")
+                if (direction.contains("LEFT") || direction.contains("RIGHT")) {
+                    callback(performDirectionalSwipe(direction), "Swiped $direction")
                 } else {
-                    val action = if (direction.contains("UP") || direction.contains("BACK"))
+                    val saved = state.elements.firstOrNull { it.key.equals(command.elementKey, true) }
+                    val live = saved?.let { findBestLiveMatch(it) } ?: findScrollableNode()
+                    val nodeAction = if (direction.contains("UP") || direction.contains("BACK"))
                         AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
                     else AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
-                    val ok = try { live.performAction(action) } catch (_: Throwable) { false }
-                    callback(ok, "Scrolled ${if (action == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) "UP" else "DOWN"}")
+                    val nodeOk = if (live != null) try { live.performAction(nodeAction) } catch (_: Throwable) { false } else false
+                    val ok = nodeOk || performDirectionalSwipe(direction)
+                    callback(ok, "Scrolled $direction")
                 }
             }
             else -> callback(false, "Unsupported action")
@@ -928,7 +1069,7 @@ class AiSidecarController(private val service: AutoActionService) {
 
     private fun findBestTargetRoot(): AccessibilityNodeInfo? {
         // AARISH_AI_TARGET_ROOT_RANKING_V3: active/focused app windows beat incidental overlays.
-        val forbidden = setOf(service.packageName, Provider.CHATGPT.packageName, Provider.GEMINI.packageName)
+        val forbidden = setOf(service.packageName) // AARISH_AI_APP_CAN_BE_TARGET_V2
         return try {
             val screenArea = (service.resources.displayMetrics.widthPixels.toLong().coerceAtLeast(1L) *
                 service.resources.displayMetrics.heightPixels.toLong().coerceAtLeast(1L)).coerceAtLeast(1L)

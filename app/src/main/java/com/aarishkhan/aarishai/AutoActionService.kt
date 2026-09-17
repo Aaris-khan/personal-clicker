@@ -284,6 +284,21 @@ class AutoActionService : AccessibilityService() {
             return instance?.captureTargetSnapshotInternal(x, y, screenW, screenH)
         }
 
+        // AARISH_RECORDING_EVIDENCE_V1: one screenshot feeds both OCR and durable replay evidence.
+        fun captureRecordingEvidenceSnapshot(
+            x: Int,
+            y: Int,
+            screenW: Float,
+            screenH: Float,
+            callback: (TargetSnapshot?, String?) -> Unit
+        ): Boolean {
+            val service = instance ?: return false
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                service.aarishCaptureRecordingEvidenceSnapshotInternal(x, y, screenW, screenH, callback)
+            }
+            return true
+        }
+
         // AARISH_PRESS_REPLAY_PRO_V2_START
         // AARISH_PRESS_REPLAY_PRO_V2_END
     }
@@ -352,6 +367,8 @@ class AutoActionService : AccessibilityService() {
     private var workflowSequence: List<String> = emptyList()
     private var workflowIndex = 0
     private var isMasterPlaybackInternal = false
+    // AARISH_AI_RESCUE_CONTEXT_V2
+    private var aarishReplayContextSteps: List<RecordedGesture> = emptyList()
 
 
     // AARISH_WAKE_LOCK_ENGINE_V2_HELPERS
@@ -1047,6 +1064,11 @@ class AutoActionService : AccessibilityService() {
                         return
                     }
 
+                    // AARISH_AI_RESCUE_CONTEXT_V2_CAPTURE
+                    aarishReplayContextSteps = orderedGestures
+                        .take(index + 1)
+                        .filter { (it.points.firstOrNull()?.x ?: -999f) > -50f }
+                        .takeLast(4)
                     dispatchOneGesture(gesture, runId, nextRealGestureAfter(index))
 
                     val waitForGestureFinish = object : Runnable {
@@ -1096,6 +1118,7 @@ private fun stopPlaybackInternal(showToast: Boolean = true) {
     // AARISH_STALE_TASK_FIX_V1: handler ke sab callbacks mat kaato; sirf playback scheduledTasks remove karo.
     // Isse service ke future safe callbacks accidentally cancel nahi hote.
     resetActiveGestures()
+    aarishReplayContextSteps = emptyList() // AARISH_AI_RESCUE_CONTEXT_V2_STOP
     chainVisitedInRun.clear()
     configCycleCounters.clear()
     masterWorkflowSteps = emptyList()
@@ -1585,6 +1608,138 @@ private fun aarishAiWaitForNextRecordedTarget(
             null
         } finally {
             try { buffer.close() } catch (_: Throwable) {}
+        }
+    }
+
+    // AARISH_RECORDING_EVIDENCE_V1_SAVE
+    private fun aarishSaveRecordingEvidenceBitmap(
+        source: android.graphics.Bitmap,
+        tapX: Int,
+        tapY: Int
+    ): String? {
+        return try {
+            val srcW = source.width.coerceAtLeast(1)
+            val srcH = source.height.coerceAtLeast(1)
+            val maxW = 720
+            val scale = kotlin.math.min(1f, maxW.toFloat() / srcW.toFloat())
+            val outW = (srcW * scale).toInt().coerceAtLeast(1)
+            val outH = (srcH * scale).toInt().coerceAtLeast(1)
+            val scaled = if (outW == srcW && outH == srcH) {
+                source.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
+            } else {
+                android.graphics.Bitmap.createScaledBitmap(source, outW, outH, true)
+                    .copy(android.graphics.Bitmap.Config.ARGB_8888, true)
+            }
+
+            val sx = outW.toFloat() / srcW.toFloat()
+            val sy = outH.toFloat() / srcH.toFloat()
+            val cx = (tapX * sx).coerceIn(0f, (outW - 1).toFloat().coerceAtLeast(0f))
+            val cy = (tapY * sy).coerceIn(0f, (outH - 1).toFloat().coerceAtLeast(0f))
+            val density = resources.displayMetrics.density.coerceAtLeast(1f)
+            val canvas = android.graphics.Canvas(scaled)
+            val ring = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                style = android.graphics.Paint.Style.STROKE
+                strokeWidth = (4f * density).coerceAtLeast(4f)
+                color = android.graphics.Color.RED
+            }
+            val cross = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                style = android.graphics.Paint.Style.STROKE
+                strokeWidth = (2.4f * density).coerceAtLeast(2.4f)
+                color = android.graphics.Color.YELLOW
+            }
+            val radius = (22f * density).coerceIn(18f, 44f)
+            canvas.drawCircle(cx, cy, radius, ring)
+            canvas.drawLine(cx - radius, cy, cx + radius, cy, cross)
+            canvas.drawLine(cx, cy - radius, cx, cy + radius, cross)
+
+            val dir = java.io.File(filesDir, "aarish_recording_evidence").apply { mkdirs() }
+            val file = java.io.File(dir, "step_${System.currentTimeMillis()}_${java.util.UUID.randomUUID()}.jpg")
+            java.io.FileOutputStream(file).use { stream ->
+                scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 72, stream)
+            }
+
+            // Bound private evidence storage so long-term recording use cannot grow forever.
+            try {
+                dir.listFiles()
+                    ?.filter { it.isFile && it.name.startsWith("step_") }
+                    ?.sortedByDescending { it.lastModified() }
+                    ?.drop(180)
+                    ?.forEach { it.delete() }
+            } catch (_: Throwable) {}
+
+            try { scaled.recycle() } catch (_: Throwable) {}
+            file.absolutePath
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    // AARISH_RECORDING_EVIDENCE_V1_CAPTURE
+    private fun aarishCaptureRecordingEvidenceSnapshotInternal(
+        x: Int,
+        y: Int,
+        screenW: Float,
+        screenH: Float,
+        callback: (TargetSnapshot?, String?) -> Unit
+    ) {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) {
+            callback(null, null)
+            return
+        }
+
+        val executor = java.util.concurrent.Executor { runnable -> handler.post(runnable) }
+        val delivered = java.util.concurrent.atomic.AtomicBoolean(false)
+        var timeoutTask: Runnable? = null
+
+        fun finish(snapshot: TargetSnapshot?, evidencePath: String?) {
+            if (!delivered.compareAndSet(false, true)) return
+            try { timeoutTask?.let { handler.removeCallbacks(it) } } catch (_: Throwable) {}
+            callback(snapshot, evidencePath)
+        }
+
+        timeoutTask = Runnable { finish(null, null) }
+        handler.postDelayed(timeoutTask!!, 8500L)
+
+        try {
+            takeScreenshot(
+                android.view.Display.DEFAULT_DISPLAY,
+                executor,
+                object : android.accessibilityservice.AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(
+                        screenshot: android.accessibilityservice.AccessibilityService.ScreenshotResult
+                    ) {
+                        val bitmap = aarishBitmapFromScreenshot(screenshot)
+                        if (bitmap == null) {
+                            finish(null, null)
+                            return
+                        }
+
+                        // Save the user's recording-time view before the app can change screens.
+                        val evidencePath = aarishSaveRecordingEvidenceBitmap(bitmap, x, y)
+                        aarishProcessOcrBoxesFromBitmapV29(
+                            bitmap = bitmap,
+                            onSuccess = { boxes ->
+                                val picked = aarishPickOcrBoxForTap(boxes, x, y, screenW, screenH)
+                                val snapshot = picked?.let {
+                                    aarishMakeOcrSnapshotFromBox(it, x, y, screenW, screenH, boxes)
+                                }
+                                finish(snapshot, evidencePath)
+                                try { bitmap.recycle() } catch (_: Throwable) {}
+                            },
+                            onFailure = {
+                                finish(null, evidencePath)
+                                try { bitmap.recycle() } catch (_: Throwable) {}
+                            }
+                        )
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        finish(null, null)
+                    }
+                }
+            )
+        } catch (_: Throwable) {
+            finish(null, null)
         }
     }
 
@@ -2245,44 +2400,18 @@ private fun aarishAiWaitForNextRecordedTarget(
     }
 
     private fun aarishFallbackTapForOcrMiss(g: RecordedGesture, runId: Int, token: Int) {
-        // AARISH_CORE_ONLY_OCR_MISS_FALLBACK
-        // OCR miss -> Magnetic rescue -> XY fallback. Keyboard raw lock and visual rescue removed.
-        val first = g.points.firstOrNull()
-        if (first == null) {
-            if (isCurrentCallbackRun(runId)) finishActiveGesture(token)
-            return
+        // AARISH_OCR_MISS_TO_AI_RESCUE_V2
+        if (!isCurrentCallbackRun(runId)) return
+        finishActiveGesture(token)
+        val started = try {
+            trySmartTargetAfterShortSettle(g, runId, 3500L)
+        } catch (_: Throwable) {
+            false
         }
-
-        val sw = resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
-        val sh = resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
-
-        val x = if (hasSavedPercentAnchor(g)) g.xPercent.coerceIn(0f, 1f) * sw else first.x
-        val y = if (hasSavedPercentAnchor(g)) g.yPercent.coerceIn(0f, 1f) * sh else first.y
-
-        val hasRealMagnetic =
-            (!g.targetId.isNullOrBlank() && !g.targetId!!.startsWith("ocr:")) ||
-                (!g.targetDesc.isNullOrBlank() && g.targetDesc != "OCR_TEXT_TARGET") ||
-                (!g.targetClass.isNullOrBlank() && g.targetClass != "OCR_TEXT") ||
-                (!g.targetTreePath.isNullOrBlank() && g.targetTreePath != "OCR") ||
-                (!g.targetRoleFlags.isNullOrBlank() && g.targetRoleFlags != "OCR_VISIBLE_TEXT")
-
-        if (hasRealMagnetic && isSamePlaybackRun(runId)) {
-            val match = try { findBestSmartTarget(g) } catch (_: Throwable) { null }
-            if (match != null && match.bounds.width() > 0 && match.bounds.height() > 0) {
-                val tapX = match.bounds.exactCenterX().coerceIn(2f, (sw - 2f).coerceAtLeast(2f))
-                val tapY = match.bounds.exactCenterY().coerceIn(2f, (sh - 2f).coerceAtLeast(2f))
-                aarishDispatchTapWithToken(tapX, tapY, runId, token, "Magnet rescue")
-                return
-            }
+        if (!started && isSamePlaybackRun(runId)) {
+            showTinyToast("Target nahi mila — AI rescue unavailable")
+            stopPlaybackInternal(showToast = false)
         }
-
-        aarishDispatchTapWithToken(
-            x.coerceIn(2f, (sw - 2f).coerceAtLeast(2f)),
-            y.coerceIn(2f, (sh - 2f).coerceAtLeast(2f)),
-            runId,
-            token,
-            "XY fallback"
-        )
     }
 
 
@@ -2954,10 +3083,11 @@ private fun aarishAiWaitForNextRecordedTarget(
             if (tryOcrTextTargetTap(recordedGesture, runId)) return
         }
 
-        if (!movement && match == null &&
+        if (!movement &&
             (hasStrongSavedIdentity(recordedGesture) || hasSavedPercentAnchor(recordedGesture) || aarishHasAnyRichIdentity(recordedGesture))
         ) {
-            if (trySmartTargetAfterShortSettle(recordedGesture, runId)) return
+            // AARISH_AI_RESCUE_ALWAYS_ON_SEMANTIC_MISS_V2
+            if (trySmartTargetAfterShortSettle(recordedGesture, runId, 3500L)) return
         }
 
         if (!movement && duration < 450L && aarishTryFilesWordNodeClickV2(recordedGesture, runId, "Files click")) {
@@ -3200,7 +3330,7 @@ private fun aarishAiWaitForNextRecordedTarget(
 private fun trySmartTargetAfterShortSettle(
         recordedGesture: RecordedGesture,
         runId: Int,
-        waitMs: Long = 10_000L
+        waitMs: Long = 3_500L
     ): Boolean {
         // AARISH_RESTORE_10S_SMART_ICON_WAIT_V1
         // Target/icon late aaye to raw/skip se pehle 10s tak poll karo.
@@ -3331,9 +3461,8 @@ private fun trySmartTargetAfterShortSettle(
             }.coerceIn(2f, (screenH - 2f).coerceAtLeast(2f))
 
             if (!movement && duration < 450L) {
-                if (performSmartNodeClick(retryMatch, recordedGesture, runId)) return true
-                performGestureAt(startX, startY, orderedPoints, runId, recordedGesture)
-                return true
+                // AARISH_SEMANTIC_RETRY_FAIL_CLOSED_V2
+                return performSmartNodeClick(retryMatch, recordedGesture, runId)
             }
 
             if (!movement && duration >= 450L) {
@@ -3382,7 +3511,7 @@ private fun trySmartTargetAfterShortSettle(
                 if (elapsed >= maxWait) {
                     // AARISH_AI_RESCUE_ON_REPLAY_MISS_V1
                     val rescueStarted = try {
-                        aiSidecarController.rescueRecordedFailure(recordedGesture) { ok ->
+                        aiSidecarController.rescueRecordedFailure(recordedGesture, aarishReplayContextSteps) { ok ->
                             if (ok) {
                                 showTinyToast("AI rescue complete")
                                 finishOnce()
@@ -4287,6 +4416,11 @@ addRoot(window.root)
         return out
     }
 
+private fun aarishGeometryFallbackWhenIdentityMissing(gesture: RecordedGesture): SmartMatch? {
+        // AARISH_IDENTITY_NO_BLIND_GEOMETRY_V2
+        return if (aarishHasPrimaryIdentity(gesture)) null else findGeometrySmartTarget(gesture)
+    }
+
 private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
         return try {
             findSelectorTargetAcrossWindows(gesture)?.let { return it }
@@ -4308,8 +4442,8 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
             }
 
             val roots = collectSmartSearchRoots(fallbackX.toInt(), fallbackY.toInt())
-            if (roots.isEmpty()) return findGeometrySmartTarget(gesture)
-            if (!aarishHasAnyRichIdentity(gesture)) return findGeometrySmartTarget(gesture)
+            if (roots.isEmpty()) return aarishGeometryFallbackWhenIdentityMissing(gesture)
+            if (!aarishHasAnyRichIdentity(gesture)) return aarishGeometryFallbackWhenIdentityMissing(gesture)
 
             val textSeedBounds = aarishCollectTextSeedBounds(roots, gesture)
             var best: SmartMatch? = null
@@ -4417,13 +4551,13 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
                 }
             }
 
-            val finalBest = best ?: return findGeometrySmartTarget(gesture)
+            val finalBest = best ?: return aarishGeometryFallbackWhenIdentityMissing(gesture)
             val threshold = smartMatchThreshold(finalBest, gesture)
-            if (finalBest.score < threshold) return findGeometrySmartTarget(gesture)
+            if (finalBest.score < threshold) return aarishGeometryFallbackWhenIdentityMissing(gesture)
 
             val runnerUp = secondBest
             if (runnerUp != null && isAmbiguousSmartMatch(finalBest, runnerUp, gesture)) {
-                return findGeometrySmartTarget(gesture)
+                return aarishGeometryFallbackWhenIdentityMissing(gesture)
             }
 
             finalBest
