@@ -10,14 +10,19 @@
         tools:targetApi="upsidedowncake" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-
     <uses-permission android:name="android.permission.REORDER_TASKS" />
 
-    <!-- AARISH_APP_LAUNCHER_QUERIES_V4 -->
+    <!-- AARISH_APP_LAUNCHER_QUERIES_V4 + AARISH_AI_SIDECAR_V1 -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <package android:name="com.openai.chatgpt" />
+        <package android:name="com.google.android.apps.bard" />
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="image/*" />
         </intent>
     </queries>
 
@@ -48,6 +53,16 @@
             android:theme="@style/AarishTheme.GhostClipboard"
             android:configChanges="keyboard|keyboardHidden|orientation|screenSize|smallestScreenSize|screenLayout|uiMode"
             android:documentLaunchMode="never" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.ai-files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/ai_sidecar_paths" />
+        </provider>
 
         <service
             android:name=".FloatingControlService"
