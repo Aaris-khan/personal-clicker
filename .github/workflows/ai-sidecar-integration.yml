@@ -29,15 +29,15 @@ jobs:
         with:
           gradle-version: '8.2'
 
-      - name: Verify base integration
-        run: python3 .github/ai_sidecar_integration_patch.py
-
-      - name: Apply hardening
-        run: python3 .github/ai_sidecar_hardening_runner.py
-
-      - name: Apply runtime guards
+      - name: Verify existing AI engine
         run: |
+          python3 .github/ai_sidecar_integration_patch.py
+          python3 .github/ai_sidecar_hardening_runner.py
           python3 .github/ai_sidecar_runtime_guards.py
+
+      - name: Add grounded mission intelligence
+        run: |
+          python3 .github/ai_sidecar_intelligence_patch.py
           git diff --check
 
       - name: Compile Kotlin without APK
@@ -52,5 +52,5 @@ jobs:
           git config user.name "Aaris AI Upgrader"
           git config user.email "actions@users.noreply.github.com"
           git add app/src/main
-          git commit -m "Harden autonomous AI sidecar [skip ci]"
+          git commit -m "Ground AI mission planning to live UI [skip ci]"
           git push origin HEAD:main
