@@ -34,17 +34,37 @@ jobs:
           python3 .github/precision_patch.py
           git diff --check
 
+      - name: Repair Kotlin regex escape from generated patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt')
+          text = p.read_text(encoding='utf-8')
+          bad = r'Regex("\s+")'
+          good = r'Regex("\\s+")'
+          count = text.count(bad)
+          if count > 1:
+              raise SystemExit(f'Unexpected invalid-regex count: {count}')
+          if count == 1:
+              text = text.replace(bad, good, 1)
+              p.write_text(text, encoding='utf-8')
+              print('Repaired single Kotlin regex escape.')
+          else:
+              print('Kotlin regex escape already repaired.')
+          PY
+          git diff --check
+
       - name: Compile Kotlin without building APK
         run: gradle --no-daemon :app:compileDebugKotlin
 
-      - name: Commit only if patch runner found missing source changes
+      - name: Commit verified source repair if needed
         run: |
           if git diff --quiet -- app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt; then
-            echo "Source already fully upgraded."
+            echo "Source already fully upgraded and compiling."
             exit 0
           fi
           git config user.name "Aaris Precision Upgrader"
           git config user.email "actions@users.noreply.github.com"
           git add app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt
-          git commit -m "Complete semantic tap recording and replay hardening [skip ci]"
+          git commit -m "Fix verified precision engine compile issue [skip ci]"
           git push origin HEAD:main
