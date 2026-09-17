@@ -6,12 +6,18 @@ on:
     paths:
       - '.github/workflows/build-final-apk.yml'
       - 'app/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-final-apk.yml'
+      - 'app/**'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  verify-and-build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -27,6 +33,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.2'
+
+      - name: Run unit tests
+        run: gradle --no-daemon :app:testDebugUnitTest
 
       - name: Build installable APK
         run: gradle --no-daemon :app:assembleDebug
