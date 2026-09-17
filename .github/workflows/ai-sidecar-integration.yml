@@ -38,6 +38,7 @@ jobs:
       - name: Add grounded mission intelligence
         run: |
           python3 .github/ai_sidecar_intelligence_patch.py
+          python3 .github/ai_sidecar_intelligence_fix.py
           git diff --check
 
       - name: Compile Kotlin without APK
