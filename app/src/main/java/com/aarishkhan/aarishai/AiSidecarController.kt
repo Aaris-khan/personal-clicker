@@ -81,13 +81,19 @@ class AiSidecarController(private val service: AutoActionService) {
     private var missionStep = 0
     private var failureCount = 0
     private var lastOutcome = "Mission started"
-    private var currentProvider: Provider? = null
     private var lastTargetPackage = ""
-    private var lastCapturedElements: List<UiElement> = emptyList()
     private var rescueCallback: ((Boolean) -> Unit)? = null
     private var rescueMode = false
-    // AARISH_AI_MISSION_HISTORY_V4: compact bounded history gives the planner memory without huge prompts.
     private val actionHistory = java.util.ArrayDeque<String>()
+
+    // Mission-local provider health keeps AUTO from retrying a broken provider forever.
+    private val providerFailureStreak = mutableMapOf<Provider, Int>()
+    private val providerCooldownUntil = mutableMapOf<Provider, Long>()
+    private var lastProviderAttempt: Provider? = null
+
+    // Same target state + same command repeated is a planner loop, not useful progress.
+    private var lastPlannerSignature = ""
+    private var repeatedPlannerSignatureCount = 0
 
     fun isRunning(): Boolean = missionRunning || waitingForAi
 
@@ -98,10 +104,11 @@ class AiSidecarController(private val service: AutoActionService) {
         missionRunning = true
         rescueMode = false
         missionGoal = clean
-        providerPreference = provider.trim().uppercase(Locale.US).ifBlank { "AUTO" }
+        providerPreference = normalizeProviderPreference(provider)
         missionStep = 0
         failureCount = 0
         lastOutcome = "Mission started"
+        resetProviderHealth()
         actionHistory.clear()
         rememberHistory("GOAL: $clean")
         val run = generation.incrementAndGet()
@@ -131,6 +138,7 @@ class AiSidecarController(private val service: AutoActionService) {
         missionStep = 0
         failureCount = 0
         lastOutcome = "Recorded replay target missing"
+        resetProviderHealth()
         actionHistory.clear()
         rememberHistory("RECORDED STEP FAILED: ${target.ifBlank { "unknown target" }}")
         rescueMode = true
@@ -168,24 +176,45 @@ class AiSidecarController(private val service: AutoActionService) {
                 return@captureTargetScreen
             }
             lastTargetPackage = state.packageName
-            lastCapturedElements = state.elements
             val provider = selectProvider()
             if (provider == null) {
                 finishMission(false, "ChatGPT/Gemini installed nahi mila")
                 return@captureTargetScreen
             }
-            currentProvider = provider
             val requestId = "A${System.currentTimeMillis().toString(36)}${missionStep.toString(36)}"
             val prompt = buildPlannerPrompt(requestId, state)
             askPhysicalAi(run, provider, requestId, prompt, state.screenshot) { command ->
                 if (!alive(run)) return@askPhysicalAi
                 if (command == null) {
-                    // AARISH_AI_NULL_RESPONSE_RETURN_V3: timeout/parse failure must not strand provider UI.
+                    markProviderFailure(provider, "open/send/response failure")
                     returnToTarget(run, lastTargetPackage) {
                         if (alive(run)) failTurn(run, "AI response parse/timeout")
                     }
                     return@askPhysicalAi
                 }
+                markProviderSuccess(provider)
+
+                val plannerSignature = listOf(
+                    state.fingerprint,
+                    command.action,
+                    command.elementKey,
+                    command.payload.take(180)
+                ).joinToString("|")
+                if (plannerSignature == lastPlannerSignature) {
+                    repeatedPlannerSignatureCount++
+                } else {
+                    lastPlannerSignature = plannerSignature
+                    repeatedPlannerSignatureCount = 1
+                }
+                if (repeatedPlannerSignatureCount >= 3 && command.action !in setOf("WAIT", "DONE", "FAIL")) {
+                    markProviderFailure(provider, "repeated identical plan")
+                    rememberHistory("LOOP BREAKER: repeated ${command.action} ${command.elementKey}")
+                    returnToTarget(run, lastTargetPackage) {
+                        if (alive(run)) failTurn(run, "AI repeated same action without progress")
+                    }
+                    return@askPhysicalAi
+                }
+
                 if (command.action == "DONE") {
                     finishMission(true, command.payload.ifBlank { "Task complete" })
                     return@askPhysicalAi
@@ -215,7 +244,7 @@ class AiSidecarController(private val service: AutoActionService) {
                                 rescueCallback = null
                                 missionRunning = false
                                 rescueMode = false
-                                cb?.invoke(verified || executed)
+                                cb?.invoke(verified)
                             } else {
                                 handler.postDelayed({ nextMissionTurn(run) }, 450L)
                             }
@@ -264,16 +293,63 @@ class AiSidecarController(private val service: AutoActionService) {
 
     private fun alive(run: Int): Boolean = missionRunning && generation.get() == run
 
-    private fun selectProvider(): Provider? {
-        fun installed(p: Provider): Boolean = try {
-            service.packageManager.getLaunchIntentForPackage(p.packageName) != null
-        } catch (_: Throwable) { false }
+    private fun normalizeProviderPreference(raw: String): String {
+        val normalized = raw.trim().uppercase(Locale.US)
+        return if (normalized in setOf("AUTO", "CHATGPT", "GEMINI")) normalized else "AUTO"
+    }
 
-        return when (providerPreference) {
-            "CHATGPT" -> Provider.CHATGPT.takeIf(::installed)
-            "GEMINI" -> Provider.GEMINI.takeIf(::installed)
-            else -> listOf(Provider.CHATGPT, Provider.GEMINI).firstOrNull(::installed)
+    private fun resetProviderHealth() {
+        providerFailureStreak.clear()
+        providerCooldownUntil.clear()
+        lastProviderAttempt = null
+        lastPlannerSignature = ""
+        repeatedPlannerSignatureCount = 0
+    }
+
+    private fun providerInstalled(provider: Provider): Boolean = try {
+        service.packageManager.getLaunchIntentForPackage(provider.packageName) != null
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun markProviderFailure(provider: Provider, reason: String) {
+        if (providerPreference != "AUTO") return
+        val streak = (providerFailureStreak[provider] ?: 0) + 1
+        providerFailureStreak[provider] = streak
+        val cooldown = (15_000L * streak).coerceAtMost(90_000L)
+        providerCooldownUntil[provider] = SystemClock.elapsedRealtime() + cooldown
+        lastProviderAttempt = provider
+        rememberHistory("PROVIDER ${provider.name} failed ($reason), failover armed")
+    }
+
+    private fun markProviderSuccess(provider: Provider) {
+        providerFailureStreak[provider] = 0
+        providerCooldownUntil.remove(provider)
+        lastProviderAttempt = provider
+    }
+
+    private fun selectProvider(): Provider? {
+        val installed = Provider.values().filter(::providerInstalled)
+        if (installed.isEmpty()) return null
+
+        when (providerPreference) {
+            "CHATGPT" -> return Provider.CHATGPT.takeIf(::providerInstalled)
+            "GEMINI" -> return Provider.GEMINI.takeIf(::providerInstalled)
         }
+
+        val now = SystemClock.elapsedRealtime()
+        val ready = installed.filter { (providerCooldownUntil[it] ?: 0L) <= now }
+        if (ready.isNotEmpty()) {
+            return ready.minWithOrNull(
+                compareBy<Provider>(
+                    { providerFailureStreak[it] ?: 0 },
+                    { if (it == lastProviderAttempt) 0 else 1 },
+                    { it.ordinal }
+                )
+            )
+        }
+
+        return installed.minByOrNull { providerCooldownUntil[it] ?: Long.MAX_VALUE }
     }
 
     private fun buildPlannerPrompt(requestId: String, state: ScreenState): String {
@@ -385,23 +461,43 @@ class AiSidecarController(private val service: AutoActionService) {
     private fun ensurePromptAndSend(run: Int, provider: Provider, root: AccessibilityNodeInfo, prompt: String, callback: (Boolean) -> Unit) {
         if (!alive(run)) return
         val composer = findEditable(root)
-        if (composer != null) {
-            try {
-                val args = Bundle().apply {
-                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, prompt)
-                }
-                composer.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-            } catch (_: Throwable) {}
+        if (composer == null) {
+            callback(false)
+            return
         }
+
+        val setOk = try {
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, prompt)
+            }
+            composer.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        } catch (_: Throwable) {
+            false
+        }
+
+        if (!setOk) {
+            val existing = try { composer.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+            val proof = prompt.take(96)
+            if (proof.isNotBlank() && !existing.contains(proof)) {
+                callback(false)
+                return
+            }
+        }
+
         handler.postDelayed({
             if (!alive(run)) return@postDelayed
             val latest = findRootForPackage(provider.packageName)
-            val send = latest?.let { findSendNode(it, composer) }
-            val ok = if (send != null) clickNode(send) else false
-            if (ok) callback(true) else {
+            val latestComposer = latest?.let(::findEditable)
+            val send = latest?.let { findSendNode(it, latestComposer ?: composer) }
+            val ok = send != null && clickNode(send)
+            if (ok) {
+                callback(true)
+            } else {
                 handler.postDelayed({
+                    if (!alive(run)) return@postDelayed
                     val retryRoot = findRootForPackage(provider.packageName)
-                    val retry = retryRoot?.let { findSendNode(it, findEditable(it)) }
+                    val retryComposer = retryRoot?.let(::findEditable)
+                    val retry = retryRoot?.let { findSendNode(it, retryComposer ?: composer) }
                     callback(retry != null && clickNode(retry))
                 }, 800L)
             }
@@ -418,7 +514,7 @@ class AiSidecarController(private val service: AutoActionService) {
             if (!alive(run)) return
             val root = findRootForPackage(provider.packageName)
             if (root == null) {
-                if (SystemClock.elapsedRealtime() - started > 210_000L) {
+                if (SystemClock.elapsedRealtime() - started > 120_000L) {
                     waitingForAi = false
                     callback(null)
                 } else handler.postDelayed({ poll() }, 700L)
@@ -443,7 +539,7 @@ class AiSidecarController(private val service: AutoActionService) {
             }
 
             val elapsed = SystemClock.elapsedRealtime() - started
-            if (elapsed > 210_000L) {
+            if (elapsed > 120_000L) {
                 // Last chance: OCR provider window so custom-rendered response can still be parsed.
                 captureProviderOcr(provider) { ocr ->
                     waitingForAi = false
@@ -474,10 +570,10 @@ class AiSidecarController(private val service: AutoActionService) {
     private fun returnToTarget(run: Int, pkg: String, callback: () -> Unit) {
         if (!alive(run)) return
         if (pkg.isBlank() || pkg == service.packageName) {
-            callback(); return
+            callback()
+            return
         }
 
-        // AARISH_AI_RETURN_TASK_V2: existing task ko front lana first choice; launcher intent fallback.
         var moved = false
         try {
             val am = service.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
@@ -487,7 +583,10 @@ class AiSidecarController(private val service: AutoActionService) {
                 info.baseIntent?.component?.packageName == pkg || info.origActivity?.packageName == pkg
             }
             if (hit != null && am != null) {
-                try { am.moveTaskToFront(hit.id, 0); moved = true } catch (_: Throwable) {}
+                try {
+                    am.moveTaskToFront(hit.id, 0)
+                    moved = true
+                } catch (_: Throwable) {}
             }
         } catch (_: Throwable) {}
 
@@ -500,7 +599,21 @@ class AiSidecarController(private val service: AutoActionService) {
                 }
             } catch (_: Throwable) {}
         }
-        handler.postDelayed({ if (alive(run)) callback() }, if (moved) 500L else 850L)
+
+        waitForTargetWindow(run, pkg, 0, callback)
+    }
+
+    private fun waitForTargetWindow(run: Int, pkg: String, attempt: Int, callback: () -> Unit) {
+        if (!alive(run)) return
+        if (findRootForPackage(pkg) != null) {
+            handler.postDelayed({ if (alive(run)) callback() }, 180L)
+            return
+        }
+        if (attempt >= 24) {
+            failTurn(run, "Target app did not return to foreground")
+            return
+        }
+        handler.postDelayed({ waitForTargetWindow(run, pkg, attempt + 1, callback) }, 250L)
     }
 
     private fun executeCommand(run: Int, command: AiCommand, state: ScreenState, callback: (Boolean, String) -> Unit) {
@@ -574,7 +687,7 @@ class AiSidecarController(private val service: AutoActionService) {
             val now = captureStateWithoutScreenshot()
             val changed = now != null && now.fingerprint != before.fingerprint
             val clipChanged = readClipboard().let { it.isNotBlank() && it != clipboardBefore }
-            if (changed || clipChanged || command.action in setOf("WAIT", "OPEN_APP")) {
+            if (changed || clipChanged || command.action == "WAIT") {
                 callback(true, when {
                     changed -> "screen state changed"
                     clipChanged -> "clipboard changed"
@@ -989,11 +1102,12 @@ class AiSidecarController(private val service: AutoActionService) {
 
     private fun isSensitive(command: AiCommand, state: ScreenState): Boolean {
         val element = state.elements.firstOrNull { it.key.equals(command.elementKey, true) }
-        val text = listOf(command.payload, element?.text.orEmpty(), element?.desc.orEmpty(), element?.viewId.orEmpty()).joinToString(" ").lowercase(Locale.US)
+        val text = listOf(missionGoal, command.payload, element?.text.orEmpty(), element?.desc.orEmpty(), element?.viewId.orEmpty()).joinToString(" ").lowercase(Locale.US)
         val blocked = listOf(
             "pay now", "payment", "send money", "transfer money", "bank transfer", "purchase", "buy now",
             "delete account", "close account", "uninstall", "install app", "allow permission", "grant permission",
-            "factory reset", "erase data", "confirm order"
+            "factory reset", "erase data", "confirm order", "otp", "one time password", "password",
+            "passcode", "upi pin", "security pin", "cvv"
         )
         return blocked.any(text::contains)
     }
