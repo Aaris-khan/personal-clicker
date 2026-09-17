@@ -17,8 +17,7 @@ def replace_once(text, old, new, label):
 
 # ---------------------------------------------------------------------------
 # FloatingControlService: make our own chrome disappear only while AI captures
-# a screenshot. This matters on Android 11-13 where Accessibility screenshot is
-# display-composited and therefore includes TYPE_APPLICATION_OVERLAY windows.
+# a visual fallback. Semantic-first turns never call this path.
 # ---------------------------------------------------------------------------
 fcs = FCS.read_text(encoding='utf-8')
 
@@ -89,13 +88,14 @@ FCS.write_text(fcs, encoding='utf-8')
 
 
 # ---------------------------------------------------------------------------
-# AiSidecarController: bind screenshot + accessibility state to one package and
-# one fingerprint, isolate the target window on pre-Android-14, and prevent the
-# physical AI provider from becoming the accidental target in split/floating UI.
+# AiSidecarController:
+# 1) semantic-first turns avoid screenshots when accessibility data is rich;
+# 2) visual fallback captures only a state-locked target window;
+# 3) provider composer is controlled directly with SET_TEXT, clipboard PASTE
+#    fallback, and semantic Send click -- no coordinate search dance.
 # ---------------------------------------------------------------------------
 ai = AI.read_text(encoding='utf-8')
 
-# New mission should not inherit target affinity from an earlier run.
 if 'lastTargetPackage = "" // AARISH_AI_STATE_OWNERSHIP_V1_START' not in ai:
     ai = replace_once(
         ai,
@@ -104,8 +104,6 @@ if 'lastTargetPackage = "" // AARISH_AI_STATE_OWNERSHIP_V1_START' not in ai:
         'AI mission target reset'
     )
 
-# A recorded failure already knows which package owned the step. Use that as
-# affinity so a split-screen ChatGPT/Gemini window cannot steal target ownership.
 if 'AARISH_AI_STATE_OWNERSHIP_V1_RESCUE' not in ai:
     ai = replace_once(
         ai,
@@ -118,8 +116,58 @@ if 'AARISH_AI_STATE_OWNERSHIP_V1_RESCUE' not in ai:
         'AI rescue target affinity'
     )
 
-# Replace captureTargetScreen with a freshness-validated capture transaction.
-if 'AARISH_AI_CAPTURE_TRANSACTION_V2' not in ai:
+# Insert semantic-first visual decision helper before captureTargetScreen.
+if 'AARISH_AI_SEMANTIC_FIRST_V1' not in ai:
+    marker = '    private fun captureTargetScreen(run: Int, callback: (ScreenState?) -> Unit) {'
+    pos = ai.find(marker)
+    if pos < 0:
+        fail('AI captureTargetScreen marker missing')
+    helper = '''    // AARISH_AI_SEMANTIC_FIRST_V1
+    // Most screens can be reasoned about from accessibility IDs/text/context.
+    // Only visual-only/ambiguous screens pay the screenshot cost.
+    private fun shouldCaptureVisualForPlanner(state: ScreenState): Boolean {
+        if (state.elements.isEmpty()) return true
+
+        fun meaningful(e: UiElement): Boolean {
+            return e.editable ||
+                e.viewId.isNotBlank() ||
+                e.text.isNotBlank() ||
+                e.desc.isNotBlank() ||
+                e.context.isNotBlank()
+        }
+
+        val useful = state.elements.count(::meaningful)
+        val unlabeledClickable = state.elements.count { e ->
+            e.clickable &&
+                e.viewId.isBlank() &&
+                e.text.isBlank() &&
+                e.desc.isBlank() &&
+                e.context.isBlank()
+        }
+
+        // Recorded rescue only needs live pixels when the failed step itself had
+        // no semantic identity. Existing recorded evidence can still be attached.
+        if (rescueMode) {
+            val failed = rescueEvidenceSteps.lastOrNull()
+            val failedHasSemanticIdentity = failed != null && listOf(
+                failed.targetText,
+                failed.targetDesc,
+                failed.targetId,
+                failed.targetContextText,
+                failed.targetChildText,
+                failed.targetSiblingText
+            ).any { !it.isNullOrBlank() }
+            if (!failedHasSemanticIdentity) return true
+        }
+
+        return useful < 3 || unlabeledClickable > useful
+    }
+
+'''
+    ai = ai[:pos] + helper + ai[pos:]
+
+# Replace captureTargetScreen with semantic-first + freshness-validated visual fallback.
+if 'AARISH_AI_CAPTURE_TRANSACTION_V3' not in ai:
     old = '''    private fun captureTargetScreen(run: Int, callback: (ScreenState?) -> Unit) {
         val base = captureStateWithoutScreenshot()
         if (base == null) { callback(null); return }
@@ -136,30 +184,32 @@ if 'AARISH_AI_CAPTURE_TRANSACTION_V2' not in ai:
         }
     }
 '''
-    new = '''    // AARISH_AI_CAPTURE_TRANSACTION_V2
-    // UI-tree metadata and pixels must describe the SAME target state. If the
-    // package/fingerprint changes while taking the screenshot, discard it and retry.
+    new = '''    // AARISH_AI_CAPTURE_TRANSACTION_V3
+    // Callback is last so Kotlin trailing-lambda calls stay valid.
     private fun captureTargetScreen(
         run: Int,
-        callback: (ScreenState?) -> Unit,
-        attempt: Int = 0
+        attempt: Int = 0,
+        callback: (ScreenState?) -> Unit
     ) {
         if (!alive(run)) return
         val base = captureStateWithoutScreenshot()
         if (base == null) { callback(null); return }
 
-        val windowId = findTargetWindowId(base.packageName)
         val windowBounds = findWindowBoundsForPackage(base.packageName)
-        // On Android 11-13 we crop a display screenshot to these bounds; on 14+
-        // takeScreenshotOfWindow already returns the isolated window. TAP_XY must
-        // therefore map normalized image coordinates through the same bounds.
         val captureBounds = windowBounds?.let(::Rect)
 
+        // Semantic-first: no bitmap, no temp file, no provider image attachment.
+        if (!shouldCaptureVisualForPlanner(base)) {
+            rememberHistory("SEMANTIC-FIRST: visual capture skipped for ${base.packageName}")
+            callback(base.copy(screenshot = null, captureBounds = captureBounds))
+            return
+        }
+
+        val windowId = findTargetWindowId(base.packageName)
         FloatingControlService.setAiScreenshotChromeHidden(true)
         val safetyRestore = Runnable { FloatingControlService.setAiScreenshotChromeHidden(false) }
         handler.postDelayed(safetyRestore, 1800L)
 
-        // Give SurfaceFlinger one frame to remove our overlay before capture.
         handler.postDelayed({
             if (!alive(run)) {
                 handler.removeCallbacks(safetyRestore)
@@ -183,7 +233,7 @@ if 'AARISH_AI_CAPTURE_TRANSACTION_V2' not in ai:
                 if (!stable) {
                     try { file?.delete() } catch (_: Throwable) {}
                     if (attempt < 3) {
-                        handler.postDelayed({ captureTargetScreen(run, callback, attempt + 1) }, 180L)
+                        handler.postDelayed({ captureTargetScreen(run, attempt + 1, callback) }, 180L)
                     } else {
                         rememberHistory("CAPTURE REJECTED: target state kept changing")
                         callback(null)
@@ -196,9 +246,8 @@ if 'AARISH_AI_CAPTURE_TRANSACTION_V2' not in ai:
         }, 90L)
     }
 '''
-    ai = replace_once(ai, old, new, 'AI capture transaction')
+    ai = replace_once(ai, old, new, 'AI semantic capture transaction')
 
-# Insert pre-Android-14 target-window crop helper.
 if 'AARISH_AI_TARGET_WINDOW_CROP_V1' not in ai:
     marker = '    private fun annotateScreenshotForAi(bitmap: Bitmap, elements: List<UiElement>, windowBounds: Rect?): Bitmap {'
     pos = ai.find(marker)
@@ -224,7 +273,6 @@ if 'AARISH_AI_TARGET_WINDOW_CROP_V1' not in ai:
         val cropW = (right - left).coerceAtLeast(1)
         val cropH = (bottom - top).coerceAtLeast(1)
 
-        // If the target really is full-screen, avoid an unnecessary bitmap copy.
         if (left <= 1 && top <= 1 && right >= source.width - 1 && bottom >= source.height - 1) {
             return source
         }
@@ -242,7 +290,6 @@ if 'AARISH_AI_TARGET_WINDOW_CROP_V1' not in ai:
 '''
     ai = ai[:pos] + helper + ai[pos:]
 
-# Make screenshot callback isolate the target and always annotate in target-window coordinates.
 if 'AARISH_AI_PIXEL_OWNERSHIP_V1' not in ai:
     old = '''                    val hw = Bitmap.wrapHardwareBuffer(buffer, screenshot.colorSpace)
                     val bitmap = hw?.copy(Bitmap.Config.ARGB_8888, true)
@@ -263,8 +310,6 @@ if 'AARISH_AI_PIXEL_OWNERSHIP_V1' not in ai:
 '''
     ai = replace_once(ai, old, new, 'AI pixel ownership')
 
-# Provider apps are allowed targets, but when we already have a different target
-# package they should lose split/floating-window ranking unless truly foreground.
 if 'AARISH_AI_PROVIDER_DRIFT_GUARD_V1' not in ai:
     old = '''                var score = (areaRatio * 3000.0).toInt()
                 if (window.isActive) score += 10000
@@ -281,9 +326,6 @@ if 'AARISH_AI_PROVIDER_DRIFT_GUARD_V1' not in ai:
                 if (pkg == "com.android.systemui" && areaRatio < 0.55) score -= 9000
 
                 // AARISH_AI_PROVIDER_DRIFT_GUARD_V1
-                // Physical ChatGPT/Gemini can be the user's target, but a provider
-                // floating/split window must not steal ownership from the app we
-                // were just automating.
                 val preferredPkg = lastTargetPackage.trim()
                 if (preferredPkg.isNotBlank() && pkg == preferredPkg) score += 15000
                 if (preferredPkg.isNotBlank() && pkg != preferredPkg &&
@@ -292,25 +334,111 @@ if 'AARISH_AI_PROVIDER_DRIFT_GUARD_V1' not in ai:
 '''
     ai = replace_once(ai, old, new, 'AI provider drift guard')
 
-# Tell the planner pixels are ownership-validated, not an arbitrary display shot.
-if 'Pixels are package-locked' not in ai:
-    ai = replace_once(
-        ai,
-        '            appendLine("A screenshot of this exact target state is attached when Android/provider sharing allows it.")\n',
-        '            appendLine("A screenshot of this exact target state is attached when Android/provider sharing allows it. Pixels are package-locked and stale captures are rejected before sending.")\n',
-        'AI planner screenshot contract'
-    )
+# Direct provider handoff: SET_TEXT first, temporary clipboard paste only if needed.
+if 'AARISH_AI_DIRECT_COMPOSER_V1' not in ai:
+    marker = '    private fun ensurePromptAndSend(run: Int, provider: Provider, root: AccessibilityNodeInfo, prompt: String, callback: (Boolean) -> Unit) {'
+    pos = ai.find(marker)
+    if pos < 0:
+        fail('AI ensurePromptAndSend marker missing')
+    helper = '''    // AARISH_AI_DIRECT_COMPOSER_V1
+    // Coordinate-free text injection fallback. Preserve the user's clipboard when possible.
+    private fun pastePromptViaClipboard(composer: AccessibilityNodeInfo, prompt: String): Boolean {
+        val cm = try {
+            service.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+        } catch (_: Throwable) { null } ?: return false
+
+        val previous = try { cm.primaryClip } catch (_: Throwable) { null }
+        return try {
+            cm.setPrimaryClip(ClipData.newPlainText("Aarish AI prompt", prompt))
+            try { composer.performAction(AccessibilityNodeInfo.ACTION_FOCUS) } catch (_: Throwable) {}
+            val pasted = try { composer.performAction(AccessibilityNodeInfo.ACTION_PASTE) } catch (_: Throwable) { false }
+            handler.postDelayed({
+                try {
+                    if (previous != null) cm.setPrimaryClip(previous)
+                    else cm.setPrimaryClip(ClipData.newPlainText("", ""))
+                } catch (_: Throwable) {}
+            }, 700L)
+            pasted
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+'''
+    ai = ai[:pos] + helper + ai[pos:]
+
+if 'AARISH_AI_DIRECT_COMPOSER_V1_SET_OR_PASTE' not in ai:
+    old = '''        if (!setOk) {
+            val existing = try { composer.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+            val proof = prompt.take(96)
+            if (proof.isNotBlank() && !existing.contains(proof)) {
+                callback(false)
+                return
+            }
+        }
+'''
+    new = '''        // AARISH_AI_DIRECT_COMPOSER_V1_SET_OR_PASTE
+        if (!setOk) {
+            val existing = try { composer.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+            val proof = prompt.take(96)
+            val alreadyThere = proof.isNotBlank() && existing.contains(proof)
+            val pasted = if (!alreadyThere) pastePromptViaClipboard(composer, prompt) else true
+            if (!alreadyThere && !pasted) {
+                callback(false)
+                return
+            }
+        }
+'''
+    ai = replace_once(ai, old, new, 'AI direct composer set/paste')
+
+# Share payload already uses clipData URI. Make the contract explicit and preserve
+# direct attachment as the preferred image transport over UI-driven gallery paste.
+if 'AARISH_AI_DIRECT_CONTENT_HANDOFF_V1' not in ai:
+    old = '''                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "image/png"
+                    setPackage(provider.packageName)
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_TEXT, prompt)
+                    clipData = ClipData.newUri(service.contentResolver, "Aarish AI screen", uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (Build.VERSION.SDK_INT >= 24) addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
+                }
+'''
+    new = '''                val send = Intent(Intent.ACTION_SEND).apply {
+                    // AARISH_AI_DIRECT_CONTENT_HANDOFF_V1
+                    // Android grants the provider a temporary content URI directly;
+                    // no gallery save and no manual attach/paste/search sequence.
+                    type = "image/png"
+                    setPackage(provider.packageName)
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_TEXT, prompt)
+                    clipData = ClipData.newUri(service.contentResolver, "Aarish AI visual evidence", uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (Build.VERSION.SDK_INT >= 24) addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
+                }
+'''
+    ai = replace_once(ai, old, new, 'AI direct content handoff')
+
+if 'Most turns are semantic-first' not in ai:
+    old = '            appendLine("A screenshot of this exact target state is attached when Android/provider sharing allows it.")\n'
+    new = '            appendLine("Most turns are semantic-first and intentionally have no screenshot. If no image is attached, rely on the UI element list/context. A state-locked target image is attached only for visual-only or ambiguous screens.")\n'
+    ai = replace_once(ai, old, new, 'AI planner semantic-first contract')
 
 AI.write_text(ai, encoding='utf-8')
 
-# Static safety checks.
 final_ai = AI.read_text(encoding='utf-8')
 final_fcs = FCS.read_text(encoding='utf-8')
 required_ai = [
-    'AARISH_AI_CAPTURE_TRANSACTION_V2',
+    'AARISH_AI_SEMANTIC_FIRST_V1',
+    'AARISH_AI_CAPTURE_TRANSACTION_V3',
     'AARISH_AI_TARGET_WINDOW_CROP_V1',
     'AARISH_AI_PIXEL_OWNERSHIP_V1',
     'AARISH_AI_PROVIDER_DRIFT_GUARD_V1',
+    'AARISH_AI_DIRECT_COMPOSER_V1',
+    'AARISH_AI_DIRECT_COMPOSER_V1_SET_OR_PASTE',
+    'AARISH_AI_DIRECT_CONTENT_HANDOFF_V1',
 ]
 required_fcs = [
     'AARISH_AI_CLEAN_CAPTURE_V1',
@@ -323,4 +451,4 @@ for marker in required_fcs:
     if marker not in final_fcs:
         fail(f'missing FCS marker: {marker}')
 
-print('Clean target capture patch applied; static assertions passed.')
+print('Semantic-first direct AI handoff patch applied; static assertions passed.')
