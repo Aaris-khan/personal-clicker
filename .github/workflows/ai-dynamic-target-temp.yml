@@ -31,6 +31,18 @@ jobs:
       - name: Apply dynamic target hardening
         run: python3 tools/ai_dynamic_target_harden_temp.py
 
+      - name: Repair generated Kotlin regex escaping
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt')
+          s = p.read_text()
+          s = s.replace('Regex("\\s+")', 'Regex("\\\\s+")')
+          s = s.replace('Regex("[^\\p{L}\\p{N}]+")', 'Regex("[^\\\\p{L}\\\\p{N}]+")')
+          p.write_text(s)
+          PY
+
       - name: Compile Kotlin
         run: gradle --no-daemon :app:compileDebugKotlin
 
