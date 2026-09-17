@@ -530,6 +530,7 @@ fun pokePanelToFront() {
     private lateinit var btnTools: Button
     private lateinit var btnSystem: Button
     private lateinit var btnAiWait: Button
+    private lateinit var btnAgent: Button // AARISH_AI_AGENT_BUTTON_FIELD_V1
     private lateinit var btnXyOnly: Button // AARISH_FORCE_XY_ONLY_BUTTON_V1
     private lateinit var btnMemory: Button // AARISH_MEMORY_SLOTS_V1_BUTTON
     private var memoryStrip: LinearLayout? = null // AARISH_MEMORY_SLOTS_V1_STRIP
@@ -1084,6 +1085,26 @@ private fun refreshPanelButtonStyles() {
         visibility = View.GONE
     }
 
+    // AARISH_AI_AGENT_BUTTON_V1
+    btnAgent = Button(this).apply {
+        text = "🤖"
+        contentDescription = "Autonomous AI Mission"
+        isAllCaps = false
+        setOnClickListener {
+            if (AutoActionService.isAiAgentRunning()) {
+                AutoActionService.stopAiAgent(this@FloatingControlService)
+                Toast.makeText(this@FloatingControlService, "AI agent stopped", Toast.LENGTH_SHORT).show()
+            } else {
+                showAiMissionDialogV1()
+            }
+        }
+        setOnLongClickListener {
+            Toast.makeText(this@FloatingControlService, "AI Mission: prompt do; recording optional hai", Toast.LENGTH_LONG).show()
+            true
+        }
+        visibility = View.VISIBLE
+    }
+
     btnClear = Button(this).apply {
         text = "CLR"
         visibility = if (GestureStore.hasRecording(this@FloatingControlService)) View.VISIBLE else View.GONE
@@ -1172,6 +1193,7 @@ private fun refreshPanelButtonStyles() {
     }
 
     root.addView(btnAiWait)
+    root.addView(btnAgent)
     root.addView(btnXyOnly)
     root.addView(btnMemory)
     memoryStrip?.let { it.visibility = View.GONE; root.addView(it) } // AARISH_MEMORY_POPUP_BELOW_ICON_V5_INLINE_STRIP_DISABLED
@@ -5229,6 +5251,74 @@ private fun showAarishAppLauncher() {
 }
 
 
+
+// AARISH_AI_MISSION_DIALOG_V1
+private fun showAiMissionDialogV1() {
+    var provider = "AUTO"
+
+    val input = android.widget.EditText(this).apply {
+        hint = "Kya kaam karwana hai? Example: ChatGPT kholo, latest photo attach karo aur answer Notes me save karo"
+        minLines = 3
+        maxLines = 8
+        setPadding(dp(12), dp(10), dp(12), dp(10))
+        setTextColor(android.graphics.Color.WHITE)
+        setHintTextColor(android.graphics.Color.LTGRAY)
+    }
+
+    val providerGroup = android.widget.RadioGroup(this).apply {
+        orientation = android.widget.RadioGroup.HORIZONTAL
+        gravity = android.view.Gravity.CENTER
+    }
+    listOf("AUTO", "CHATGPT", "GEMINI").forEachIndexed { index, name ->
+        providerGroup.addView(android.widget.RadioButton(this).apply {
+            id = 7100 + index
+            text = name
+            setTextColor(android.graphics.Color.WHITE)
+            isChecked = name == "AUTO"
+            setOnCheckedChangeListener { _, checked -> if (checked) provider = name }
+        })
+    }
+
+    val box = android.widget.LinearLayout(this).apply {
+        orientation = android.widget.LinearLayout.VERTICAL
+        setPadding(dp(12), dp(8), dp(12), dp(8))
+        addView(android.widget.TextView(this@FloatingControlService).apply {
+            text = "Prompt-only autonomous mode • recording ki zaroorat nahi.\nAI sirf next bounded action choose karega; app execute + verify karega."
+            setTextColor(android.graphics.Color.LTGRAY)
+            textSize = 12f
+            setPadding(0, 0, 0, dp(8))
+        })
+        addView(input, android.widget.LinearLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        addView(providerGroup)
+    }
+
+    val dialog = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+        .setTitle("🤖 Autonomous Mission")
+        .setView(box)
+        .setPositiveButton("START", null)
+        .setNegativeButton("Cancel", null)
+        .create()
+
+    dialog.setOnShowListener {
+        dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+            val goal = input.text?.toString().orEmpty().trim()
+            if (goal.isBlank()) {
+                input.error = "Prompt likho"
+                return@setOnClickListener
+            }
+            val started = AutoActionService.startAutonomousMission(this, goal, provider)
+            if (started) {
+                dialog.dismiss()
+                Toast.makeText(this, "🤖 Mission started • $provider", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    showOverlayDialogSafely(dialog)
+}
 
 private fun recordWaitAiAction() {
     // AARISH_AI_WAIT_BUTTON_V1_RECORD

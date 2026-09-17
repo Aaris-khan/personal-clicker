@@ -239,6 +239,25 @@ class AutoActionService : AccessibilityService() {
         }
 
 
+        // AARISH_AI_SIDECAR_BRIDGE_V1
+        fun startAutonomousMission(context: Context, goal: String, provider: String = "AUTO"): Boolean {
+            val service = instance
+            if (service == null) {
+                Toast.makeText(context, "Accessibility Service ready nahi hai", Toast.LENGTH_SHORT).show()
+                return false
+            }
+            if (service.isPlayingInternal) service.stopPlaybackInternal()
+            return service.aiSidecarController.startMission(goal, provider)
+        }
+
+        fun stopAiAgent(context: Context): Boolean {
+            val service = instance ?: return false
+            service.aiSidecarController.stop("stopped")
+            return true
+        }
+
+        fun isAiAgentRunning(): Boolean = instance?.aiSidecarController?.isRunning() == true
+
         // 🔥 Recording ke time button ki kundali nikalne ke liye
 
         // AARISH_OCR_TEXT_CLICK_V4_COMPANION
@@ -273,6 +292,9 @@ class AutoActionService : AccessibilityService() {
     private data class AarishOcrBox(val text: String, val bounds: android.graphics.Rect)
 
     private val handler = Handler(Looper.getMainLooper())
+    // AARISH_AI_SIDECAR_CONTROLLER_FIELD_V1
+    private val aiSidecarController: AiSidecarController by lazy { AiSidecarController(this) }
+
     private val scheduledTasks = mutableListOf<Runnable>()
 
     @Volatile
@@ -699,6 +721,9 @@ class AutoActionService : AccessibilityService() {
         resetActiveGestures()
         chainVisitedInRun.clear()
         configCycleCounters.clear()
+
+        // AARISH_AI_SIDECAR_DESTROY_V1
+        try { aiSidecarController.stop("service stopped") } catch (_: Throwable) {}
 
         if (instance == this) {
             instance = null
@@ -3353,8 +3378,20 @@ private fun trySmartTargetAfterShortSettle(
 
                 val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
                 if (elapsed >= maxWait) {
-                    showTinyToast("Target 10s me nahi mila")
-                    finishOnce()
+                    // AARISH_AI_RESCUE_ON_REPLAY_MISS_V1
+                    val rescueStarted = try {
+                        aiSidecarController.rescueRecordedFailure(recordedGesture) { ok ->
+                            if (ok) showTinyToast("AI rescue complete")
+                            else showTinyToast("AI rescue failed")
+                            finishOnce()
+                        }
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    if (!rescueStarted) {
+                        showTinyToast("Target 10s me nahi mila")
+                        finishOnce()
+                    }
                     return
                 }
 
