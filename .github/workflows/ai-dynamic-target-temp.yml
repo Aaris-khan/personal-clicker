@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Java 17
         uses: actions/setup-java@v4
@@ -54,4 +56,6 @@ jobs:
           git add app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
           git rm .github/workflows/ai-dynamic-target-temp.yml tools/ai_dynamic_target_harden_temp.py
           git commit -m "Make AI target matching dynamic and visual [skip ci]"
-          git push origin main
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main
