@@ -301,6 +301,15 @@ class AiSidecarController(private val service: AutoActionService) {
                     }
                     return@askPhysicalAi
                 }
+                if (state.visualToken.isBlank() &&
+                    !command.visualToken.equals("NONE", ignoreCase = true)
+                ) {
+                    markProviderFailure(provider, "unexpected visual token on semantic-only turn")
+                    returnToTarget(run, lastTargetPackage) {
+                        if (alive(run)) failTurn(run, "AI response protocol mismatch: expected VISUAL=NONE")
+                    }
+                    return@askPhysicalAi
+                }
                 // AARISH_AI_PROVIDER_HEALTH_V4
                 // A parseable answer is not enough to call a provider healthy. Health is
                 // credited only after the chosen action (or DONE proof) is verified.
@@ -565,6 +574,7 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine("Reply with ONE single machine line and no prose using exactly eight fields: AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
             appendLine("VISUAL must be the exact token read from the attached screenshot pixels, NONE when no image is attached, or MISSING when an expected image cannot be read. Never invent a visual token.")
             appendLine("The final literal END field is mandatory. Do not emit the machine line until every earlier field is complete.")
+            appendLine("Never place the delimiter sequence :: inside ELEMENT, PAYLOAD, EXPECTED, or VISUAL fields.")
             appendLine("EXPECTED is the observable post-condition the executor must verify. For TAP/TAP_XY/LONG_TAP/SCROLL/DONE it is mandatory. Prefer visible text or semantic state. You may use PACKAGE=<package>, CLIPBOARD_CHANGE, or STATE_CHANGE only when that is genuinely the strongest observable proof.")
             appendLine("For SET_TEXT put text to type in PAYLOAD and a short visible confirmation in EXPECTED when available. For WAIT put milliseconds in PAYLOAD. For OPEN_APP put the human app name in PAYLOAD and PACKAGE=<expected package> when known. For DONE put a short completion reason in PAYLOAD and concrete current-state proof in EXPECTED. FAIL uses PAYLOAD for the reason.")
         }.take(15000)
@@ -1016,6 +1026,8 @@ class AiSidecarController(private val service: AutoActionService) {
         // Stabilize the correlated machine response itself, not the whole provider UI.
         // Animated suggestions, timers or unrelated chat chrome must not hold a valid reply hostage.
         val started = SystemClock.elapsedRealtime()
+        val maxResponseWaitMs = 120_000L
+        val providerMissingGraceMs = 12_000L
         var stableCommandSignature = ""
         var stableCommandCount = 0
         var sawGenerating = false
@@ -1036,7 +1048,7 @@ class AiSidecarController(private val service: AutoActionService) {
             if (root == null) {
                 if (providerMissingSince == 0L) providerMissingSince = nowElapsed
                 val missingFor = nowElapsed - providerMissingSince
-                if (missingFor > 8_000L || elapsed > 78_000L) {
+                if (missingFor > providerMissingGraceMs || elapsed > maxResponseWaitMs) {
                     waitingForAi = false
                     callback(lastParsed)
                 } else {
@@ -1070,7 +1082,7 @@ class AiSidecarController(private val service: AutoActionService) {
                 return
             }
 
-            if (elapsed > 78_000L) {
+            if (elapsed > maxResponseWaitMs) {
                 // Last chance: OCR provider window so custom-rendered response can still be parsed.
                 captureProviderOcr(provider) { ocr ->
                     waitingForAi = false
@@ -2075,11 +2087,28 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun flattenText(root: AccessibilityNodeInfo, maxChars: Int): String {
+        // AARISH_AI_ORDERED_RESPONSE_TEXT_V6
+        // Generic walk() intentionally uses a LIFO stack for search performance. Response
+        // reconstruction needs stable child order, otherwise split protocol fields can be
+        // read backwards on custom-rendered chat UIs.
         val lines = LinkedHashSet<String>()
-        walk(root, 5000) { n ->
-            listOf(n.text?.toString(), n.contentDescription?.toString()).forEach { s ->
-                val clean = s.orEmpty().replace(Regex("\\s+"), " ").trim()
+        val stack = java.util.ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+        var count = 0
+        while (stack.isNotEmpty() && count++ < 5000) {
+            val n = stack.removeLast()
+            listOf(
+                try { n.text?.toString() } catch (_: Throwable) { null },
+                try { n.contentDescription?.toString() } catch (_: Throwable) { null }
+            ).forEach { raw ->
+                val clean = raw.orEmpty().replace(Regex("\\s+"), " ").trim()
                 if (clean.isNotBlank() && clean.length <= 5000) lines.add(clean)
+            }
+
+            val c = try { n.childCount } catch (_: Throwable) { 0 }
+            // Push in reverse so removeLast() visits child 0,1,2... in tree order.
+            for (i in c - 1 downTo 0) {
+                try { n.getChild(i)?.let(stack::add) } catch (_: Throwable) {}
             }
         }
         return lines.joinToString("\n").takeLast(maxChars)
