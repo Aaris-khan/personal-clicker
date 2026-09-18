@@ -5,6 +5,7 @@ on:
     branches: [ main ]
     paths:
       - '.github/workflows/autonomy-final-compile-gate.yml'
+      - 'app/**'
 
 permissions:
   contents: write
