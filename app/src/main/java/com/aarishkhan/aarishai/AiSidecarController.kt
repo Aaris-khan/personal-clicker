@@ -649,7 +649,13 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine()
             appendLine("VISIBLE ACTIONABLE ELEMENTS:")
         }
-        val remainingForElements = (maxPromptChars - fixed.length - 80).coerceAtLeast(0)
+        val tail = buildString {
+            appendLine("FINAL RESPONSE: use the exact REQUEST IDENTIFIER above in the <request-id> field.")
+            appendLine("FINAL RESPONSE SUFFIX: ::END")
+            append("PROMPT COMMIT: $requestId")
+        }
+        val remainingForElements =
+            (maxPromptChars - fixed.length - tail.length - 4).coerceAtLeast(0)
         val elements = appendWholeLinesWithinBudget(
             elementLines.ifBlank { "(no accessible actionable nodes)" },
             remainingForElements
@@ -658,9 +664,8 @@ class AiSidecarController(private val service: AutoActionService) {
         return buildString {
             append(fixed)
             appendLine(elements.ifBlank { "(UI element list omitted by prompt budget)" })
-            appendLine("FINAL RESPONSE: use the exact REQUEST IDENTIFIER above in the <request-id> field.")
-            append("FINAL RESPONSE SUFFIX: ::END")
-        }.take(maxPromptChars)
+            append(tail)
+        }
     }
 
     // AARISH_AI_RESCUE_EVIDENCE_GRID_V2
@@ -897,6 +902,13 @@ class AiSidecarController(private val service: AutoActionService) {
         return prefix.isNotBlank() && value.contains(prefix)
     }
 
+    private fun nodeContainsLiteral(node: AccessibilityNodeInfo?, literal: String): Boolean {
+        if (literal.isBlank()) return false
+        val n = node ?: return false
+        val value = try { n.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+        return value.contains(literal)
+    }
+
     private fun requestMarkerOutsideComposer(root: AccessibilityNodeInfo, requestMarker: String): Boolean {
         if (requestMarker.isBlank()) return false
         var found = false
@@ -986,10 +998,18 @@ class AiSidecarController(private val service: AutoActionService) {
             .firstOrNull { it.startsWith("REQUEST IDENTIFIER:") }
             ?.trim()
             .orEmpty()
-        if (requestMarker.isBlank()) {
+        val promptCommitMarker = prompt.lineSequence()
+            .firstOrNull { it.startsWith("PROMPT COMMIT:") }
+            ?.trim()
+            .orEmpty()
+        if (requestMarker.isBlank() || promptCommitMarker.isBlank()) {
             finish(false)
             return
         }
+
+        fun composerHasFullPrompt(node: AccessibilityNodeInfo?): Boolean =
+            nodeContainsRequest(node, requestMarker, prompt) &&
+                nodeContainsLiteral(node, promptCommitMarker)
 
         // Unique UUID marker must not already exist in provider history before this turn.
         // If it somehow does, correlation is compromised and we fail closed.
@@ -1008,7 +1028,7 @@ class AiSidecarController(private val service: AutoActionService) {
                 false
             }
             if (setOk) return true
-            if (nodeContainsRequest(node, requestMarker, prompt)) return true
+            if (composerHasFullPrompt(node)) return true
             return pastePromptViaClipboard(node, prompt)
         }
 
@@ -1021,15 +1041,27 @@ class AiSidecarController(private val service: AutoActionService) {
             if (!alive(run) || finished.get()) return
             val latest = findRootForPackage(provider.packageName)
             val composer = latest?.let(::findEditable)
+            val nativeSubmitReady = composer?.let { node ->
+                val actions = try { node.actionList.orEmpty() } catch (_: Throwable) { emptyList() }
+                actions.any { action ->
+                    val label = action.label?.toString().orEmpty().lowercase(Locale.US)
+                    label.contains("send") || label.contains("submit") ||
+                        (Build.VERSION.SDK_INT >= 30 &&
+                            action.id == AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                }
+            } == true
+            val fallbackSubmitReady =
+                latest != null && composer != null && findSendNode(latest, composer) != null
             if (latest != null &&
                 !hasGeneratingIndicator(latest) &&
                 composer != null &&
-                nodeContainsRequest(composer, requestMarker, prompt)
+                composerHasFullPrompt(composer) &&
+                (nativeSubmitReady || fallbackSubmitReady)
             ) {
                 onReady(composer)
                 return
             }
-            if (attempt >= 18) {
+            if (attempt >= 36) {
                 finish(false)
                 return
             }
@@ -1063,7 +1095,7 @@ class AiSidecarController(private val service: AutoActionService) {
             if (!alive(run) || finished.get()) return
             val latest = findRootForPackage(provider.packageName)
             val freshComposer = latest?.let(::findEditable) ?: composer
-            if (!nodeContainsRequest(freshComposer, requestMarker, prompt)) {
+            if (!composerHasFullPrompt(freshComposer)) {
                 finish(
                     latest != null && requestWasCommitted(
                         provider,
