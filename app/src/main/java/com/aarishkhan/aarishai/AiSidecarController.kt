@@ -139,6 +139,11 @@ class AiSidecarController(private val service: AutoActionService) {
     private val providerCooldownUntil = mutableMapOf<Provider, Long>()
     private var lastProviderAttempt: Provider? = null
 
+    // AARISH_LOCAL_FIRST_PLANNER_V1
+    // Failed local plans are suppressed for the exact live state so AUTO can fall back
+    // to ChatGPT/Gemini instead of repeating a deterministic mistake.
+    private val localPlannerRejectedSignatures = linkedSetOf<String>()
+
     // Provider UI mutation pulse. The response reader still has a timeout/poll fallback,
     // but accessibility events let it react to streaming replies without depending on
     // arbitrary fixed sleeps or a provider-specific "copy" affordance.
@@ -203,6 +208,7 @@ class AiSidecarController(private val service: AutoActionService) {
         lastTargetPackage = "" // AARISH_AI_STATE_OWNERSHIP_V1_START
         resetProviderHealth()
         resetMissionProgressWatchdog()
+        localPlannerRejectedSignatures.clear()
         actionHistory.clear()
         rememberHistory("GOAL: $clean")
         val run = generation.incrementAndGet()
@@ -261,6 +267,7 @@ class AiSidecarController(private val service: AutoActionService) {
         }
         resetProviderHealth()
         resetMissionProgressWatchdog()
+        localPlannerRejectedSignatures.clear()
         actionHistory.clear()
         rememberHistory("RECORDED STEP FAILED: ${target.ifBlank { "unknown target" }}")
         rescueMode = true
@@ -340,6 +347,12 @@ class AiSidecarController(private val service: AutoActionService) {
             }
 
             lastTargetPackage = state.packageName
+
+            // AARISH_LOCAL_FIRST_PLANNER_V1
+            // AUTO first tries a conservative on-device plan. Only novel/ambiguous states
+            // pay the cost and UI disruption of opening an external AI application.
+            if (tryLocalPlannerTurn(run, state)) return@captureTargetScreen
+
             val provider = selectProvider(state.packageName)
             if (provider == null) {
                 val targetAi = Provider.values().firstOrNull { it.packageName == state.packageName }
@@ -575,6 +588,127 @@ class AiSidecarController(private val service: AutoActionService) {
         providerFailureStreak[provider] = 0
         providerCooldownUntil.remove(provider)
         lastProviderAttempt = provider
+    }
+
+
+    // AARISH_LOCAL_FIRST_PLANNER_V1
+    private fun rememberRejectedLocalPlan(signature: String) {
+        if (signature.isBlank()) return
+        while (localPlannerRejectedSignatures.size >= 24) {
+            localPlannerRejectedSignatures.firstOrNull()?.let(localPlannerRejectedSignatures::remove)
+                ?: break
+        }
+        localPlannerRejectedSignatures.add(signature)
+    }
+
+    private fun tryLocalPlannerTurn(run: Int, state: ScreenState): Boolean {
+        if (!alive(run) || rescueMode) return false
+
+        val intent = LocalMissionPlanner.parseIntent(missionGoal)
+        if (!intent.hasUsefulLocalIntent) return false
+
+        val targetPackage = intent.appLabel?.let(::resolveLaunchPackageByLabel)
+        if (intent.appLabel != null && targetPackage == null) return false
+
+        val screenH = service.resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
+        val plannerElements = state.elements.map { e ->
+            LocalMissionPlanner.Element(
+                key = e.key,
+                viewId = e.viewId,
+                text = e.text,
+                desc = e.desc,
+                className = e.className,
+                context = e.context,
+                clickable = e.clickable,
+                editable = e.editable,
+                enabled = e.enabled,
+                yCenterPercent = (e.bounds.exactCenterY() / screenH).coerceIn(0f, 1f)
+            )
+        }
+
+        val local = LocalMissionPlanner.next(
+            intent = intent,
+            currentPackage = state.packageName,
+            targetAppPackage = targetPackage,
+            elements = plannerElements
+        ) ?: return false
+
+        val command = AiCommand(
+            action = local.action,
+            elementKey = local.elementKey,
+            payload = local.payload,
+            expected = local.expected,
+            visualToken = "NONE"
+        )
+
+        val signature = listOf(
+            state.fingerprint,
+            command.action,
+            command.elementKey,
+            command.payload.take(220),
+            command.expected.take(220)
+        ).joinToString("|")
+        if (localPlannerRejectedSignatures.contains(signature)) return false
+
+        rememberHistory(
+            "LOCAL PLAN: ${command.action} ${command.elementKey.ifBlank { "-" }} " +
+                "reason=${local.reason.take(140)}"
+        )
+
+        if (command.action == "DONE") {
+            verifyDoneEvidence(run, state, command) { verified, proof ->
+                if (!alive(run)) return@verifyDoneEvidence
+                if (verified) {
+                    lastOutcome = "SUCCESS: local completion proof -> $proof"
+                    rememberHistory(lastOutcome)
+                    finishMission(true, "Task complete")
+                } else {
+                    rememberRejectedLocalPlan(signature)
+                    lastOutcome = "LOCAL DONE REJECTED: $proof"
+                    rememberHistory(lastOutcome)
+                    handler.postDelayed({ if (alive(run)) nextMissionTurn(run) }, 120L)
+                }
+            }
+            return true
+        }
+
+        val clipboardBefore = readClipboard()
+        executeCommand(run, command, state) { executed, outcome ->
+            if (!alive(run)) return@executeCommand
+            if (!executed) {
+                rememberRejectedLocalPlan(signature)
+                failureCount++
+                missionStep++
+                lastOutcome = "LOCAL EXECUTION FAILED: $outcome"
+                rememberHistory(lastOutcome)
+                handler.postDelayed({ if (alive(run)) nextMissionTurn(run) }, 120L)
+                return@executeCommand
+            }
+
+            verifyAfterAction(run, state, command, clipboardBefore) { verified, proof ->
+                if (!alive(run)) return@verifyAfterAction
+                missionStep++
+                if (!verified) {
+                    rememberRejectedLocalPlan(signature)
+                    failureCount++
+                    lastOutcome = "LOCAL UNVERIFIED: $proof"
+                    rememberHistory(lastOutcome)
+                    handler.postDelayed({ if (alive(run)) nextMissionTurn(run) }, 120L)
+                    return@verifyAfterAction
+                }
+
+                failureCount = (failureCount - 1).coerceAtLeast(0)
+                lastOutcome = "SUCCESS: local ${command.action} -> $proof"
+                rememberHistory(lastOutcome)
+
+                if (local.terminalAfterVerify) {
+                    finishMission(true, "Task complete")
+                } else {
+                    handler.postDelayed({ if (alive(run)) nextMissionTurn(run) }, 180L)
+                }
+            }
+        }
+        return true
     }
 
     private fun selectProvider(targetPackage: String = ""): Provider? {
