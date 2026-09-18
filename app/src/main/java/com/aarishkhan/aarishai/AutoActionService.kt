@@ -1661,10 +1661,14 @@ private fun aarishAiWaitForNextRecordedTarget(
                 contextH = context?.let { aarishVisualDHash(bitmap, it, sw, sh) },
                 contextV = context?.let { aarishVisualVHash(bitmap, it, sw, sh) },
                 contextE = context?.let { aarishVisualEdgeHash(bitmap, it, sw, sh) },
-                coreWPercent = coreWPct,
-                coreHPercent = coreHPct,
-                contextWPercent = contextWPct,
-                contextHPercent = contextHPct
+                coreWPercent = (core.width().toFloat() / sw).coerceIn(0.01f, 0.40f),
+                coreHPercent = (core.height().toFloat() / sh).coerceIn(0.01f, 0.30f),
+                contextWPercent = (
+                    context?.width()?.toFloat()?.div(sw) ?: contextWPct
+                ).coerceIn(0.01f, 0.50f),
+                contextHPercent = (
+                    context?.height()?.toFloat()?.div(sh) ?: contextHPct
+                ).coerceIn(0.01f, 0.40f)
             )
         } catch (_: Throwable) {
             null
@@ -4496,7 +4500,7 @@ private fun aarishAiWaitForNextRecordedTarget(
                                     null
                                 }
 
-                                val iconSketch = if (dense == null && isSamePlaybackRun(runId)) {
+                                val iconSketch = if (isSamePlaybackRun(runId)) {
                                     try {
                                         aarishDenseIconSketchSearch(
                                             bitmap = bitmap,
@@ -4513,21 +4517,52 @@ private fun aarishAiWaitForNextRecordedTarget(
                                     null
                                 }
 
+                                fun sameVisualTarget(a: AarishVisualHit, b: AarishVisualHit): Boolean {
+                                    val dx = kotlin.math.abs(a.bounds.exactCenterX() - b.bounds.exactCenterX())
+                                    val dy = kotlin.math.abs(a.bounds.exactCenterY() - b.bounds.exactCenterY())
+                                    val gateX = kotlin.math.max(
+                                        20f * resources.displayMetrics.density,
+                                        kotlin.math.min(a.bounds.width(), b.bounds.width()).toFloat() * 0.85f
+                                    )
+                                    val gateY = kotlin.math.max(
+                                        20f * resources.displayMetrics.density,
+                                        kotlin.math.min(a.bounds.height(), b.bounds.height()).toFloat() * 0.85f
+                                    )
+                                    return dx <= gateX && dy <= gateY
+                                }
+
+                                val visualWinner = when {
+                                    dense != null && iconSketch != null -> {
+                                        if (sameVisualTarget(dense, iconSketch)) {
+                                            // Independent visual engines agree. Prefer the icon-core
+                                            // anchor because its center reproduces the user's tap point.
+                                            if (iconSketch.confidence + 0.04f >= dense.confidence) {
+                                                iconSketch
+                                            } else {
+                                                dense
+                                            }
+                                        } else {
+                                            // Two independent visual systems point at different
+                                            // controls: fail closed and let OCR/VLM resolve it.
+                                            null
+                                        }
+                                    }
+                                    iconSketch != null -> iconSketch
+                                    else -> dense
+                                }
+
                                 handler.post {
                                     if (!isSamePlaybackRun(runId)) {
                                         try { bitmap.recycle() } catch (_: Throwable) {}
                                         callback(null)
-                                    } else {
-                                        val visualWinner = dense ?: iconSketch
-                                        if (visualWinner != null) {
-                                            try {
-                                                callback(visualWinner)
-                                            } finally {
-                                                try { bitmap.recycle() } catch (_: Throwable) {}
-                                            }
-                                        } else {
-                                            finishWithUniversalOcrRescue()
+                                    } else if (visualWinner != null) {
+                                        try {
+                                            callback(visualWinner)
+                                        } finally {
+                                            try { bitmap.recycle() } catch (_: Throwable) {}
                                         }
+                                    } else {
+                                        finishWithUniversalOcrRescue()
                                     }
                                 }
                             }
