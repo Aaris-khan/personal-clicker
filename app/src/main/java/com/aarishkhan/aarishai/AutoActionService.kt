@@ -3636,6 +3636,21 @@ private fun trySmartTargetAfterShortSettle(
         }
     }
 
+    private fun safeUniqueId(node: AccessibilityNodeInfo?): String? {
+        if (node == null || android.os.Build.VERSION.SDK_INT < 33) return null
+        return try { node.uniqueId?.trim()?.takeIf { it.isNotBlank() } } catch (_: Throwable) { null }
+    }
+
+    private fun safeHintText(node: AccessibilityNodeInfo?): String? {
+        if (node == null || android.os.Build.VERSION.SDK_INT < 26) return null
+        return try { node.hintText?.toString()?.trim()?.takeIf { it.isNotBlank() } } catch (_: Throwable) { null }
+    }
+
+    private fun safeTooltipText(node: AccessibilityNodeInfo?): String? {
+        if (node == null || android.os.Build.VERSION.SDK_INT < 28) return null
+        return try { node.tooltipText?.toString()?.trim()?.takeIf { it.isNotBlank() } } catch (_: Throwable) { null }
+    }
+
     private fun safeClass(node: AccessibilityNodeInfo?): String? =
         try { node?.className?.toString() } catch (_: Exception) { null }
 
@@ -3747,8 +3762,10 @@ private fun trySmartTargetAfterShortSettle(
         val desc = safeDesc(node).orEmpty()
         val id = safeId(node)?.substringAfterLast("/").orEmpty()
         val composeTag = safeComposeTestTag(node).orEmpty()
+        val hint = safeHintText(node).orEmpty()
+        val tooltip = safeTooltipText(node).orEmpty()
 
-        return listOf(text, desc, id, composeTag)
+        return listOf(text, desc, id, composeTag, hint, tooltip)
             .filter { it.isNotBlank() }
             .joinToString(" | ")
     }
@@ -4148,14 +4165,17 @@ addRoot(window.root)
             val text = safeText(node)
             val desc = safeDesc(node)
             val id = safeId(node)
+            val uniqueId = safeUniqueId(node)
             val tail = idTail(id)
             val own = ownLabelOf(node)
 
             if (savedId.isNotBlank()) {
+                val savedUnique = savedId.takeIf { it.startsWith("uid:") }?.removePrefix("uid:")
                 when {
-                    id == savedId -> score += 260
-                    savedTail.isNotBlank() && tail == savedTail -> score += 185
-                    savedTail.isNotBlank() && tokenSimilarity(savedTail, own) >= 0.94f -> score += 96
+                    !savedUnique.isNullOrBlank() && uniqueId == savedUnique -> score += 320
+                    savedUnique.isNullOrBlank() && id == savedId -> score += 260
+                    savedUnique.isNullOrBlank() && savedTail.isNotBlank() && tail == savedTail -> score += 185
+                    savedUnique.isNullOrBlank() && savedTail.isNotBlank() && tokenSimilarity(savedTail, own) >= 0.94f -> score += 96
                 }
             }
 
@@ -4573,7 +4593,10 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
         }
 
         val fullId = gesture.targetId?.trim().orEmpty()
-        if (fullId.isNotBlank() && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.JELLY_BEAN_MR2) {
+        val savedUniqueId = fullId.takeIf { it.startsWith("uid:") }?.removePrefix("uid:")
+        if (fullId.isNotBlank() && savedUniqueId == null &&
+            android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.JELLY_BEAN_MR2
+        ) {
             for (root in roots) {
                 try {
                     root.findAccessibilityNodeInfosByViewId(fullId).orEmpty()
@@ -4633,7 +4656,9 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
 
                         val nodeOwn = ownLabelOf(node)
                         val nodeIdTail = idTail(safeId(node))
-                        val directHit = seeds.any { seed ->
+                        val uniqueHit = !savedUniqueId.isNullOrBlank() &&
+                            safeUniqueId(node) == savedUniqueId
+                        val directHit = uniqueHit || seeds.any { seed ->
                             labelsEqual(safeText(node), seed) ||
                                 labelsEqual(safeDesc(node), seed) ||
                                 labelsEqual(nodeIdTail, seed) ||
@@ -4743,10 +4768,12 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
             val nodeText = safeText(node)?.trim()
             val nodeDesc = safeDesc(node)?.trim()
             val nodeId = safeId(node)?.trim()
+            val nodeUniqueId = safeUniqueId(node)
             val nodeClass = safeClass(node)?.trim()
             val actionText = safeText(actionNode)?.trim()
             val actionDesc = safeDesc(actionNode)?.trim()
             val actionId = safeId(actionNode)?.trim()
+            val actionUniqueId = safeUniqueId(actionNode)
             val actionClass = safeClass(actionNode)?.trim()
 
             val nodeSubtree = collectNodeTextLimited(node, 36, 420)
@@ -4761,18 +4788,24 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
 
             val savedId = gesture.targetId?.trim()
             if (!savedId.isNullOrBlank()) {
-                val savedTail = idTail(savedId)
+                val savedUnique = savedId.takeIf { it.startsWith("uid:") }?.removePrefix("uid:")
+                val savedTail = if (savedUnique == null) idTail(savedId) else ""
                 when {
-                    nodeId == savedId || actionId == savedId -> {
+                    !savedUnique.isNullOrBlank() &&
+                        (nodeUniqueId == savedUnique || actionUniqueId == savedUnique) -> {
+                        score += 230
+                        primaryHits++
+                    }
+                    savedUnique == null && (nodeId == savedId || actionId == savedId) -> {
                         score += 190
                         primaryHits++
                     }
-                    savedTail.isNotBlank() &&
+                    savedUnique == null && savedTail.isNotBlank() &&
                         (idTail(nodeId) == savedTail || idTail(actionId) == savedTail) -> {
                         score += 108
                         primaryHits++
                     }
-                    tokenSimilarity(savedTail, semanticWindow) >= 0.88f -> score += 34
+                    savedUnique == null && tokenSimilarity(savedTail, semanticWindow) >= 0.88f -> score += 34
                 }
             }
 
@@ -5090,9 +5123,11 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
         val nodeText = safeText(node)
         val nodeDesc = safeDesc(node)
         val nodeId = safeId(node)
+        val nodeUniqueId = safeUniqueId(node)
         val actionText = safeText(actionNode)
         val actionDesc = safeDesc(actionNode)
         val actionId = safeId(actionNode)
+        val actionUniqueId = safeUniqueId(actionNode)
 
         val nodeOwn = ownLabelOf(node)
         val actionOwn = ownLabelOf(actionNode)
@@ -5118,13 +5153,19 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
 
         val savedId = gesture.targetId?.trim()
         if (!savedId.isNullOrBlank()) {
-            val savedTail = idTail(savedId)
+            val savedUnique = savedId.takeIf { it.startsWith("uid:") }?.removePrefix("uid:")
+            val savedTail = if (savedUnique == null) idTail(savedId) else ""
             val nodeTail = idTail(nodeId)
             val actionTail = idTail(actionId)
 
-            if (nodeId == savedId || actionId == savedId) best = maxOf(best, 1f)
-            else if (savedTail.isNotBlank() && (savedTail == nodeTail || savedTail == actionTail)) best = maxOf(best, 0.88f)
-            else best = maxOf(best, tokenSimilarity(savedTail, mergedContext) * 0.72f)
+            if (!savedUnique.isNullOrBlank() &&
+                (nodeUniqueId == savedUnique || actionUniqueId == savedUnique)
+            ) best = maxOf(best, 1f)
+            else if (savedUnique == null && (nodeId == savedId || actionId == savedId)) best = maxOf(best, 1f)
+            else if (savedUnique == null && savedTail.isNotBlank() &&
+                (savedTail == nodeTail || savedTail == actionTail)
+            ) best = maxOf(best, 0.88f)
+            else if (savedUnique == null) best = maxOf(best, tokenSimilarity(savedTail, mergedContext) * 0.72f)
         }
 
         val savedText = gesture.targetText?.trim()
@@ -5225,9 +5266,11 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
         val nodeText = safeText(node)
         val nodeDesc = safeDesc(node)
         val nodeId = safeId(node)
+        val nodeUniqueId = safeUniqueId(node)
         val actionText = safeText(actionNode)
         val actionDesc = safeDesc(actionNode)
         val actionId = safeId(actionNode)
+        val actionUniqueId = safeUniqueId(actionNode)
 
         val nodeContext = collectNodeTextLimited(node, 26, 340)
         val actionContext = collectNodeTextLimited(actionNode, 60, 680)
@@ -5239,12 +5282,16 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
         val packageOk = savedPackage.isBlank() || aarishNodePackage(actionNode) == savedPackage || aarishNodePackage(node) == savedPackage
 
         val savedId = gesture.targetId?.trim()
+        val savedUnique = savedId?.takeIf { it.startsWith("uid:") }?.removePrefix("uid:")
         val idOk = packageOk && !savedId.isNullOrBlank() &&
-            (
+            if (!savedUnique.isNullOrBlank()) {
+                nodeUniqueId == savedUnique || actionUniqueId == savedUnique
+            } else {
                 nodeId == savedId ||
                     actionId == savedId ||
-                    (idTail(savedId).isNotBlank() && (idTail(nodeId) == idTail(savedId) || idTail(actionId) == idTail(savedId)))
-                )
+                    (idTail(savedId).isNotBlank() &&
+                        (idTail(nodeId) == idTail(savedId) || idTail(actionId) == idTail(savedId)))
+            }
 
         val savedText = gesture.targetText?.trim()
         val textOk = packageOk && !savedText.isNullOrBlank() &&
@@ -5874,6 +5921,8 @@ private fun captureTargetSnapshotInternal(
     val touchDesc = clean(safeDesc(touchedNode))
     val clickId = clean(safeId(clickNode))
     val touchId = clean(safeId(touchedNode))
+    val clickUniqueId = clean(safeUniqueId(clickNode))?.let { "uid:$it" }
+    val touchUniqueId = clean(safeUniqueId(touchedNode))?.let { "uid:$it" }
 
     val clickOwn = ownLabelOf(clickNode)
     val touchOwn = ownLabelOf(touchedNode)
@@ -5920,7 +5969,7 @@ private fun captureTargetSnapshotInternal(
     return TargetSnapshot(
         targetText = aarishPrimaryTextV2,
         targetDesc = aarishPrimaryDescV2,
-        targetId = firstClean(clickId, touchId),
+        targetId = firstClean(clickId, touchId, clickUniqueId, touchUniqueId),
         targetClass = firstClean(safeClass(clickNode), safeClass(touchedNode)),
         targetPackage = firstClean(aarishNodePackage(clickNode), aarishNodePackage(touchedNode)),
 
@@ -6957,7 +7006,7 @@ val root = window.root ?: continue
         return TargetSnapshot(
             targetText = firstCleanAarishSnapshot(clickText, touchText, clickDesc, touchDesc, idTail(clickId), idTail(touchId)),
             targetDesc = firstCleanAarishSnapshot(clickDesc, touchDesc, clickText, touchText),
-            targetId = firstCleanAarishSnapshot(clickId, touchId),
+            targetId = firstCleanAarishSnapshot(clickId, touchId, clickUniqueId, touchUniqueId),
             targetClass = firstCleanAarishSnapshot(safeClass(clickNode), safeClass(touchedNode)),
             targetPackage = firstCleanAarishSnapshot(aarishNodePackage(clickNode), aarishNodePackage(touchedNode), eventPackage),
 
