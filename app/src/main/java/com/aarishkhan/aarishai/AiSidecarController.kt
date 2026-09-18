@@ -473,7 +473,14 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun buildPlannerPrompt(requestId: String, state: ScreenState): String {
-        val elements = state.elements.take(90).joinToString("\n") { e ->
+        // AARISH_AI_PLANNER_QUOTA_V4
+        // Reserve prompt space for both controls and passive state evidence.
+        val plannerElements = (
+            state.elements.filter { it.clickable || it.editable }.take(70) +
+                state.elements.filter { !it.clickable && !it.editable }.take(20)
+            ).distinctBy { it.key }.take(90)
+
+        val elements = plannerElements.joinToString("\n") { e ->
             val label = listOf(e.text, e.desc).filter { it.isNotBlank() }.joinToString(" / ").take(140)
             val idHint = e.viewId.substringAfterLast('/').take(90)
             val contextHint = e.context.take(150)
@@ -1629,7 +1636,20 @@ class AiSidecarController(private val service: AutoActionService) {
                 .thenBy { it.bounds.width() * it.bounds.height() }
         )
 
-        return ordered.take(140).mapIndexed { index, element ->
+        val selected = (
+            ordered.filter { it.editable || it.clickable }.take(100) +
+                ordered.filter { !it.editable && !it.clickable }.take(40)
+            ).distinctBy { element ->
+                listOf(
+                    element.viewId,
+                    element.text,
+                    element.desc,
+                    element.className,
+                    element.bounds.flattenToString()
+                ).joinToString("|")
+            }.take(140)
+
+        return selected.mapIndexed { index, element ->
             element.copy(key = "E${index + 1}")
         }
     }
