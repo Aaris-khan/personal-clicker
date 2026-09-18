@@ -4343,6 +4343,11 @@ Recordings aur Master Chain delete nahi honge.""".trimIndent())
 
 
     private fun stopEverythingAndClose() {
+        // AARISH_AI_MANUAL_OVERRIDE_V4
+        // CUT is a master stop. Never leave autonomous callbacks alive after UI/service close.
+        if (AutoActionService.isAiAgentRunning()) {
+            AutoActionService.stopAiAgent(this)
+        }
         cancelClipboardCopyArmV6() // AARISH_MEMORY_CLIPBOARD_TWOSTEP_V6_CLEANUP
 
         val liveGestures = if (isRecording) captureView?.getRecordedGestures().orEmpty() else emptyList()
@@ -5707,6 +5712,10 @@ private fun reAddOverlayViewSilently(view: View, params: WindowManager.LayoutPar
     // AARISH_SHARE_MENU_LIVE_GUARD_V4_END
 
         override fun onDestroy() {
+        // AARISH_AI_MANUAL_OVERRIDE_V4_DESTROY
+        if (AutoActionService.isAiAgentRunning()) {
+            try { AutoActionService.stopAiAgent(this) } catch (_: Throwable) {}
+        }
         cancelClipboardCopyArmV6() // AARISH_MEMORY_CLIPBOARD_TWOSTEP_V6_CLEANUP
 
         closeAarishDesktopLauncher() // AARISH_PREMIUM_DESKTOP_APP_DESTROY_CLEANUP_V4_FINAL
@@ -5897,6 +5906,13 @@ private fun extractAndAppendGestures() {
 
 private fun startRecording() {
     try { closeSettingsPanel() } catch (_: Exception) {}
+
+    // AARISH_AI_MANUAL_OVERRIDE_V4_RECORD
+    // A user starting manual recording explicitly takes control away from autonomy.
+    if (AutoActionService.isAiAgentRunning()) {
+        AutoActionService.stopAiAgent(this)
+        Toast.makeText(this, "Manual recording → AI agent stopped", Toast.LENGTH_SHORT).show()
+    }
 
     if (isRecording) return
 
