@@ -1,0 +1,3 @@
+source_sha=447ef6104882dc76064f4a1213194fa79e95224e
+compile_outcome=success
+workflow=Autonomy Compile Gate
