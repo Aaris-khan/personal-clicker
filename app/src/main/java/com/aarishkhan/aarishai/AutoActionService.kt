@@ -4469,23 +4469,43 @@ private fun aarishAiWaitForNextRecordedTarget(
                             }
 
                             val denseFingerprint = fp
-                            if (denseFingerprint?.tapH == null && denseFingerprint?.tapV == null) {
-                                finishWithUniversalOcrRescue()
-                                return
-                            }
 
                             aarishVisualMatchExecutor.execute {
-                                val dense = try {
-                                    aarishDenseScreenshotVisualSearch(
-                                        bitmap = bitmap,
-                                        gesture = gesture,
-                                        fp = denseFingerprint,
-                                        screenW = screenW,
-                                        screenH = screenH,
-                                        runId = runId,
-                                        livePackageSnapshot = livePackageSnapshot
-                                    )
-                                } catch (_: Throwable) {
+                                val dense = if (
+                                    denseFingerprint?.tapH != null ||
+                                    denseFingerprint?.tapV != null
+                                ) {
+                                    try {
+                                        aarishDenseScreenshotVisualSearch(
+                                            bitmap = bitmap,
+                                            gesture = gesture,
+                                            fp = denseFingerprint,
+                                            screenW = screenW,
+                                            screenH = screenH,
+                                            runId = runId,
+                                            livePackageSnapshot = livePackageSnapshot
+                                        )
+                                    } catch (_: Throwable) {
+                                        null
+                                    }
+                                } else {
+                                    null
+                                }
+
+                                val iconSketch = if (dense == null && isSamePlaybackRun(runId)) {
+                                    try {
+                                        aarishDenseIconSketchSearch(
+                                            bitmap = bitmap,
+                                            gesture = gesture,
+                                            screenW = screenW,
+                                            screenH = screenH,
+                                            runId = runId,
+                                            livePackageSnapshot = livePackageSnapshot
+                                        )
+                                    } catch (_: Throwable) {
+                                        null
+                                    }
+                                } else {
                                     null
                                 }
 
@@ -4493,14 +4513,17 @@ private fun aarishAiWaitForNextRecordedTarget(
                                     if (!isSamePlaybackRun(runId)) {
                                         try { bitmap.recycle() } catch (_: Throwable) {}
                                         callback(null)
-                                    } else if (dense != null) {
-                                        try {
-                                            callback(dense)
-                                        } finally {
-                                            try { bitmap.recycle() } catch (_: Throwable) {}
-                                        }
                                     } else {
-                                        finishWithUniversalOcrRescue()
+                                        val visualWinner = dense ?: iconSketch
+                                        if (visualWinner != null) {
+                                            try {
+                                                callback(visualWinner)
+                                            } finally {
+                                                try { bitmap.recycle() } catch (_: Throwable) {}
+                                            }
+                                        } else {
+                                            finishWithUniversalOcrRescue()
+                                        }
                                     }
                                 }
                             }
@@ -4739,7 +4762,7 @@ private fun trySmartTargetAfterShortSettle(
                     runId = runId,
                     token = token,
                     label = if (visualHit.clickAtCenter) {
-                        "Screenshot visual rescue"
+                        "Visual rescue click"
                     } else {
                         "Visual fingerprint click"
                     },
