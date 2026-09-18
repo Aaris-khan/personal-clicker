@@ -210,7 +210,12 @@ object LocalVisionLocator {
         }
     }
 
-    private fun buildPrompt(gesture: RecordedGesture, imageW: Int, imageH: Int): String {
+    private fun buildPrompt(
+        gesture: RecordedGesture,
+        imageW: Int,
+        imageH: Int,
+        hasReferenceImage: Boolean
+    ): String {
         fun clean(value: String?, limit: Int): String {
             return value.orEmpty()
                 .replace(Regex("[\\r\\n\\t]+"), " ")
@@ -228,11 +233,31 @@ object LocalVisionLocator {
             "unknown"
         }
 
+        val imageGuide = if (hasReferenceImage) {
+            """
+IMAGE ORDER:
+1) REFERENCE image from recording time. The user's selected point is visibly marked with a red/yellow ring/cross.
+2) CURRENT live screenshot. Find the same logical control here.
+
+Use the reference image as primary visual evidence. Match icon/shape/text/row/context, not old absolute coordinates.
+The control may have moved, reordered, changed size slightly, or changed theme.
+""".trimIndent()
+        } else {
+            """
+Only the CURRENT screenshot is available. Use the recorded semantic metadata carefully.
+Do not guess if the target is ambiguous.
+""".trimIndent()
+        }
+
         return """
-You are the visual fallback for an Android automation recorder.
-The screenshot is the CURRENT screen. Locate the SAME control the user selected while recording.
-Do not choose a merely similar nearby control. Use text, icon meaning, UI context and relative placement together.
-If the intended control is not visibly present, return found=false. Never invent coordinates.
+You are the last-resort visual locator for an Android automation recorder.
+$imageGuide
+
+Locate the SAME logical control the user selected while recording.
+Do not choose a merely similar nearby control. Use visual identity, text, icon meaning,
+row context, surrounding controls and layout relationships together.
+If the intended control is not visibly present or two candidates are equally plausible,
+return found=false. Never invent coordinates.
 
 RECORDED TARGET:
 package=${clean(gesture.targetPackage, 120)}
@@ -254,9 +279,10 @@ Return ONLY one JSON object, no markdown and no explanation outside JSON:
 {"found":true,"x":0.0,"y":0.0,"confidence":0.0,"scroll":"none","reason":"short reason"}
 
 Rules:
-- x and y MUST be normalized 0..1 coordinates relative to the screenshot.
-- Put x/y at the safe clickable center of the intended control.
-- confidence is 0..1.
+- x and y MUST be normalized 0..1 coordinates on the CURRENT screenshot.
+- Put x/y at a safe clickable point inside the intended current control.
+- confidence is 0..1 and must reflect ambiguity honestly.
+- Prefer found=false over a guess.
 - scroll must be one of: none, up, down.
 - If target is not currently visible: {"found":false,"x":0.0,"y":0.0,"confidence":0.0,"scroll":"none","reason":"not visible"}
 """.trimIndent()
