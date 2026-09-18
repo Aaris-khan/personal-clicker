@@ -4750,7 +4750,17 @@ private fun trySmartTargetAfterShortSettle(
         val token = beginActiveGesture()
         val startedAt = android.os.SystemClock.elapsedRealtime()
         val maxWait = if (!recordedGesture.recordingEvidencePath.isNullOrBlank()) {
-            val rescueFloor = if (LocalVisionLocator.isEnabled(this)) 14_000L else 6_500L
+            val evidencePath = recordedGesture.recordingEvidencePath.orEmpty()
+            val hasCleanIconReference = try {
+                java.io.File(evidencePath + ".refimg").exists()
+            } catch (_: Throwable) {
+                false
+            }
+            val rescueFloor = when {
+                LocalVisionLocator.isEnabled(this) -> 14_000L
+                hasCleanIconReference -> 10_000L
+                else -> 6_500L
+            }
             kotlin.math.max(waitMs, rescueFloor).coerceIn(1_000L, 15_000L)
         } else {
             waitMs.coerceIn(1_000L, 15_000L)
