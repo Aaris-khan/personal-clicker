@@ -2018,22 +2018,72 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        // AARISH_AI_COMPOSER_RANKING_V6
+        // Provider screens can expose search/title/rename editors in addition to the
+        // actual chat composer. Rank by chat semantics + bottom/wide geometry instead
+        // of taking any visible editable node.
+        val screenW = service.resources.displayMetrics.widthPixels.coerceAtLeast(1)
+        val screenH = service.resources.displayMetrics.heightPixels.coerceAtLeast(1)
         var best: AccessibilityNodeInfo? = null
         var bestScore = Int.MIN_VALUE
+
         walk(root, 3500) { n ->
             val editable = try { n.isEditable } catch (_: Throwable) { false }
             val enabled = try { n.isEnabled } catch (_: Throwable) { false }
             val visible = try { n.isVisibleToUser } catch (_: Throwable) { false }
             if (!editable || !enabled || !visible) return@walk
-            val text = (n.text?.toString().orEmpty() + " " + n.contentDescription?.toString().orEmpty()).lowercase(Locale.US)
+
+            val hint = if (Build.VERSION.SDK_INT >= 26) {
+                try { n.hintText?.toString().orEmpty() } catch (_: Throwable) { "" }
+            } else ""
+            val viewId = try { n.viewIdResourceName.orEmpty() } catch (_: Throwable) { "" }
+            val label = (
+                n.text?.toString().orEmpty() + " " +
+                    n.contentDescription?.toString().orEmpty() + " " +
+                    hint + " " + viewId
+                ).lowercase(Locale.US)
+
+            val b = Rect()
+            try { n.getBoundsInScreen(b) } catch (_: Throwable) {}
+            if (b.width() <= 0 || b.height() <= 0) return@walk
+
             var score = 100
-            if (try { n.isFocused } catch (_: Throwable) { false }) score += 80
-            if (text.contains("message") || text.contains("ask") || text.contains("prompt") || text.contains("chat")) score += 40
-            val b = Rect(); try { n.getBoundsInScreen(b) } catch (_: Throwable) {}
-            score += (b.top / 100).coerceAtMost(30)
-            if (score > bestScore) { bestScore = score; best = n }
+            if (try { n.isFocused } catch (_: Throwable) { false }) score += 90
+
+            val chatHint = listOf(
+                "message", "ask", "prompt", "chat", "reply", "type a message",
+                "send a message", "composer"
+            ).any { label.contains(it) }
+            if (chatHint) score += 180
+
+            val wrongFieldHint = listOf(
+                "search", "find", "rename", "title", "conversation name",
+                "url", "address", "email", "username"
+            ).any { label.contains(it) }
+            if (wrongFieldHint) score -= 320
+
+            val centerYRatio = b.centerY().toFloat() / screenH.toFloat()
+            val widthRatio = b.width().toFloat() / screenW.toFloat()
+            when {
+                centerYRatio >= 0.72f -> score += 170
+                centerYRatio >= 0.58f -> score += 90
+                centerYRatio < 0.35f -> score -= 130
+            }
+            if (widthRatio >= 0.55f) score += 90
+            else if (widthRatio >= 0.35f) score += 45
+            else if (widthRatio < 0.18f) score -= 70
+
+            val cls = try { n.className?.toString().orEmpty() } catch (_: Throwable) { "" }
+            if (cls.contains("EditText", ignoreCase = true)) score += 25
+
+            if (score > bestScore) {
+                bestScore = score
+                best = n
+            }
         }
-        return best
+
+        // Fail closed instead of typing into an obviously unrelated editor.
+        return best.takeIf { bestScore >= 120 }
     }
 
     private fun findSendNode(root: AccessibilityNodeInfo, composer: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
