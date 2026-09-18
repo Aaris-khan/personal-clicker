@@ -4251,6 +4251,114 @@ private fun trySmartTargetAfterShortSettle(
         return out.toString().take(maxChars)
     }
 
+    // AARISH_LOGICAL_ACTION_LABEL_V1
+    // A tap may land on a decorative icon whose own semantics are weak while the
+    // clickable parent contains the real human label (for example "Create images").
+    // Promote that label into the recorded primary identity; keep geometry only as fallback.
+    private fun aarishStableHumanActionLabel(raw: String?): String? {
+        val cleaned = raw
+            ?.replace(Regex("\\s+"), " ")
+            ?.trim()
+            ?.take(120)
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+
+        val norm = normalizeUltraText(cleaned)
+        if (norm.length < 2) return null
+        if (cleaned.count { it.isLetter() } < 2) return null
+
+        val generic = setOf(
+            "image",
+            "icon",
+            "button",
+            "view",
+            "layout",
+            "row",
+            "column",
+            "container",
+            "item",
+            "android view"
+        )
+        if (norm in generic) return null
+
+        return cleaned
+    }
+
+    private fun aarishBestActionSemanticLabel(
+        touchedNode: AccessibilityNodeInfo?,
+        actionNode: AccessibilityNodeInfo?
+    ): String? {
+        data class LabelCandidate(val value: String, val score: Int, val order: Int)
+
+        var best: LabelCandidate? = null
+        var order = 0
+
+        fun remember(raw: String?, baseScore: Int) {
+            val value = aarishStableHumanActionLabel(raw) ?: return
+            val lengthPenalty = ((value.length - 54).coerceAtLeast(0) / 6)
+            val candidate = LabelCandidate(
+                value = value,
+                score = baseScore - lengthPenalty,
+                order = order++
+            )
+            val old = best
+            if (old == null ||
+                candidate.score > old.score ||
+                (candidate.score == old.score && candidate.order < old.order)
+            ) {
+                best = candidate
+            }
+        }
+
+        // Preserve an exact label under the finger when it exists.
+        remember(safeText(touchedNode), 760)
+        remember(safeDesc(touchedNode), 735)
+        remember(safeHintText(touchedNode), 700)
+        remember(safeTooltipText(touchedNode), 685)
+
+        // Then prefer the logical actionable parent itself.
+        remember(safeText(actionNode), 730)
+        remember(safeDesc(actionNode), 710)
+        remember(safeHintText(actionNode), 680)
+        remember(safeTooltipText(actionNode), 665)
+        remember(safePaneTitle(actionNode), 650)
+        remember(safeLabeledByText(actionNode), 640)
+
+        // Compose and custom views often expose the title only on a descendant/sibling
+        // inside the clickable row. Search only inside the action subtree so unrelated
+        // menu text cannot become the primary selector.
+        if (actionNode != null) {
+            val queue = java.util.ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+            queue.add(Pair(actionNode, 0))
+            var visited = 0
+
+            while (!queue.isEmpty() && visited < 72) {
+                val item = queue.removeFirst()
+                val node = item.first
+                val depth = item.second
+                visited++
+
+                if (depth > 0) {
+                    val depthPenalty = (depth.coerceAtMost(6) * 24)
+                    remember(safeText(node), 620 - depthPenalty)
+                    remember(safeDesc(node), 595 - depthPenalty)
+                    remember(safeHintText(node), 555 - depthPenalty)
+                    remember(safeTooltipText(node), 540 - depthPenalty)
+                    remember(safeLabeledByText(node), 525 - depthPenalty)
+                }
+
+                if (depth >= 6) continue
+                val count = safeChildCount(node)
+                for (i in 0 until count) {
+                    safeChild(node, i)?.let { queue.add(Pair(it, depth + 1)) }
+                }
+            }
+        }
+
+        return best?.value
+    }
+
+
     private fun collectSiblingText(
         node: AccessibilityNodeInfo?,
         maxChars: Int = 300
@@ -5270,6 +5378,17 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
         addRaw(gesture.targetDesc)
         addRaw(idTail(gesture.targetId))
 
+        // AARISH_LEGACY_CHILD_LABEL_SEEDS_V1
+        // Older recordings may have captured an unlabeled icon as primary identity while
+        // the clickable row title survived in targetChildText. Promote those child labels
+        // into direct replay seeds so moved rows can still be found without re-recording.
+        gesture.targetChildText
+            ?.split("|", "•", ">", "\n")
+            ?.mapNotNull { aarishStableHumanActionLabel(it) }
+            ?.filter { it.length in 3..64 }
+            ?.take(8)
+            ?.forEach { addRaw(it) }
+
         gesture.targetContextText
             ?.split("|", "•", ">", "\n")
             ?.map { it.trim() }
@@ -5277,7 +5396,7 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
             ?.take(8)
             ?.forEach { addRaw(it) }
 
-        return seeds.filter { it.isNotBlank() }.distinct().take(14)
+        return seeds.filter { it.isNotBlank() }.distinct().take(20)
     }
 
     // AARISH_SELECTOR_SEED_V1: resource-id/text/direct selector seeds before fuzzy scoring.
@@ -6660,12 +6779,27 @@ private fun captureTargetSnapshotInternal(
     val parentContext = collectNodeTextLimited(safeParent(clickNode), 50, 560)
     val grandParentContext = collectNodeTextLimited(safeParent(safeParent(clickNode)), 34, 360)
 
-    // AARISH_DETERMINISTIC_TOUCHED_LABEL_PRIORITY_V8
-    // If the user taps the visible label inside a larger clickable parent (e.g. "Gemini"
-    // inside "Ask Gemini"), preserve that exact touched label as primary identity.
-    // Parent id/role/context is still recorded separately for strong action grounding.
-    val primaryText = firstClean(touchText, clickText, touchDesc, clickDesc, idTail(clickId), idTail(touchId))
-    val primaryDesc = firstClean(touchDesc, clickDesc, touchText, clickText)
+    // AARISH_DETERMINISTIC_TOUCHED_LABEL_PRIORITY_V9
+    // Preserve the exact touched label when available, but when the finger lands on a
+    // decorative icon promote the logical clickable row's human label (e.g. "Create images").
+    // Parent bounds/inside-offset remain the action point; XY is never the primary identity.
+    val logicalActionLabel = aarishBestActionSemanticLabel(touchedNode, clickNode)
+    val primaryText = firstClean(
+        logicalActionLabel,
+        touchText,
+        clickText,
+        touchDesc,
+        clickDesc,
+        idTail(clickId),
+        idTail(touchId)
+    )
+    val primaryDesc = firstClean(
+        logicalActionLabel,
+        touchDesc,
+        clickDesc,
+        touchText,
+        clickText
+    )
 
     // AARISH_PRECISION_FILES_IDENTITY_V3
     val directFilesWordPrimaryV3 =
@@ -6695,8 +6829,9 @@ private fun captureTargetSnapshotInternal(
         targetClass = firstClean(safeClass(clickNode), safeClass(touchedNode)),
         targetPackage = firstClean(aarishNodePackage(clickNode), aarishNodePackage(touchedNode)),
 
-        targetContextText = listOf(composeTags, clickOwn, touchOwn, clickContext, touchContext, parentContext, grandParentContext)
-            .filter { it.isNotBlank() }
+        targetContextText = listOf(logicalActionLabel, composeTags, clickOwn, touchOwn, clickContext, touchContext, parentContext, grandParentContext)
+            .filter { !it.isNullOrBlank() }
+            .map { it!! }
             .joinToString(" | ")
             .take(1100),
         targetChildText = listOf(touchContext, clickContext)
@@ -7703,9 +7838,11 @@ val root = window.root ?: continue
         val touchId = cleanAarishSnapshotText(safeId(touchedNode))
         val clickUniqueId = cleanAarishSnapshotText(safeUniqueId(clickNode))?.let { "uid:$it" }
         val touchUniqueId = cleanAarishSnapshotText(safeUniqueId(touchedNode))?.let { "uid:$it" }
+        val logicalActionLabel = aarishBestActionSemanticLabel(touchedNode, clickNode)
 
         if (
             areaRatio > 0.86f &&
+            logicalActionLabel.isNullOrBlank() &&
             clickText.isNullOrBlank() &&
             touchText.isNullOrBlank() &&
             clickDesc.isNullOrBlank() &&
@@ -7734,14 +7871,15 @@ val root = window.root ?: continue
         val grandParentContext = collectNodeTextLimited(safeParent(safeParent(clickNode)), 34, 360)
 
         return TargetSnapshot(
-            targetText = firstCleanAarishSnapshot(clickText, touchText, clickDesc, touchDesc, idTail(clickId), idTail(touchId)),
-            targetDesc = firstCleanAarishSnapshot(clickDesc, touchDesc, clickText, touchText),
+            targetText = firstCleanAarishSnapshot(logicalActionLabel, clickText, touchText, clickDesc, touchDesc, idTail(clickId), idTail(touchId)),
+            targetDesc = firstCleanAarishSnapshot(logicalActionLabel, clickDesc, touchDesc, clickText, touchText),
             targetId = firstCleanAarishSnapshot(clickId, touchId, clickUniqueId, touchUniqueId),
             targetClass = firstCleanAarishSnapshot(safeClass(clickNode), safeClass(touchedNode)),
             targetPackage = firstCleanAarishSnapshot(aarishNodePackage(clickNode), aarishNodePackage(touchedNode), eventPackage),
 
-            targetContextText = listOf(clickOwn, touchOwn, clickContext, touchContext, parentContext, grandParentContext)
-                .filter { it.isNotBlank() }
+            targetContextText = listOf(logicalActionLabel, clickOwn, touchOwn, clickContext, touchContext, parentContext, grandParentContext)
+                .filter { !it.isNullOrBlank() }
+                .map { it!! }
                 .joinToString(" | ")
                 .take(1100),
             targetChildText = listOf(touchContext, clickContext)
