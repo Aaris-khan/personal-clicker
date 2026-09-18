@@ -640,7 +640,7 @@ class AiSidecarController(private val service: AutoActionService) {
 
     private fun openProviderWithPayload(provider: Provider, prompt: String, screenshot: File?): Boolean {
         if (screenshot != null && screenshot.exists()) {
-            try {
+            return try {
                 val uri = FileProvider.getUriForFile(service, "${service.packageName}.ai-files", screenshot)
                 val send = Intent(Intent.ACTION_SEND).apply {
                     // AARISH_AI_DIRECT_CONTENT_HANDOFF_V1
@@ -656,8 +656,12 @@ class AiSidecarController(private val service: AutoActionService) {
                     if (Build.VERSION.SDK_INT >= 24) addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
                 }
                 service.startActivity(send)
-                return true
-            } catch (_: Throwable) {}
+                true
+            } catch (_: Throwable) {
+                // AARISH_AI_VISUAL_FAIL_CLOSED_V4
+                // A visual planning turn must never silently degrade to text-only.
+                false
+            }
         }
         return try {
             val launch = service.packageManager.getLaunchIntentForPackage(provider.packageName) ?: return false
