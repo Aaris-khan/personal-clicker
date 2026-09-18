@@ -4008,24 +4008,25 @@ private fun trySmartTargetAfterShortSettle(
 
 
     private fun isToolbarActionLabel(label: String?): Boolean {
-        val v = label?.trim()?.lowercase() ?: return false
+        val raw = label?.trim().orEmpty()
+        if (raw.isBlank()) return false
+        val v = normalizeUltraText(raw)
 
-        return v in setOf(
-            "copy",
-            "cut",
-            "paste",
-            "select",
-            "select all",
-            "share",
-            "translate",
-            "कॉपी",
-            "कट",
-            "पेस्ट",
-            "चुनें",
-            "सब चुनें",
-            "साझा करें",
-            "अनुवाद"
+        val exact = setOf(
+            "copy", "cut", "paste", "select", "select all", "share", "translate",
+            "कॉपी", "कट", "पेस्ट", "चुनें", "सब चुनें", "साझा करें", "अनुवाद",
+            "نسخ", "قص", "لصق", "تحديد", "تحديد الكل", "مشاركة", "ترجمة"
         )
+        if (v in exact) return true
+
+        // Context toolbars often decorate the same logical action with an object/modifier:
+        // "Copy link", "Copy text", "Paste as plain text", "Share selection", etc.
+        val prefixes = listOf(
+            "copy ", "cut ", "paste ", "select ", "share ", "translate ",
+            "कॉपी ", "कट ", "पेस्ट ", "चुन", "साझा ", "अनुवाद ",
+            "نسخ ", "قص ", "لصق ", "تحديد ", "مشاركة ", "ترجمة "
+        )
+        return prefixes.any { v.startsWith(it) }
     }
 
     private fun findExactActionButtonAcrossWindows(
@@ -4079,7 +4080,9 @@ addRoot(window.root)
                 labelsEqual(text, wanted) ||
                     labelsEqual(desc, wanted) ||
                     normalizeUltraText(text) == normalizeUltraText(wanted) ||
-                    normalizeUltraText(desc) == normalizeUltraText(wanted)
+                    normalizeUltraText(desc) == normalizeUltraText(wanted) ||
+                    tokenSimilarity(wanted, text) >= 0.86f ||
+                    tokenSimilarity(wanted, desc) >= 0.86f
             }
         }
 
