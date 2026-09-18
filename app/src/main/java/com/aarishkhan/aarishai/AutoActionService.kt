@@ -855,6 +855,11 @@ class AutoActionService : AccessibilityService() {
             if (index <= 0) return current.delayFromStart.coerceAtLeast(0L)
 
             val previous = orderedGestures[index - 1]
+
+            // AI WAIT (-400) already owns the dynamic wait-until-target semantics.
+            // Do not replay the human recording time spent waiting for that same target.
+            if (previous.points.firstOrNull()?.x?.toInt() == -400) return 0L
+
             val previousRecordedEnd = (
                 previous.delayFromStart.coerceAtLeast(0L) +
                     recordedGestureDurationMs(previous)
