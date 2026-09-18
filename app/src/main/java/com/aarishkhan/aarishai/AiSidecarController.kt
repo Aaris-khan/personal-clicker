@@ -303,8 +303,14 @@ class AiSidecarController(private val service: AutoActionService) {
                     return@askPhysicalAi
                 }
                 if (command.action == "FAIL") {
-                    if (rescueMode) finishRescue(false)
-                    else finishMission(false, command.payload.ifBlank { "AI could not continue" })
+                    // AARISH_AI_FAIL_RETURN_V4
+                    // Even a negative planner result behaves like an API response: close the
+                    // sidecar interaction and restore the user's target app before finishing.
+                    returnToTarget(run, lastTargetPackage) {
+                        if (!alive(run)) return@returnToTarget
+                        if (rescueMode) finishRescue(false)
+                        else finishMission(false, command.payload.ifBlank { "AI could not continue" })
+                    }
                     return@askPhysicalAi
                 }
                 returnToTarget(run, lastTargetPackage) {
@@ -479,8 +485,8 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine("Clickable/editable candidates in the screenshot are visually marked with their E-number (E1, E2, ...). Use those markers plus the element list to ground your choice.")
             appendLine("Choose ONE next action only. Prefer a listed element key over guessing coordinates.")
             appendLine("Allowed actions: TAP, TAP_XY, LONG_TAP, SET_TEXT, SCROLL (UP/DOWN/LEFT/RIGHT), BACK, HOME, WAIT milliseconds, OPEN_APP by human app name, DONE, FAIL.")
-            appendLine("For SCROLL use an element key when a scrollable container is listed; otherwise leave element empty and put UP or DOWN in the final field.")
-            appendLine("Use TAP_XY only when the intended control is clearly visible in the attached screenshot but no suitable E-number exists. For TAP_XY leave element empty and put normalized screenshot coordinates x,y (both 0..1) in the final field. Never use TAP_XY when uncertain or for a sensitive action.")
+            appendLine("For SCROLL use an element key when a scrollable container is listed; otherwise leave ELEMENT empty. Put UP/DOWN/LEFT/RIGHT in PAYLOAD and the observable post-scroll state in EXPECTED.")
+            appendLine("Use TAP_XY only when the intended control is clearly visible in the attached screenshot but no suitable E-number exists. For TAP_XY leave ELEMENT empty, put normalized screenshot coordinates x,y (both 0..1) in PAYLOAD, and put the expected visible result in EXPECTED. Never use TAP_XY when uncertain or for a sensitive action.")
             appendLine("Do not perform payments, purchases, money transfers, account deletion, installs/uninstalls, or permission/security changes autonomously.")
             // AARISH_AI_DONE_EVIDENCE_V3
             appendLine("Use DONE only when the CURRENT visible screen/state provides evidence that the user's goal is complete; never mark DONE from assumption or an earlier screen.")
