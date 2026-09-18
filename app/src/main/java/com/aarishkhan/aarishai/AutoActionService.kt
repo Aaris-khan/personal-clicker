@@ -6994,6 +6994,8 @@ val root = window.root ?: continue
         val touchDesc = cleanAarishSnapshotText(safeDesc(touchedNode))
         val clickId = cleanAarishSnapshotText(safeId(clickNode))
         val touchId = cleanAarishSnapshotText(safeId(touchedNode))
+        val clickUniqueId = cleanAarishSnapshotText(safeUniqueId(clickNode))?.let { "uid:$it" }
+        val touchUniqueId = cleanAarishSnapshotText(safeUniqueId(touchedNode))?.let { "uid:$it" }
 
         if (
             areaRatio > 0.86f &&
