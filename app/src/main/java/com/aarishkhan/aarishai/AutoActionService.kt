@@ -3760,7 +3760,11 @@ private fun aarishAiWaitForNextRecordedTarget(
         ): Float {
             val liveE = aarishVisualEdgeHash(bitmap, liveBounds, screenW, screenH) ?: return 0f
             val edge = aarishVisualFingerprintSimilarity(savedE, liveE)
-            if (edge <= 0f) return 0f
+
+            // AARISH_ICON_EDGE_CHEAP_GATE_V1
+            // Edge descriptor is the cheapest and most theme-stable test. Reject obvious
+            // non-matches before computing the extra horizontal/vertical hashes.
+            if (edge < 0.62f) return 0f
 
             val liveH = if (savedH != null) aarishVisualDHash(bitmap, liveBounds, screenW, screenH) else null
             val liveV = if (savedV != null) aarishVisualVHash(bitmap, liveBounds, screenW, screenH) else null
