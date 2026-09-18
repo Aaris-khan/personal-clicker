@@ -1468,13 +1468,45 @@ class AiSidecarController(private val service: AutoActionService) {
         } catch (_: Throwable) { null }
     }
 
+    // AARISH_AI_WINDOW_RANKING_V4
+    // A package can expose multiple accessibility windows (old activity, dialog, share flow).
+    // Always bind the pseudo-API transaction to the live active/focused application window.
+    private fun bestWindowForPackage(pkg: String): android.view.accessibility.AccessibilityWindowInfo? = try {
+        val screenArea = (
+            service.resources.displayMetrics.widthPixels.toLong().coerceAtLeast(1L) *
+                service.resources.displayMetrics.heightPixels.toLong().coerceAtLeast(1L)
+            ).coerceAtLeast(1L)
+
+        service.windows
+            .filter { window ->
+                try { window.root?.packageName?.toString() == pkg } catch (_: Throwable) { false }
+            }
+            .maxByOrNull { window ->
+                val root = try { window.root } catch (_: Throwable) { null }
+                val bounds = Rect()
+                try { root?.getBoundsInScreen(bounds) } catch (_: Throwable) {}
+                val area = bounds.width().toLong().coerceAtLeast(0L) *
+                    bounds.height().toLong().coerceAtLeast(0L)
+                val areaScore = ((area.toDouble() / screenArea.toDouble()).coerceIn(0.0, 1.0) * 1500.0).toInt()
+
+                var score = areaScore
+                if (window.isActive) score += 10_000
+                if (window.isFocused) score += 12_000
+                if (window.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION) score += 3_000
+                score += window.layer.coerceIn(-100, 100) * 12
+                score
+            }
+    } catch (_: Throwable) {
+        null
+    }
+
     private fun findRootForPackage(pkg: String): AccessibilityNodeInfo? = try {
-        service.windows.asSequence().mapNotNull { it.root }.firstOrNull { it.packageName?.toString() == pkg }
+        bestWindowForPackage(pkg)?.root
             ?: service.rootInActiveWindow?.takeIf { it.packageName?.toString() == pkg }
     } catch (_: Throwable) { null }
 
     private fun findWindowIdForPackage(pkg: String): Int? = try {
-        service.windows.firstOrNull { it.root?.packageName?.toString() == pkg }?.id
+        bestWindowForPackage(pkg)?.id
     } catch (_: Throwable) { null }
 
     private fun findTargetWindowId(pkg: String): Int? = findWindowIdForPackage(pkg)
