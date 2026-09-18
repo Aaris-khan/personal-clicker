@@ -4318,9 +4318,7 @@ addRoot(window.root)
         if (finalBest.score < 245) return null
 
         val runner = second
-        if (runner != null && finalBest.score - runner.score < 18 &&
-            !aarishExactOrVeryStrong(finalBest.node, gesture)
-        ) {
+        if (runner != null && aarishDuplicateSemanticAmbiguous(finalBest, runner, gesture)) {
             return null
         }
 
@@ -4369,6 +4367,50 @@ addRoot(window.root)
 private fun aarishGeometryFallbackWhenIdentityMissing(gesture: RecordedGesture): SmartMatch? {
         // AARISH_IDENTITY_NO_BLIND_GEOMETRY_V2
         return if (aarishHasPrimaryIdentity(gesture)) null else findGeometrySmartTarget(gesture)
+    }
+
+    private fun aarishDuplicateSemanticAmbiguous(
+        best: SmartMatch,
+        runner: SmartMatch,
+        gesture: RecordedGesture
+    ): Boolean {
+        val gap = best.score - runner.score
+        if (gap >= 30) return false
+
+        val bestExact = aarishExactOrVeryStrong(best.node, gesture)
+        val runnerExact = aarishExactOrVeryStrong(runner.node, gesture)
+        if (!(bestExact && runnerExact)) return isAmbiguousSmartMatch(best, runner, gesture)
+
+        val bestContext = maxOf(
+            tokenSimilarity(gesture.targetContextText, aarishSemanticWindow(best.node, 1500)),
+            tokenSimilarity(gesture.targetSiblingText, collectSiblingText(best.node, 520)) * 0.88f
+        )
+        val runnerContext = maxOf(
+            tokenSimilarity(gesture.targetContextText, aarishSemanticWindow(runner.node, 1500)),
+            tokenSimilarity(gesture.targetSiblingText, collectSiblingText(runner.node, 520)) * 0.88f
+        )
+        if (bestContext >= 0.62f && bestContext - runnerContext >= 0.10f) return false
+        if (runnerContext >= 0.62f && runnerContext - bestContext >= 0.08f) return true
+
+        val bestRole = roleSimilarity(gesture.targetRoleFlags, roleFlagsOf(best.node))
+        val runnerRole = roleSimilarity(gesture.targetRoleFlags, roleFlagsOf(runner.node))
+        if (bestRole >= 0.70f && bestRole - runnerRole >= 0.16f) return false
+        if (runnerRole >= 0.70f && runnerRole - bestRole >= 0.13f) return true
+
+        val bestShape = aarishShapeSimilarity(best.bounds, gesture)
+        val runnerShape = aarishShapeSimilarity(runner.bounds, gesture)
+        if (bestShape >= 0.72f && bestShape - runnerShape >= 0.14f) return false
+        if (runnerShape >= 0.72f && runnerShape - bestShape >= 0.12f) return true
+
+        val bestDna = dnaSimilarity(gesture.targetTreePath, extractTreePathDNA(best.node))
+        val runnerDna = dnaSimilarity(gesture.targetTreePath, extractTreePathDNA(runner.node))
+        if (bestDna >= 0.66f && bestDna - runnerDna >= 0.14f) return false
+        if (runnerDna >= 0.66f && runnerDna - bestDna >= 0.12f) return true
+
+        // Position is intentionally not allowed to break an otherwise exact duplicate:
+        // controls can legitimately move/reorder. If semantics cannot distinguish them,
+        // refusing the click is safer than guessing.
+        return gap < 24
     }
 
 private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
@@ -4506,7 +4548,7 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
             if (finalBest.score < threshold) return aarishGeometryFallbackWhenIdentityMissing(gesture)
 
             val runnerUp = secondBest
-            if (runnerUp != null && isAmbiguousSmartMatch(finalBest, runnerUp, gesture)) {
+            if (runnerUp != null && aarishDuplicateSemanticAmbiguous(finalBest, runnerUp, gesture)) {
                 return aarishGeometryFallbackWhenIdentityMissing(gesture)
             }
 
