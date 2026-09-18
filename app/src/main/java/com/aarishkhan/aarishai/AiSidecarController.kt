@@ -1181,7 +1181,7 @@ class AiSidecarController(private val service: AutoActionService) {
             val settledAfterGeneration =
                 generationEndedAt > 0L && nowElapsed - generationEndedAt >= 1_800L
             val noGenerationSignalButSlow =
-                !sawGenerating && elapsed >= 18_000L && providerUiSerial.get() > 0L
+                !sawGenerating && elapsed >= 18_000L && providerUiEventAt >= started
             if (parsed == null &&
                 !earlyOcrAttempted &&
                 !generating &&
