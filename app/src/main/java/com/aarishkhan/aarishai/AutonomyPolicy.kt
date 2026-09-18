@@ -67,4 +67,23 @@ internal object AutonomyPolicy {
 
         return orientationSafe
     }
+    /**
+     * AI WAIT may unlock only from a semantic matcher result, never from raw coordinates.
+     * If both packages are known they must agree, preventing a similarly-labelled control
+     * in a provider/launcher window from accidentally releasing the wait gate.
+     */
+    fun allowsAiWaitTargetReady(
+        hasSemanticIdentity: Boolean,
+        savedPackageRaw: String,
+        livePackageRaw: String
+    ): Boolean {
+        if (!hasSemanticIdentity) return false
+        val savedPackage = savedPackageRaw.trim()
+        val livePackage = livePackageRaw.trim()
+        if (savedPackage.isNotBlank() && livePackage.isNotBlank() &&
+            !savedPackage.equals(livePackage, ignoreCase = true)
+        ) return false
+        return true
+    }
+
 }

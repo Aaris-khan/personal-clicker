@@ -1187,10 +1187,13 @@ private fun aarishAiWaitForNextRecordedTarget(
     token: Int,
     nextRecordedGesture: RecordedGesture?
 ) {
-    // AARISH_AI_WAIT_OWN_LABEL_MAGNETIC_V8
+    // AARISH_AI_WAIT_NORMAL_MATCHER_HANDOFF_V9
+    // Readiness must use the same trusted semantic matcher as normal replay.
+    // The old extra "small target + own label" gate could reject a valid Copy/Send
+    // control even after findBestSmartTarget had already identified it confidently.
     val startedAt = android.os.SystemClock.elapsedRealtime()
     val maxWaitMs = 30L * 60L * 1000L
-    val pollMs = 1200L
+    val pollMs = 450L
     // AARISH_30M_WAIT_CONTINUE_V1
     // Timeout belongs to this wait gate only. Replaying the complete workflow from
     // the beginning can loop forever and repeat already-completed actions.
@@ -1230,75 +1233,32 @@ private fun aarishAiWaitForNextRecordedTarget(
         finishWait()
     }
 
-    fun norm(v: String?): String = v.orEmpty()
-        .lowercase(java.util.Locale.US)
-        .replace(Regex("[^a-z0-9\\u0600-\\u06FF\\u0750-\\u077F\\u0900-\\u097F]+"), " ")
-        .replace(Regex("\\s+"), " ")
-        .trim()
-
-    fun useful(v: String): Boolean {
-        val bad = setOf("", "view", "text", "button", "image", "layout", "android", "widget", "item")
-        return v.length >= 2 && v !in bad
-    }
-
-    fun needles(g: RecordedGesture): List<String> = listOf(
-        norm(g.targetText),
-        norm(g.targetDesc),
-        norm(g.targetId?.substringAfterLast("/")?.substringAfterLast(":")?.replace("_", " ")?.replace("-", " "))
-    ).filter { useful(it) }.distinct()
-
-    fun ownLabels(node: AccessibilityNodeInfo?): List<String> {
-        val n = node ?: return emptyList()
-        val action = try { findClickableParent(n) ?: n } catch (_: Throwable) { n }
-        val out = mutableListOf<String>()
-
-        fun add(x: AccessibilityNodeInfo?) {
-            try { out.add(norm(safeText(x))) } catch (_: Throwable) {}
-            try { out.add(norm(safeDesc(x))) } catch (_: Throwable) {}
-            try { out.add(norm(safeId(x)?.substringAfterLast("/")?.substringAfterLast(":")?.replace("_", " ")?.replace("-", " "))) } catch (_: Throwable) {}
-        }
-
-        add(n)
-        add(action)
-
-        val childCount = try { action.childCount.coerceAtMost(6) } catch (_: Throwable) { 0 }
-        for (i in 0 until childCount) {
-            add(try { action.getChild(i) } catch (_: Throwable) { null })
-        }
-
-        return out.filter { it.isNotBlank() }.distinct()
-    }
-
-    fun smallTarget(node: AccessibilityNodeInfo?): Boolean {
-        val n = try { findClickableParent(node) ?: node } catch (_: Throwable) { node } ?: return false
-        if (!safeVisible(n) || !safeEnabled(n)) return false
-        val b = Rect()
-        if (!safeBounds(n, b) || b.width() <= 0 || b.height() <= 0) return false
-        val area = (b.width().toFloat() * b.height().toFloat()) /
-            (resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f) *
-                resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f))
-        return area <= 0.42f
-    }
-
-    fun wordHit(label: String, needle: String): Boolean {
-        if (label == needle) return true
-        if (needle.length <= 5) return label.split(" ").any { it == needle }
-        return label.contains(needle) || try { tokenSimilarity(label, needle) >= 0.90f } catch (_: Throwable) { false }
-    }
-
-    fun hit(match: SmartMatch?, g: RecordedGesture): Boolean {
+    fun trustedReadyMatch(match: SmartMatch?, g: RecordedGesture): Boolean {
         val m = match ?: return false
-        if (!smallTarget(m.node)) return false
-        val ns = needles(g)
-        if (ns.isEmpty()) return false
-        return ownLabels(m.node).any { label -> ns.any { n -> wordHit(label, n) } }
+        val savedPackage = g.targetPackage?.trim().orEmpty().ifBlank {
+            try { aarishSavedPackageFromId(g) } catch (_: Throwable) { "" }
+        }
+        val livePackage = try { aarishNodePackage(m.node) } catch (_: Throwable) { "" }
+
+        return AutonomyPolicy.allowsAiWaitTargetReady(
+            hasSemanticIdentity = aarishHasPrimaryIdentity(g),
+            savedPackageRaw = savedPackage,
+            livePackageRaw = livePackage
+        )
     }
 
     fun targetReady(): Boolean {
         val g = nextRecordedGesture ?: return false
-        if (hit(try { findExactActionButtonAcrossWindows(g) } catch (_: Throwable) { null }, g)) return true
-        if (hit(try { findSelectorTargetAcrossWindows(g) } catch (_: Throwable) { null }, g)) return true
-        if (hit(try { findBestSmartTarget(g) } catch (_: Throwable) { null }, g)) return true
+
+        // AI WAIT is a gate, not a coordinate timer. A pure XY step has no evidence that
+        // its logical control actually exists yet, so it must never unlock on geometry alone.
+        if (!aarishHasPrimaryIdentity(g)) return false
+
+        // Use the exact same confidence/ambiguity machinery normal replay already trusts.
+        // Do NOT re-impose an own-label/size test after a SmartMatch: that was the bug.
+        if (trustedReadyMatch(try { findSelectorTargetAcrossWindows(g) } catch (_: Throwable) { null }, g)) return true
+        if (trustedReadyMatch(try { findExactActionButtonAcrossWindows(g) } catch (_: Throwable) { null }, g)) return true
+        if (trustedReadyMatch(try { findBestSmartTarget(g) } catch (_: Throwable) { null }, g)) return true
         return false
     }
 

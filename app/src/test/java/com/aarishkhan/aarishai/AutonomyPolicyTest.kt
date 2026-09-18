@@ -63,4 +63,28 @@ class AutonomyPolicyTest {
             )
         )
     }
+    @Test
+    fun aiWaitReady_requiresSemanticIdentityAndRejectsWrongPackage() {
+        assertTrue(
+            AutonomyPolicy.allowsAiWaitTargetReady(
+                true, "com.openai.chatgpt", "com.openai.chatgpt"
+            )
+        )
+        assertTrue(
+            AutonomyPolicy.allowsAiWaitTargetReady(
+                true, "com.openai.chatgpt", ""
+            )
+        )
+        assertFalse(
+            AutonomyPolicy.allowsAiWaitTargetReady(
+                false, "com.openai.chatgpt", "com.openai.chatgpt"
+            )
+        )
+        assertFalse(
+            AutonomyPolicy.allowsAiWaitTargetReady(
+                true, "com.openai.chatgpt", "com.android.launcher"
+            )
+        )
+    }
+
 }

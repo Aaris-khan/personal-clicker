@@ -7379,7 +7379,7 @@ fun addWaitAiGesture(): Boolean {
                 GesturePoint(-400f, -400f, 90L)
             ),
             targetText = "WAIT_NEXT_TARGET_AI_GATE",
-            targetDesc = "AI Wait: waits for next recorded target up to 20 minutes",
+            targetDesc = "AI Wait: waits for next recorded target up to 30 minutes",
             targetId = "ai_wait:next_recorded_target",
             targetContextText = "AI Wait: wait until next recorded target appears, then continue"
         )
