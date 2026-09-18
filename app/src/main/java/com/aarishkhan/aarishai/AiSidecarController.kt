@@ -55,6 +55,9 @@ class AiSidecarController(private val service: AutoActionService) {
         val clickable: Boolean,
         val editable: Boolean,
         val enabled: Boolean,
+        val checkable: Boolean = false,
+        val checked: Boolean = false,
+        val selected: Boolean = false,
         val context: String = ""
     )
 
@@ -484,7 +487,14 @@ class AiSidecarController(private val service: AutoActionService) {
             val label = listOf(e.text, e.desc).filter { it.isNotBlank() }.joinToString(" / ").take(140)
             val idHint = e.viewId.substringAfterLast('/').take(90)
             val contextHint = e.context.take(150)
-            "${e.key}|${e.className.substringAfterLast('.')}|${if (e.clickable) "C" else "-"}${if (e.editable) "E" else "-"}|id=$idHint|label=$label|ctx=$contextHint|bounds=${e.bounds.left},${e.bounds.top},${e.bounds.right},${e.bounds.bottom}"
+            val stateFlags = buildString {
+                append(if (e.clickable) "C" else "-")
+                append(if (e.editable) "E" else "-")
+                append(if (e.checkable) "Q" else "-")
+                append(if (e.checked) "K" else "-")
+                append(if (e.selected) "S" else "-")
+            }
+            "${e.key}|${e.className.substringAfterLast('.')}|$stateFlags|id=$idHint|label=$label|ctx=$contextHint|bounds=${e.bounds.left},${e.bounds.top},${e.bounds.right},${e.bounds.bottom}"
         }
         val history = actionHistory.joinToString("\n") { "- $it" }
         return buildString {
@@ -1636,6 +1646,9 @@ class AiSidecarController(private val service: AutoActionService) {
             val enabled = try { node.isEnabled } catch (_: Throwable) { false }
             val clickable = try { node.isClickable } catch (_: Throwable) { false }
             val editable = try { node.isEditable } catch (_: Throwable) { false }
+            val checkable = try { node.isCheckable } catch (_: Throwable) { false }
+            val checked = try { node.isChecked } catch (_: Throwable) { false }
+            val selected = try { node.isSelected } catch (_: Throwable) { false }
             val text = node.text?.toString().orEmpty().trim().take(300)
             val desc = node.contentDescription?.toString().orEmpty().trim().take(300)
             val id = try { node.viewIdResourceName.orEmpty() } catch (_: Throwable) { "" }
@@ -1656,6 +1669,9 @@ class AiSidecarController(private val service: AutoActionService) {
                         clickable,
                         editable,
                         enabled,
+                        checkable,
+                        checked,
+                        selected,
                         buildUiContextHint(node)
                     )
                 )
@@ -1692,14 +1708,35 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun buildFingerprint(pkg: String, elements: List<UiElement>): String {
+        // AARISH_AI_STRONG_FINGERPRINT_V4
+        // Include semantic state (checked/selected) so toggles are observable even when
+        // their text and geometry stay identical. SHA-256 avoids weak 32-bit hash collisions.
         val raw = buildString {
             append(pkg)
-            elements.take(100).forEach { e ->
-                append('|').append(e.viewId).append(':').append(e.text.take(70)).append(':').append(e.desc.take(70))
-                    .append(':').append(e.bounds.left / 12).append(',').append(e.bounds.top / 12)
+            elements.take(120).forEach { e ->
+                append('|').append(e.viewId)
+                    .append(':').append(e.className)
+                    .append(':').append(e.text.take(90))
+                    .append(':').append(e.desc.take(90))
+                    .append(':').append(if (e.clickable) '1' else '0')
+                    .append(if (e.editable) '1' else '0')
+                    .append(if (e.enabled) '1' else '0')
+                    .append(if (e.checkable) '1' else '0')
+                    .append(if (e.checked) '1' else '0')
+                    .append(if (e.selected) '1' else '0')
+                    .append(':').append(e.bounds.left / 8).append(',').append(e.bounds.top / 8)
+                    .append(',').append(e.bounds.width() / 8).append(',').append(e.bounds.height() / 8)
             }
         }
-        return raw.hashCode().toString(16)
+        return try {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(raw.toByteArray(Charsets.UTF_8))
+            digest.take(16).joinToString("") { byte ->
+                (byte.toInt() and 0xff).toString(16).padStart(2, '0')
+            }
+        } catch (_: Throwable) {
+            raw.hashCode().toString(16)
+        }
     }
 
     private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
