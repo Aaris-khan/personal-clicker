@@ -3479,13 +3479,17 @@ private fun aarishAiWaitForNextRecordedTarget(
         gesture: RecordedGesture,
         fp: AarishVisualFingerprintBundle,
         screenW: Float,
-        screenH: Float
+        screenH: Float,
+        runId: Int,
+        livePackageSnapshot: String
     ): AarishVisualHit? {
+        if (!isSamePlaybackRun(runId)) return null
+
         val savedH = fp.tapH ?: return null
         val savedV = fp.tapV
 
         val savedPkg = aarishSavedPackageFromId(gesture)
-        val livePkg = aarishBestForegroundPackageForOcr()?.trim()?.lowercase().orEmpty()
+        val livePkg = livePackageSnapshot.trim().lowercase()
         if (savedPkg.isNotBlank() && livePkg.isNotBlank() && savedPkg != livePkg) return null
 
         val density = resources.displayMetrics.density.coerceAtLeast(1f)
@@ -3595,12 +3599,15 @@ private fun aarishAiWaitForNextRecordedTarget(
         // Coarse multi-scale search. Step size is bounded so low-RAM phones do not
         // pay for pixel-by-pixel template matching.
         for (scale in floatArrayOf(0.82f, 1.0f, 1.18f)) {
+            if (!isSamePlaybackRun(runId)) return null
+
             val w = (baseW * scale).coerceIn(36f, screenW * 0.46f)
             val h = (baseH * scale).coerceIn(30f, screenH * 0.25f)
             val step = kotlin.math.max(10f * density, kotlin.math.min(w, h) * 0.28f)
 
             var cy = h / 2f
             while (cy <= screenH - h / 2f) {
+                if (!isSamePlaybackRun(runId)) return null
                 var cx = w / 2f
                 while (cx <= screenW - w / 2f) {
                     evaluate(cx, cy, w, h)
@@ -3623,10 +3630,13 @@ private fun aarishAiWaitForNextRecordedTarget(
             val centerY = coarse.bounds.exactCenterY()
 
             for (scale in floatArrayOf(0.94f, 1.0f, 1.06f)) {
+                if (!isSamePlaybackRun(runId)) return null
+
                 val w = coarse.bounds.width() * scale
                 val h = coarse.bounds.height() * scale
                 var cy = centerY - radiusY
                 while (cy <= centerY + radiusY) {
+                    if (!isSamePlaybackRun(runId)) return null
                     var cx = centerX - radiusX
                     while (cx <= centerX + radiusX) {
                         evaluate(cx, cy, w, h)
@@ -3846,6 +3856,8 @@ private fun aarishAiWaitForNextRecordedTarget(
                             }
                             val roots = collectSmartSearchRoots(anchorX.toInt(), anchorY.toInt())
                             val savedPkg = aarishSavedPackageFromId(gesture)
+                            val livePackageSnapshot =
+                                aarishBestForegroundPackageForOcr()?.trim()?.lowercase().orEmpty()
 
                             fun finishWithLocalVisionRescue() {
                                 if (!isSamePlaybackRun(runId)) {
@@ -4072,11 +4084,13 @@ private fun aarishAiWaitForNextRecordedTarget(
                             aarishVisualMatchExecutor.execute {
                                 val dense = try {
                                     aarishDenseScreenshotVisualSearch(
-                                        bitmap,
-                                        gesture,
-                                        denseFingerprint,
-                                        screenW,
-                                        screenH
+                                        bitmap = bitmap,
+                                        gesture = gesture,
+                                        fp = denseFingerprint,
+                                        screenW = screenW,
+                                        screenH = screenH,
+                                        runId = runId,
+                                        livePackageSnapshot = livePackageSnapshot
                                     )
                                 } catch (_: Throwable) {
                                     null
