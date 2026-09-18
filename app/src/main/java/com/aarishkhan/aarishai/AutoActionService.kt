@@ -324,21 +324,6 @@ class AutoActionService : AccessibilityService() {
     @Volatile
     private var isPlayingInternal = false
 
-    // AARISH_LOCAL_VISION_FALLBACK_V1_FIELDS
-    private data class AarishVisionCache(
-        val key: String,
-        val xPercent: Float,
-        val yPercent: Float,
-        val confidence: Float,
-        val atMs: Long
-    )
-
-    @Volatile
-    private var aarishVisionCache: AarishVisionCache? = null
-    private val aarishVisionInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
-    private val aarishUiMutationSerial = java.util.concurrent.atomic.AtomicLong(0L)
-
-
     // AARISH_WAKE_LOCK_ENGINE_V2_FIELDS
     private var aarishCpuWakeLock: android.os.PowerManager.WakeLock? = null
     private var aarishScreenWakeLock: android.os.PowerManager.WakeLock? = null
@@ -376,10 +361,6 @@ class AutoActionService : AccessibilityService() {
     private var workflowSequence: List<String> = emptyList()
     private var workflowIndex = 0
     private var isMasterPlaybackInternal = false
-    // AARISH_AI_RESCUE_CONTEXT_V2
-    private var aarishReplayContextSteps: List<RecordedGesture> = emptyList()
-
-
     // AARISH_WAKE_LOCK_ENGINE_V2_HELPERS
     @android.annotation.SuppressLint("WakelockTimeout")
     private fun acquirePlaybackWakeLocks() {
@@ -842,7 +823,7 @@ class AutoActionService : AccessibilityService() {
 
         // AARISH_RELATIVE_INTENT_TIMING_V1
         // Playback timing is step-relative, not tied to a wall-clock deadline from sequence start.
-        // If a previous step needs slow loading / semantic recovery / AI rescue, later intentional
+        // If a previous step needs slow loading / deterministic semantic recovery, later intentional
         // pauses must not collapse to zero merely because the original absolute schedule is "late".
         fun recordedGestureDurationMs(g: RecordedGesture): Long {
             return g.points.maxOfOrNull { it.t.coerceAtLeast(0L) }
@@ -1101,11 +1082,6 @@ class AutoActionService : AccessibilityService() {
                         return
                     }
 
-                    // AARISH_AI_RESCUE_CONTEXT_V2_CAPTURE
-                    aarishReplayContextSteps = orderedGestures
-                        .take(index + 1)
-                        .filter { (it.points.firstOrNull()?.x ?: -999f) > -50f }
-                        .takeLast(4)
                     dispatchOneGesture(gesture, runId, nextRealGestureAfter(index))
 
                     val waitForGestureFinish = object : Runnable {
@@ -1142,7 +1118,6 @@ private fun stopPlaybackInternal(showToast: Boolean = true) {
         // AARISH_AI_CANCEL_WITH_PLAYBACK_V2: STOP means rescue/mission callbacks must not continue stale work.
         try { if (aiSidecarController.isRunning()) aiSidecarController.stop("stopped") } catch (_: Throwable) {}
     isPlayingInternal = false
-    aarishVisionCache = null // AARISH_LOCAL_VISION_FALLBACK_V1_STOP_CLEAR
         releasePlaybackWakeLocks()
     playbackRunId.incrementAndGet()
 
@@ -1155,7 +1130,6 @@ private fun stopPlaybackInternal(showToast: Boolean = true) {
     // AARISH_STALE_TASK_FIX_V1: handler ke sab callbacks mat kaato; sirf playback scheduledTasks remove karo.
     // Isse service ke future safe callbacks accidentally cancel nahi hote.
     resetActiveGestures()
-    aarishReplayContextSteps = emptyList() // AARISH_AI_RESCUE_CONTEXT_V2_STOP
     chainVisitedInRun.clear()
     configCycleCounters.clear()
     masterWorkflowSteps = emptyList()
@@ -1400,182 +1374,6 @@ private fun aarishAiWaitForNextRecordedTarget(
 
 
 
-    // AARISH_LOCAL_VISION_FALLBACK_V1_START
-    private fun aarishVisionKey(g: RecordedGesture): String {
-        return listOf(
-            g.targetPackage,
-            g.targetId,
-            g.targetText,
-            g.targetDesc,
-            g.targetClass,
-            g.targetRoleFlags,
-            g.targetTreePath
-        ).joinToString("\u241F") { value ->
-            value.orEmpty()
-                .replace(Regex("[\\r\\n\\t]+"), " ")
-                .replace(Regex("\\s+"), " ")
-                .trim()
-                .lowercase(java.util.Locale.US)
-                .take(420)
-        }.take(2600)
-    }
-
-    private fun aarishVisionPackageLooksSafe(g: RecordedGesture): Boolean {
-        val saved = g.targetPackage.orEmpty().trim().lowercase(java.util.Locale.US)
-        if (saved.isBlank()) return true
-
-        val livePackages = linkedSetOf<String>()
-        try {
-            rootInActiveWindow?.packageName?.toString()?.trim()?.lowercase(java.util.Locale.US)
-                ?.takeIf { it.isNotBlank() && it != packageName.lowercase(java.util.Locale.US) }
-                ?.let { livePackages.add(it) }
-        } catch (_: Throwable) {}
-
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-            try {
-                windows.forEach { window ->
-                    window.root?.packageName?.toString()?.trim()?.lowercase(java.util.Locale.US)
-                        ?.takeIf { it.isNotBlank() && it != packageName.lowercase(java.util.Locale.US) }
-                        ?.let { livePackages.add(it) }
-                }
-            } catch (_: Throwable) {}
-        }
-
-        return livePackages.isEmpty() || livePackages.contains(saved)
-    }
-
-    private fun aarishCacheVisionTarget(
-        g: RecordedGesture,
-        target: LocalVisionLocator.VisionTarget
-    ) {
-        if (!target.found || target.confidence < 0.50f) return
-        if (target.xPercent !in 0f..1f || target.yPercent !in 0f..1f) return
-        if (!aarishVisionPackageLooksSafe(g)) return
-
-        aarishVisionCache = AarishVisionCache(
-            key = aarishVisionKey(g),
-            xPercent = target.xPercent,
-            yPercent = target.yPercent,
-            confidence = target.confidence,
-            atMs = android.os.SystemClock.elapsedRealtime()
-        )
-    }
-
-    private fun aarishConsumeCachedVisionPoint(g: RecordedGesture): Pair<Float, Float>? {
-        val cached = aarishVisionCache ?: return null
-        if (cached.key != aarishVisionKey(g)) return null
-
-        val age = android.os.SystemClock.elapsedRealtime() - cached.atMs
-        if (age < 0L || age > 1_800L) {
-            aarishVisionCache = null
-            return null
-        }
-        if (cached.confidence < 0.72f || !aarishVisionPackageLooksSafe(g)) {
-            aarishVisionCache = null
-            return null
-        }
-
-        aarishVisionCache = null
-        val sw = (resources.displayMetrics.widthPixels.toFloat() - 2f).coerceAtLeast(2f)
-        val sh = (resources.displayMetrics.heightPixels.toFloat() - 2f).coerceAtLeast(2f)
-        return Pair(
-            (cached.xPercent.coerceIn(0f, 1f) * sw).coerceIn(2f, sw),
-            (cached.yPercent.coerceIn(0f, 1f) * sh).coerceIn(2f, sh)
-        )
-    }
-
-    private fun aarishTryCachedVisionTap(g: RecordedGesture, runId: Int): Boolean {
-        if (!isSamePlaybackRun(runId)) return false
-        val point = aarishConsumeCachedVisionPoint(g) ?: return false
-        val token = beginActiveGesture()
-        aarishDispatchTapWithToken(
-            x = point.first,
-            y = point.second,
-            runId = runId,
-            token = token,
-            label = "🧠 Vision AI click",
-            tapDurationMs = 105L,
-            postGapMs = 90L
-        )
-        return true
-    }
-
-    private fun aarishRequestLocalVisionTarget(
-        g: RecordedGesture,
-        runId: Int,
-        callback: (LocalVisionLocator.VisionTarget?) -> Unit
-    ): Boolean {
-        if (!isSamePlaybackRun(runId)) return false
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return false
-        if (!aarishVisionPackageLooksSafe(g)) return false
-        if (!aarishVisionInFlight.compareAndSet(false, true)) return false
-
-        val executor = java.util.concurrent.Executor { runnable -> handler.post(runnable) }
-        val delivered = java.util.concurrent.atomic.AtomicBoolean(false)
-        var timeoutTask: Runnable? = null
-
-        fun finish(result: LocalVisionLocator.VisionTarget?) {
-            if (!delivered.compareAndSet(false, true)) return
-            timeoutTask?.let { task ->
-                try { handler.removeCallbacks(task) } catch (_: Throwable) {}
-                try { scheduledTasks.remove(task) } catch (_: Throwable) {}
-            }
-            aarishVisionInFlight.set(false)
-            handler.post {
-                callback(if (isSamePlaybackRun(runId)) result else null)
-            }
-        }
-
-        timeoutTask = object : Runnable {
-            override fun run() {
-                scheduledTasks.remove(this)
-                finish(null)
-            }
-        }
-        scheduledTasks.add(timeoutTask!!)
-        handler.postDelayed(timeoutTask!!, 15_000L)
-
-        return try {
-            takeScreenshot(
-                android.view.Display.DEFAULT_DISPLAY,
-                executor,
-                object : android.accessibilityservice.AccessibilityService.TakeScreenshotCallback {
-                    override fun onSuccess(
-                        screenshot: android.accessibilityservice.AccessibilityService.ScreenshotResult
-                    ) {
-                        if (!isSamePlaybackRun(runId)) {
-                            try { screenshot.hardwareBuffer.close() } catch (_: Throwable) {}
-                            finish(null)
-                            return
-                        }
-
-                        val bitmap = aarishBitmapFromScreenshot(screenshot)
-                        if (bitmap == null) {
-                            finish(null)
-                            return
-                        }
-
-                        LocalVisionLocator.locate(
-                            context = applicationContext,
-                            bitmap = bitmap,
-                            gesture = g
-                        ) { target ->
-                            handler.post { finish(target) }
-                        }
-                    }
-
-                    override fun onFailure(errorCode: Int) {
-                        finish(null)
-                    }
-                }
-            )
-            true
-        } catch (_: Throwable) {
-            finish(null)
-            false
-        }
-    }
-    // AARISH_LOCAL_VISION_FALLBACK_V1_END
 
     // AARISH_OCR_TEXT_CLICK_V4_HELPER
     private fun aarishNormOcr(raw: String?): String {
@@ -7043,15 +6841,6 @@ val root = window.root ?: continue
 
         val type = event.eventType
         val floating = FloatingControlService.instance
-
-        // AARISH_LOCAL_VISION_UI_MUTATION_V1
-        if (type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
-            type == AccessibilityEvent.TYPE_VIEW_SCROLLED ||
-            type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            type == AccessibilityEvent.TYPE_WINDOWS_CHANGED
-        ) {
-            aarishUiMutationSerial.incrementAndGet()
-        }
 
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             type == AccessibilityEvent.TYPE_WINDOWS_CHANGED
