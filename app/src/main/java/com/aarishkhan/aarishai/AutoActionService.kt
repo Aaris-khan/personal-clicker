@@ -1356,52 +1356,23 @@ private fun aarishAiWaitForNextRecordedTarget(
             }
 
             if (targetReady()) {
-                showTinyToast("AI WAIT done → target")
+                showTinyToast("Smart wait done → target")
                 finishWait()
                 return
             }
 
             val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
 
-            // AARISH_LOCAL_VISION_AI_WAIT_V1
-            // Magnetic remains first. On a miss, a screenshot is sent only to the SAME-PHONE
-            // local VLM. If the screen is still unchanged after a miss, do not spam the model.
-            val targetGesture = nextRecordedGesture
-            val uiSerial = aarishUiMutationSerial.get()
-            if (targetGesture != null &&
-                elapsed >= 1_100L &&
-                !visionRequestPending &&
-                uiSerial != lastVisionSerial &&
-                elapsed - lastVisionAt >= 3_500L
-            ) {
-                visionRequestPending = true
-                lastVisionSerial = uiSerial
-                lastVisionAt = elapsed
-
-                val launched = aarishRequestLocalVisionTarget(targetGesture, runId) { target ->
-                    visionRequestPending = false
-                    if (!finished &&
-                        isSamePlaybackRun(runId) &&
-                        target?.found == true
-                    ) {
-                        aarishCacheVisionTarget(targetGesture, target)
-                        if (aarishVisionCache != null) {
-                            showTinyToast("🧠 Local Vision found target")
-                            finishWait()
-                        }
-                    }
-                }
-
-                if (!launched) visionRequestPending = false
-            }
-
+            // AARISH_DETERMINISTIC_WAIT_ONLY_V1
+            // Normal replay never asks any AI/VLM here. It only polls the live
+            // Accessibility/selector tree until the recorded target becomes available.
             if (elapsed >= maxWaitMs) {
                 restartAfterTimeout()
                 return
             }
 
             if (elapsed - lastToastMs >= 6000L) {
-                showTinyToast("AI WAIT holding ${elapsed / 1000}s")
+                showTinyToast("Smart wait holding ${elapsed / 1000}s")
                 lastToastMs = elapsed
             }
 
@@ -1413,7 +1384,7 @@ private fun aarishAiWaitForNextRecordedTarget(
     currentTask = pollTask
     scheduledTasks.add(pollTask)
     handler.postDelayed(pollTask, pollMs)
-    showTinyToast("⏳ AI WAIT 20min magnetic")
+    showTinyToast("⏳ Smart wait 20min deterministic")
 }
 
 
@@ -3098,14 +3069,14 @@ private fun aarishAiWaitForNextRecordedTarget(
         val movement = hasRealMovement(points)
         val duration = kotlin.math.max(50L, points.maxOf { it.t.coerceAtLeast(0L) }).coerceAtMost(600000L)
 
-        // AARISH_SEMANTIC_FIRST_DISPATCH_V4
-        // Tap resolver priority:
+        // AARISH_DETERMINISTIC_DISPATCH_V5
+        // Normal replay resolver priority (strictly local + deterministic):
         // 1) live Accessibility identity/structure
         // 2) OCR identity
-        // 3) short live-target settle (vision can assist in parallel)
+        // 3) short live-target settle using the same deterministic matcher
         // 4) explicit Files fallback
-        // 5) short-lived vision cache
-        // 6) raw/normalized XY last
+        // 5) raw/normalized XY last when allowed
+        // No ChatGPT/Gemini sidecar and no LocalVision model are invoked here.
         val match = if (!movement || hasStrongSavedIdentity(recordedGesture) || hasSavedPercentAnchor(recordedGesture)) {
             findBestSmartTarget(recordedGesture)
         } else {
@@ -3123,15 +3094,13 @@ private fun aarishAiWaitForNextRecordedTarget(
         if (!movement &&
             (hasStrongSavedIdentity(recordedGesture) || hasSavedPercentAnchor(recordedGesture) || aarishHasAnyRichIdentity(recordedGesture))
         ) {
-            // AARISH_AI_RESCUE_ALWAYS_ON_SEMANTIC_MISS_V2
+            // AARISH_DETERMINISTIC_RETRY_ON_SEMANTIC_MISS_V1
             if (trySmartTargetAfterShortSettle(recordedGesture, runId, 3500L)) return
         }
 
         if (!movement && duration < 450L && aarishTryFilesWordNodeClickV2(recordedGesture, runId, "Files click")) {
             return
         }
-
-        if (!movement && duration < 450L && aarishTryCachedVisionTap(recordedGesture, runId)) return
 
         if (!movement &&
             match == null &&
@@ -3401,41 +3370,9 @@ private fun trySmartTargetAfterShortSettle(
             if (isCurrentCallbackRun(runId)) finishActiveGesture(token)
         }
 
-        fun finishWithVision(target: LocalVisionLocator.VisionTarget) {
-            if (finished) return
-            if (!target.found || target.confidence < 0.50f) return
-            if (!aarishVisionPackageLooksSafe(recordedGesture)) return
-
-            finished = true
-            currentTask?.let {
-                try { scheduledTasks.remove(it) } catch (_: Throwable) {}
-                try { handler.removeCallbacks(it) } catch (_: Throwable) {}
-            }
-
-            if (!isSamePlaybackRun(runId)) return
-
-            val sw = (resources.displayMetrics.widthPixels.toFloat() - 2f).coerceAtLeast(2f)
-            val sh = (resources.displayMetrics.heightPixels.toFloat() - 2f).coerceAtLeast(2f)
-            val x = (target.xPercent.coerceIn(0f, 1f) * sw).coerceIn(2f, sw)
-            val y = (target.yPercent.coerceIn(0f, 1f) * sh).coerceIn(2f, sh)
-
-            aarishDispatchTapWithToken(
-                x = x,
-                y = y,
-                runId = runId,
-                token = token,
-                label = "🧠 Vision AI click",
-                tapDurationMs = 105L,
-                postGapMs = 90L
-            )
-        }
-
-        // AARISH_LOCAL_VISION_SHORT_SETTLE_V1
-        // We are already here because the first magnetic pass missed. Start visual reasoning
-        // now; magnetic polling continues in parallel and wins if it resolves first.
-        aarishRequestLocalVisionTarget(recordedGesture, runId) { target ->
-            if (!finished && target?.found == true) finishWithVision(target)
-        }
+        // AARISH_DETERMINISTIC_SHORT_SETTLE_V1
+        // Keep polling only the deterministic smart matcher. No model call is allowed
+        // from normal replay, even when the first semantic lookup misses.
 
         fun tryClickNow(): Boolean {
             if (!isSamePlaybackRun(runId)) return true
@@ -3546,26 +3483,12 @@ private fun trySmartTargetAfterShortSettle(
 
                 val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
                 if (elapsed >= maxWait) {
-                    // AARISH_AI_RESCUE_ON_REPLAY_MISS_V1
-                    val rescueStarted = try {
-                        aiSidecarController.rescueRecordedFailure(recordedGesture, aarishReplayContextSteps) { ok ->
-                            if (ok) {
-                                showTinyToast("AI rescue complete")
-                                finishOnce()
-                            } else {
-                                showTinyToast("AI rescue failed — playback stopped")
-                                finishOnce()
-                                if (isSamePlaybackRun(runId)) stopPlaybackInternal(showToast = false)
-                            }
-                        }
-                    } catch (_: Throwable) {
-                        false
-                    }
-                    if (!rescueStarted) {
-                        showTinyToast("Target nahi mila — playback stopped")
-                        finishOnce()
-                        if (isSamePlaybackRun(runId)) stopPlaybackInternal(showToast = false)
-                    }
+                    // AARISH_NORMAL_REPLAY_NO_EXTERNAL_AI_V1
+                    // A missing recorded target is a deterministic replay failure.
+                    // Never open ChatGPT/Gemini or any model from this path.
+                    showTinyToast("Target nahi mila — deterministic playback stopped")
+                    finishOnce()
+                    if (isSamePlaybackRun(runId)) stopPlaybackInternal(showToast = false)
                     return
                 }
 
