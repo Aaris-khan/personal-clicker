@@ -7112,6 +7112,12 @@ val root = window.root ?: continue
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
 
+        // AARISH_AI_PROVIDER_EVENT_BRIDGE_V5
+        // Feed ChatGPT/Gemini UI mutations to the sidecar before normal recording
+        // filtering/early-returns. The response transaction no longer depends only
+        // on fixed polling intervals or a provider-specific Copy button.
+        try { aiSidecarController.onAccessibilityEvent(event) } catch (_: Throwable) {}
+
         val type = event.eventType
         val floating = FloatingControlService.instance
 
