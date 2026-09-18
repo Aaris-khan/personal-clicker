@@ -1189,7 +1189,7 @@ private fun aarishAiWaitForNextRecordedTarget(
 ) {
     // AARISH_AI_WAIT_OWN_LABEL_MAGNETIC_V8
     val startedAt = android.os.SystemClock.elapsedRealtime()
-    val maxWaitMs = 20L * 60L * 1000L
+    val maxWaitMs = 30L * 60L * 1000L
     val pollMs = 1200L
     val restartAsMaster = isMasterPlaybackInternal
     val restartOwner = if (restartAsMaster && masterWorkflowOwner.isNotBlank()) {
@@ -1229,7 +1229,7 @@ private fun aarishAiWaitForNextRecordedTarget(
             return
         }
 
-        showTinyToast("AI WAIT 20min → restart")
+        showTinyToast("AI WAIT 30min → restart")
         finishActiveGesture(token)
 
         val owner = restartOwner.trim()
@@ -1358,7 +1358,7 @@ private fun aarishAiWaitForNextRecordedTarget(
     currentTask = pollTask
     scheduledTasks.add(pollTask)
     handler.postDelayed(pollTask, pollMs)
-    showTinyToast("⏳ Smart wait 20min deterministic")
+    showTinyToast("⏳ Smart wait 30min deterministic")
 }
 
 
