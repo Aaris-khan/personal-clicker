@@ -243,7 +243,8 @@ class AiSidecarController(private val service: AutoActionService) {
                 )
                 return@captureTargetScreen
             }
-            val requestId = "A${System.currentTimeMillis().toString(36)}${missionStep.toString(36)}"
+            // AARISH_AI_REQUEST_ID_V4: collision-resistant correlation id for pseudo-API turns.
+            val requestId = "A" + UUID.randomUUID().toString().replace("-", "").take(12)
             val prompt = buildPlannerPrompt(requestId, state)
             val aiAttachment = if (rescueMode) buildRescueEvidenceAttachment(state.screenshot) else state.screenshot
             askPhysicalAi(run, provider, requestId, prompt, aiAttachment) { command ->
@@ -725,51 +726,75 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun waitForCompleteResponse(run: Int, provider: Provider, requestId: String, callback: (AiCommand?) -> Unit) {
+        // AARISH_AI_RESPONSE_TRANSACTION_V4
+        // Stabilize the correlated machine response itself, not the whole provider UI.
+        // Animated suggestions, timers or unrelated chat chrome must not hold a valid reply hostage.
         val started = SystemClock.elapsedRealtime()
-        var stableText = ""
-        var stableCount = 0
+        var stableCommandSignature = ""
+        var stableCommandCount = 0
         var sawGenerating = false
+        var providerMissingSince = 0L
+        var lastParsed: AiCommand? = null
+
+        fun signature(command: AiCommand?): String {
+            val c = command ?: return ""
+            return listOf(c.action, c.elementKey, c.payload, c.expected).joinToString("\u241F")
+        }
 
         fun poll() {
             if (!alive(run)) return
+            val nowElapsed = SystemClock.elapsedRealtime()
+            val elapsed = nowElapsed - started
             val root = findRootForPackage(provider.packageName)
+
             if (root == null) {
-                if (SystemClock.elapsedRealtime() - started > 120_000L) {
+                if (providerMissingSince == 0L) providerMissingSince = nowElapsed
+                val missingFor = nowElapsed - providerMissingSince
+                if (missingFor > 8_000L || elapsed > 78_000L) {
                     waitingForAi = false
-                    callback(null)
-                } else handler.postDelayed({ poll() }, 700L)
+                    callback(lastParsed)
+                } else {
+                    handler.postDelayed({ poll() }, 600L)
+                }
                 return
             }
+            providerMissingSince = 0L
 
             val text = flattenText(root, 26000)
             val generating = hasGeneratingIndicator(root)
             if (generating) sawGenerating = true
             val parsed = parseCommand(text, requestId)
+            if (parsed != null) lastParsed = parsed
 
-            if (text == stableText && text.isNotBlank()) stableCount++ else {
-                stableText = text
-                stableCount = 0
+            val currentSignature = signature(parsed)
+            if (currentSignature.isNotBlank() && currentSignature == stableCommandSignature) {
+                stableCommandCount++
+            } else {
+                stableCommandSignature = currentSignature
+                stableCommandCount = if (currentSignature.isNotBlank()) 1 else 0
             }
 
-            val complete = parsed != null && !generating && stableCount >= if (sawGenerating) 2 else 4
+            // One extra stability sample after generation, two when the app never exposes
+            // a generating affordance. This is much faster than waiting for all UI text to freeze.
+            val requiredStableSamples = if (sawGenerating) 2 else 3
+            val complete = parsed != null && !generating && stableCommandCount >= requiredStableSamples
             if (complete) {
                 waitingForAi = false
                 callback(parsed)
                 return
             }
 
-            val elapsed = SystemClock.elapsedRealtime() - started
-            if (elapsed > 120_000L) {
+            if (elapsed > 78_000L) {
                 // Last chance: OCR provider window so custom-rendered response can still be parsed.
                 captureProviderOcr(provider) { ocr ->
                     waitingForAi = false
-                    callback(parseCommand(ocr, requestId) ?: parsed)
+                    callback(parseCommand(ocr, requestId) ?: lastParsed)
                 }
                 return
             }
-            handler.postDelayed({ poll() }, 700L)
+            handler.postDelayed({ poll() }, 600L)
         }
-        handler.postDelayed({ poll() }, 900L)
+        handler.postDelayed({ poll() }, 750L)
     }
 
     private fun parseCommand(text: String, requestId: String): AiCommand? {
