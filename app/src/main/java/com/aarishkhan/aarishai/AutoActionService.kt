@@ -4433,6 +4433,29 @@ addRoot(window.root)
         addRoot(rootInActiveWindow)
 
         var best: SmartMatch? = null
+        var second: SmartMatch? = null
+
+        fun remember(candidate: SmartMatch) {
+            val oldBest = best
+            if (oldBest == null || candidate.score > oldBest.score ||
+                (candidate.score == oldBest.score &&
+                    candidate.bounds.width() * candidate.bounds.height() <
+                    oldBest.bounds.width() * oldBest.bounds.height())
+            ) {
+                second = oldBest
+                best = candidate
+                return
+            }
+
+            val oldSecond = second
+            if (oldSecond == null || candidate.score > oldSecond.score ||
+                (candidate.score == oldSecond.score &&
+                    candidate.bounds.width() * candidate.bounds.height() <
+                    oldSecond.bounds.width() * oldSecond.bounds.height())
+            ) {
+                second = candidate
+            }
+        }
 
         fun labelMatches(node: AccessibilityNodeInfo): Boolean {
             val text = safeText(node)
@@ -4476,25 +4499,39 @@ addRoot(window.root)
                 if (safeClickable(clickable)) score += 60
                 if (exactIdentityHit(clickable, gesture) || exactIdentityHit(node, gesture)) score += 55
 
+                val contextSim = maxOf(
+                    tokenSimilarity(gesture.targetContextText, aarishSemanticWindow(clickable, 1200)),
+                    tokenSimilarity(gesture.targetSiblingText, collectSiblingText(clickable, 420)) * 0.84f
+                )
+                val roleSim = roleSimilarity(gesture.targetRoleFlags, roleFlagsOf(clickable))
+                val dnaSim = dnaSimilarity(gesture.targetTreePath, extractTreePathDNA(clickable))
+                val shapeSim = aarishShapeSimilarity(bounds, gesture)
+
+                if (contextSim >= 0.78f) score += 42
+                else if (contextSim >= 0.58f) score += 20
+                if (roleSim >= 0.78f) score += 28
+                else if (roleSim >= 0.56f) score += 13
+                if (dnaSim >= 0.78f) score += 28
+                else if (dnaSim >= 0.56f) score += 12
+                if (shapeSim >= 0.82f) score += 20
+                else if (shapeSim >= 0.62f) score += 9
+
                 if (hasSavedPercentAnchor(gesture)) {
                     val dist = projectedTapDistance(bounds, gesture)
-                    if (dist < 0.08f) score += 32
-                    else if (dist < 0.22f) score += 14
+                    if (dist < 0.08f) score += 24
+                    else if (dist < 0.22f) score += 10
                 }
 
-                val candidate = SmartMatch(clickable, Rect(bounds), score)
-                val oldBest = best
-                if (oldBest == null ||
-                    candidate.score > oldBest.score ||
-                    (candidate.score == oldBest.score &&
-                        candidate.bounds.width() * candidate.bounds.height() < oldBest.bounds.width() * oldBest.bounds.height())
-                ) {
-                    best = candidate
-                }
+                remember(SmartMatch(clickable, Rect(bounds), score))
             }
         }
 
-        return best
+        val winner = best ?: return null
+        val runner = second
+        if (runner != null && aarishDuplicateSemanticAmbiguous(winner, runner, gesture)) {
+            return null
+        }
+        return winner
     }
 
 
