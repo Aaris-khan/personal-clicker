@@ -1157,26 +1157,33 @@ class AiSidecarController(private val service: AutoActionService) {
             val clipboardAfter = readClipboard()
             val clipChanged = clipboardAfter.isNotBlank() && clipboardAfter != clipboardBefore
             val expected = command.expected.trim()
+            val expectedBefore = expected.isNotBlank() && expectedMatchesState(before, expected)
+            val expectedNow = expected.isNotBlank() && expectedMatchesState(now, expected)
+            val expectedTransition = expectedNow && (!expectedBefore || changed || clipChanged)
 
+            // AARISH_AI_TRANSITION_PROOF_V4
+            // For actions that are supposed to cause a transition, a condition that was already
+            // true before the action is not proof by itself. Require fresh evidence or mutation.
             val verified = when (command.action) {
                 "WAIT" -> true
                 "SET_TEXT" -> textEntryMatches(before, command) ||
-                    (expected.isNotBlank() && expectedMatchesState(now, expected))
+                    (expected.isNotBlank() && expectedTransition)
                 "OPEN_APP" -> {
                     val wantedPkg = resolveLaunchPackageByLabel(command.payload)
-                    wantedPkg != null && now?.packageName == wantedPkg
+                    wantedPkg != null && now?.packageName == wantedPkg &&
+                        (before.packageName != wantedPkg || changed)
                 }
                 "TAP", "TAP_XY", "LONG_TAP", "SCROLL" -> when {
-                    expected.startsWith("PACKAGE=", ignoreCase = true) -> expectedMatchesState(now, expected)
+                    expected.startsWith("PACKAGE=", ignoreCase = true) -> expectedTransition
                     expected.equals("CLIPBOARD_CHANGE", ignoreCase = true) -> clipChanged
                     expected.equals("STATE_CHANGE", ignoreCase = true) -> changed
-                    expected.isNotBlank() -> expectedMatchesState(now, expected)
+                    expected.isNotBlank() -> expectedTransition
                     rescueMode -> changed || clipChanged
                     else -> false
                 }
                 "BACK", "HOME" -> when {
-                    expected.startsWith("PACKAGE=", ignoreCase = true) -> expectedMatchesState(now, expected)
-                    expected.isNotBlank() -> expectedMatchesState(now, expected) || changed
+                    expected.startsWith("PACKAGE=", ignoreCase = true) -> expectedTransition
+                    expected.isNotBlank() -> expectedTransition || changed
                     else -> changed
                 }
                 else -> changed
@@ -1187,7 +1194,7 @@ class AiSidecarController(private val service: AutoActionService) {
                     command.action == "SET_TEXT" -> "text entry verified"
                     command.action == "OPEN_APP" -> "target app foreground"
                     expected.equals("CLIPBOARD_CHANGE", ignoreCase = true) -> "clipboard changed"
-                    expected.isNotBlank() && expectedMatchesState(now, expected) -> "expected state visible"
+                    expected.isNotBlank() && expectedTransition -> "fresh expected state observed"
                     changed -> "screen/package state changed"
                     else -> "action-specific proof matched"
                 }
