@@ -5549,19 +5549,27 @@ fun notifyExternalWindowChangedFromAccessibility() {
     fun recordAccessibilitySemanticClickFromSnapshot(snapshot: TargetSnapshot) {
         handler.post {
             if (instance !== this@FloatingControlService) return@post
-            if (!shouldRecordAccessibilitySemanticClick()) return@post
+            if (!isRecording || captureView == null || AutoActionService.isPlaying()) return@post
 
             val now = android.os.SystemClock.uptimeMillis()
-            if (now <= semanticClickMuteUntil) return@post
-
             val pkg = snapshot.targetPackage.orEmpty().trim().lowercase()
-            if (
-                pkg.isBlank() ||
-                pkg == packageName.lowercase() ||
-                false
-            ) {
+            if (pkg.isBlank() || pkg == packageName.lowercase()) return@post
+
+            // AARISH_CONFIRMED_CLICK_FINGERPRINT_V1
+            // During ghost/live replay the app's TYPE_VIEW_CLICKED event is not a new
+            // user action: it is authoritative confirmation of the gesture we just
+            // injected on behalf of the user's recorded tap. Patch that step in place.
+            val patched = captureView?.patchLatestGestureFromAccessibility(snapshot) == true
+            if (patched) {
+                lastSemanticAccessibilityClickAt = now
+                lastSemanticAccessibilityClickKey = semanticSnapshotKey(snapshot)
                 return@post
             }
+
+            // Outside live replay, keep the older bridge behavior for Share/Dialog
+            // controls that appear while recording and are clicked semantically.
+            if (!shouldRecordAccessibilitySemanticClick()) return@post
+            if (now <= semanticClickMuteUntil) return@post
 
             val key = semanticSnapshotKey(snapshot)
             if (key == lastSemanticAccessibilityClickKey && now - lastSemanticAccessibilityClickAt < 900L) {
@@ -7629,6 +7637,127 @@ fun addSystemGesture(actionType: Int) {
             targetDesc = if (actionType == 1) "System Back" else "System Recents"
         )
     )
+}
+
+
+// AARISH_CONFIRMED_CLICK_FINGERPRINT_V1
+fun patchLatestGestureFromAccessibility(snapshot: TargetSnapshot): Boolean {
+    if (recordedGestures.isEmpty()) return false
+
+    val index = recordedGestures.lastIndex
+    val old = recordedGestures[index]
+    val first = old.points.firstOrNull() ?: return false
+    if (first.x <= -50f || first.y <= -50f) return false
+
+    val nowRel = (android.os.SystemClock.uptimeMillis() - recordingStartTime).coerceAtLeast(0L)
+    val oldEnd = old.delayFromStart.coerceAtLeast(0L) +
+        (old.points.maxOfOrNull { it.t.coerceAtLeast(0L) } ?: 0L)
+    if (kotlin.math.abs(nowRel - oldEnd) > 3600L) return false
+
+    val oldPkg = old.targetPackage.orEmpty().trim().lowercase()
+    val newPkg = snapshot.targetPackage.orEmpty().trim().lowercase()
+    if (oldPkg.isNotBlank() && newPkg.isNotBlank() && oldPkg != newPkg) return false
+
+    fun eq(a: String?, b: String?): Boolean =
+        !a.isNullOrBlank() && !b.isNullOrBlank() &&
+            a.trim().equals(b.trim(), ignoreCase = true)
+
+    val samePrimary =
+        eq(old.targetId, snapshot.targetId) ||
+            eq(old.targetText, snapshot.targetText) ||
+            eq(old.targetDesc, snapshot.targetDesc)
+
+    val hasBounds = snapshot.targetRight > snapshot.targetLeft &&
+        snapshot.targetBottom > snapshot.targetTop
+    val density = resources.displayMetrics.density.coerceAtLeast(1f)
+    val pad = (36f * density).toInt().coerceAtLeast(24)
+    val nearConfirmedBounds = if (hasBounds) {
+        first.x >= snapshot.targetLeft - pad &&
+            first.x <= snapshot.targetRight + pad &&
+            first.y >= snapshot.targetTop - pad &&
+            first.y <= snapshot.targetBottom + pad
+    } else {
+        false
+    }
+
+    if (!samePrimary && !nearConfirmedBounds) return false
+
+    fun realText(v: String?): Boolean {
+        if (v.isNullOrBlank() || v.startsWith("OCR:")) return false
+        val n = v.trim().lowercase(java.util.Locale.US)
+        return n.length >= 2 && n !in setOf("view", "text", "button", "image", "layout", "item")
+    }
+
+    fun realId(v: String?): Boolean = !v.isNullOrBlank() && !v.startsWith("ocr:")
+
+    fun combine(a: String?, b: String?, limit: Int): String? {
+        val vals = listOf(a, b)
+            .map { it.orEmpty().replace(Regex("\\s+"), " ").trim() }
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase(java.util.Locale.US) }
+        return vals.joinToString(" | ").take(limit).takeIf { it.isNotBlank() }
+    }
+
+    fun combineFlags(a: String?, b: String?): String? {
+        val tokens = (a.orEmpty().split("|") + b.orEmpty().split("|"))
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+        return tokens.joinToString("|").take(520).takeIf { it.isNotBlank() }
+    }
+
+    val screenW = resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
+    val screenH = resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
+
+    val insideX = if (hasBounds) {
+        ((first.x - snapshot.targetLeft) / (snapshot.targetRight - snapshot.targetLeft).toFloat())
+            .coerceIn(0f, 1f)
+    } else {
+        old.insideXPercent
+    }
+    val insideY = if (hasBounds) {
+        ((first.y - snapshot.targetTop) / (snapshot.targetBottom - snapshot.targetTop).toFloat())
+            .coerceIn(0f, 1f)
+    } else {
+        old.insideYPercent
+    }
+
+    val patched = old.copy(
+        // Preserve the exact visible child label the user touched when it is useful.
+        targetText = if (realText(old.targetText)) old.targetText else snapshot.targetText ?: old.targetText,
+        targetDesc = old.targetDesc?.takeIf { it.isNotBlank() && it != "OCR_TEXT_TARGET" }
+            ?: snapshot.targetDesc,
+        targetId = if (realId(old.targetId)) old.targetId else snapshot.targetId ?: old.targetId,
+        targetClass = snapshot.targetClass ?: old.targetClass,
+        targetPackage = snapshot.targetPackage ?: old.targetPackage,
+        targetContextText = combine(old.targetContextText, snapshot.targetContextText, 1500),
+        targetChildText = combine(old.targetChildText, snapshot.targetChildText, 860),
+        targetSiblingText = combine(old.targetSiblingText, snapshot.targetSiblingText, 900),
+        targetRoleFlags = combineFlags(old.targetRoleFlags, snapshot.targetRoleFlags),
+        targetTreePath = snapshot.targetTreePath?.takeIf { it.isNotBlank() } ?: old.targetTreePath,
+
+        // Confirmed node bounds are authoritative, but the user's original finger
+        // coordinate remains the tap anchor inside those bounds.
+        targetLeft = if (hasBounds) snapshot.targetLeft else old.targetLeft,
+        targetTop = if (hasBounds) snapshot.targetTop else old.targetTop,
+        targetRight = if (hasBounds) snapshot.targetRight else old.targetRight,
+        targetBottom = if (hasBounds) snapshot.targetBottom else old.targetBottom,
+        xPercent = (first.x / screenW).coerceIn(0f, 1f),
+        yPercent = (first.y / screenH).coerceIn(0f, 1f),
+        targetWPercent = if (hasBounds) {
+            ((snapshot.targetRight - snapshot.targetLeft) / screenW).coerceIn(0f, 1f)
+        } else old.targetWPercent,
+        targetHPercent = if (hasBounds) {
+            ((snapshot.targetBottom - snapshot.targetTop) / screenH).coerceIn(0f, 1f)
+        } else old.targetHPercent,
+        insideXPercent = insideX,
+        insideYPercent = insideY,
+        recordedScreenW = resources.displayMetrics.widthPixels,
+        recordedScreenH = resources.displayMetrics.heightPixels
+    )
+
+    recordedGestures[index] = patched
+    return true
 }
 
 
