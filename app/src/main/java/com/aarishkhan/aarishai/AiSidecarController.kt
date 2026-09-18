@@ -2033,26 +2033,55 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun isSensitive(command: AiCommand, state: ScreenState): Boolean {
+        // AARISH_AI_SENSITIVE_SCOPE_V4
+        // Safety follows the action/target, not every word anywhere on the screen.
+        // A harmless "History" tap in a banking app must not be blocked merely because
+        // some unrelated card on the same screen contains the word "payment".
         val element = state.elements.firstOrNull { it.key.equals(command.elementKey, true) }
-        val screenContext = state.elements.take(100).joinToString(" ") { e ->
-            listOf(e.text, e.desc, e.viewId, e.context).joinToString(" ")
-        }.take(12000)
-        val text = listOf(
-            missionGoal,
+        val local = listOf(
             command.payload,
+            command.expected,
             element?.text.orEmpty(),
             element?.desc.orEmpty(),
             element?.viewId.orEmpty(),
-            element?.context.orEmpty(),
-            screenContext
+            element?.context.orEmpty()
         ).joinToString(" ").lowercase(Locale.US)
-        val blocked = listOf(
+
+        val mission = missionGoal.lowercase(Locale.US)
+        val screenContext = state.elements.take(100).joinToString(" ") { e ->
+            listOf(e.text, e.desc, e.viewId, e.context).joinToString(" ")
+        }.lowercase(Locale.US).take(12000)
+
+        val highRiskTerms = listOf(
             "pay now", "payment", "send money", "transfer money", "bank transfer", "purchase", "buy now",
             "delete account", "close account", "uninstall", "install app", "allow permission", "grant permission",
-            "factory reset", "erase data", "confirm order", "otp", "one time password", "password",
-            "passcode", "upi pin", "security pin", "cvv"
+            "factory reset", "erase data", "confirm order", "upi pin", "security pin", "cvv"
         )
-        return blocked.any(text::contains)
+        val secretTerms = listOf(
+            "otp", "one time password", "password", "passcode", "upi pin", "security pin", "cvv"
+        )
+        val commitTerms = listOf(
+            "confirm", "submit", "send", "pay", "buy", "purchase", "order", "transfer",
+            "delete", "erase", "grant", "allow", "install", "uninstall"
+        )
+
+        val localHighRisk = highRiskTerms.any(local::contains)
+        val localSecret = secretTerms.any(local::contains)
+        val missionHighRisk = highRiskTerms.any(mission::contains)
+        val commitLike = commitTerms.any(local::contains)
+
+        return when (command.action) {
+            "WAIT", "BACK", "HOME", "OPEN_APP", "SCROLL" -> false
+            "SET_TEXT" -> localSecret || localHighRisk
+            "TAP", "LONG_TAP" -> localHighRisk || (missionHighRisk && commitLike)
+            "TAP_XY" -> {
+                // No semantic target exists, so on a risky screen visual coordinates are
+                // intentionally fail-closed.
+                missionHighRisk || highRiskTerms.any(screenContext::contains) ||
+                    secretTerms.any(screenContext::contains)
+            }
+            else -> localHighRisk || localSecret
+        }
     }
 
     private fun resolveLaunchPackageByLabel(labelRaw: String): String? {
