@@ -256,8 +256,9 @@ class AiSidecarController(private val service: AutoActionService) {
                     }
                     return@askPhysicalAi
                 }
-                markProviderSuccess(provider)
-
+                // AARISH_AI_PROVIDER_HEALTH_V4
+                // A parseable answer is not enough to call a provider healthy. Health is
+                // credited only after the chosen action (or DONE proof) is verified.
                 val plannerSignature = listOf(
                     state.fingerprint,
                     command.action,
@@ -292,9 +293,11 @@ class AiSidecarController(private val service: AutoActionService) {
                             verifyDoneEvidence(run, state, command) { verified, proof ->
                                 if (!alive(run)) return@verifyDoneEvidence
                                 if (verified) {
+                                    markProviderSuccess(provider)
                                     rememberHistory("DONE verified -> $proof")
                                     finishMission(true, command.payload.ifBlank { "Task complete" })
                                 } else {
+                                    markProviderFailure(provider, "DONE evidence rejected")
                                     failTurn(run, "DONE rejected: $proof")
                                 }
                             }
@@ -320,6 +323,7 @@ class AiSidecarController(private val service: AutoActionService) {
                     executeCommand(run, command, state) { executed, outcome ->
                         if (!alive(run)) return@executeCommand
                         if (!executed) {
+                            markProviderFailure(provider, "command execution failed: ${command.action}")
                             failTurn(run, outcome)
                             return@executeCommand
                         }
@@ -327,7 +331,13 @@ class AiSidecarController(private val service: AutoActionService) {
                             if (!alive(run)) return@verifyAfterAction
                             lastOutcome = if (verified) "SUCCESS: $proof" else "UNCERTAIN: $proof"
                             rememberHistory("STEP $missionStep ${command.action} ${command.elementKey.ifBlank { "-" }} -> $lastOutcome")
-                            if (!verified) failureCount++ else failureCount = (failureCount - 1).coerceAtLeast(0)
+                            if (!verified) {
+                                markProviderFailure(provider, "post-condition not verified: ${command.action}")
+                                failureCount++
+                            } else {
+                                markProviderSuccess(provider)
+                                failureCount = (failureCount - 1).coerceAtLeast(0)
+                            }
                             missionStep++
                             if (rescueMode) {
                                 val reproduced = verified && command.action == rescueExpectedAction
