@@ -1657,6 +1657,24 @@ private fun aarishAiWaitForNextRecordedTarget(
             val cx = (tapX * sx).coerceIn(0f, (outW - 1).toFloat().coerceAtLeast(0f))
             val cy = (tapY * sy).coerceIn(0f, (outH - 1).toFloat().coerceAtLeast(0f))
             val density = resources.displayMetrics.density.coerceAtLeast(1f)
+
+            val dir = java.io.File(filesDir, "aarish_recording_evidence").apply { mkdirs() }
+            val file = java.io.File(
+                dir,
+                "step_${System.currentTimeMillis()}_${java.util.UUID.randomUUID()}.jpg"
+            )
+
+            // AARISH_CLEAN_VISION_REFERENCE_V1
+            // Keep a clean reference for visual reasoning. The visible evidence JPG below
+            // may contain a tap marker, which can cover a small icon.
+            try {
+                java.io.FileOutputStream(java.io.File(file.absolutePath + ".refimg")).use { stream ->
+                    scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 72, stream)
+                }
+            } catch (_: Throwable) {
+                // Marked evidence remains usable even if the clean companion cannot be saved.
+            }
+
             val canvas = android.graphics.Canvas(scaled)
             val ring = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
                 style = android.graphics.Paint.Style.STROKE
@@ -1673,8 +1691,6 @@ private fun aarishAiWaitForNextRecordedTarget(
             canvas.drawLine(cx - radius, cy, cx + radius, cy, cross)
             canvas.drawLine(cx, cy - radius, cx, cy + radius, cross)
 
-            val dir = java.io.File(filesDir, "aarish_recording_evidence").apply { mkdirs() }
-            val file = java.io.File(dir, "step_${System.currentTimeMillis()}_${java.util.UUID.randomUUID()}.jpg")
             java.io.FileOutputStream(file).use { stream ->
                 scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 72, stream)
             }
@@ -1711,10 +1727,23 @@ private fun aarishAiWaitForNextRecordedTarget(
                 tapHPercent = tapPatch?.height()?.toFloat()?.div(sh) ?: 0f
             )
 
-            // AARISH_EVIDENCE_PAIR_RETENTION_V2
-            // Keep 180 complete recording bundles. Counting JPG and .vfp separately could
-            // delete only one half of a live pair and silently disable visual recovery.
+            // AARISH_EVIDENCE_REFERENCE_AWARE_RETENTION_V3
+            // Never delete evidence still referenced by a saved workflow. Only stale/orphan
+            // bundles are bounded. This prevents old commands from silently losing visual rescue.
             try {
+                val protectedPaths = linkedSetOf<String>()
+                protectedPaths.add(file.absolutePath)
+
+                try {
+                    GestureStore.getAllConfigNames(this@AutoActionService).forEach { configName ->
+                        GestureStore.loadConfig(this@AutoActionService, configName).forEach { gesture ->
+                            gesture.recordingEvidencePath
+                                ?.takeIf { it.isNotBlank() }
+                                ?.let { protectedPaths.add(it) }
+                        }
+                    }
+                } catch (_: Throwable) {}
+
                 val jpgs = dir.listFiles()
                     ?.filter {
                         it.isFile &&
@@ -1724,22 +1753,42 @@ private fun aarishAiWaitForNextRecordedTarget(
                     ?.sortedByDescending { it.lastModified() }
                     .orEmpty()
 
-                jpgs.drop(180).forEach { oldJpg ->
-                    try { java.io.File(oldJpg.absolutePath + ".vfp").delete() } catch (_: Throwable) {}
-                    try { oldJpg.delete() } catch (_: Throwable) {}
+                val recentOrphanKeep = jpgs
+                    .filter { it.absolutePath !in protectedPaths }
+                    .take(300)
+                    .map { it.absolutePath }
+                    .toHashSet()
+
+                jpgs.forEach { oldJpg ->
+                    val keep =
+                        oldJpg.absolutePath in protectedPaths ||
+                            oldJpg.absolutePath in recentOrphanKeep
+                    if (!keep) {
+                        try { java.io.File(oldJpg.absolutePath + ".vfp").delete() } catch (_: Throwable) {}
+                        try { java.io.File(oldJpg.absolutePath + ".refimg").delete() } catch (_: Throwable) {}
+                        try { oldJpg.delete() } catch (_: Throwable) {}
+                    }
                 }
 
-                // Remove sidecars whose reference image no longer exists.
                 dir.listFiles()
                     ?.filter {
                         it.isFile &&
                             it.name.startsWith("step_") &&
-                            it.name.endsWith(".jpg.vfp", ignoreCase = true)
+                            (
+                                it.name.endsWith(".jpg.vfp", ignoreCase = true) ||
+                                    it.name.endsWith(".jpg.refimg", ignoreCase = true)
+                                )
                     }
-                    ?.forEach { sidecar ->
-                        val jpgPath = sidecar.absolutePath.removeSuffix(".vfp")
-                        if (!java.io.File(jpgPath).exists()) {
-                            try { sidecar.delete() } catch (_: Throwable) {}
+                    ?.forEach { companion ->
+                        val jpgPath = when {
+                            companion.absolutePath.endsWith(".vfp") ->
+                                companion.absolutePath.removeSuffix(".vfp")
+                            companion.absolutePath.endsWith(".refimg") ->
+                                companion.absolutePath.removeSuffix(".refimg")
+                            else -> ""
+                        }
+                        if (jpgPath.isNotBlank() && !java.io.File(jpgPath).exists()) {
+                            try { companion.delete() } catch (_: Throwable) {}
                         }
                     }
             } catch (_: Throwable) {}
