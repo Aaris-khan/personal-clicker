@@ -1116,6 +1116,8 @@ class AiSidecarController(private val service: AutoActionService) {
         var stableCommandSignature = ""
         var stableCommandCount = 0
         var sawGenerating = false
+        var generationEndedAt = 0L
+        var earlyOcrAttempted = false
         var providerMissingSince = 0L
         var lastParsed: AiCommand? = null
 
@@ -1145,7 +1147,12 @@ class AiSidecarController(private val service: AutoActionService) {
 
             val text = flattenText(root, 26000)
             val generating = hasGeneratingIndicator(root)
-            if (generating) sawGenerating = true
+            if (generating) {
+                sawGenerating = true
+                generationEndedAt = 0L
+            } else if (sawGenerating && generationEndedAt == 0L) {
+                generationEndedAt = nowElapsed
+            }
             val parsed = parseCommand(text, requestId)
             if (parsed != null) lastParsed = parsed
 
@@ -1164,6 +1171,33 @@ class AiSidecarController(private val service: AutoActionService) {
             if (complete) {
                 waitingForAi = false
                 callback(parsed)
+                return
+            }
+
+            // AARISH_AI_EARLY_OCR_FALLBACK_V7
+            // Some provider builds visually render the reply but expose little/no text
+            // through Accessibility. OCR soon after generation settles instead of waiting
+            // for the full transaction timeout. Strict ::END parsing rejects partial OCR.
+            val settledAfterGeneration =
+                generationEndedAt > 0L && nowElapsed - generationEndedAt >= 1_800L
+            val noGenerationSignalButSlow =
+                !sawGenerating && elapsed >= 18_000L && providerUiSerial.get() > 0L
+            if (parsed == null &&
+                !earlyOcrAttempted &&
+                !generating &&
+                (settledAfterGeneration || noGenerationSignalButSlow)
+            ) {
+                earlyOcrAttempted = true
+                captureProviderOcr(provider) { ocr ->
+                    if (!alive(run)) return@captureProviderOcr
+                    val fromOcr = parseCommand(ocr, requestId)
+                    if (fromOcr != null) {
+                        waitingForAi = false
+                        callback(fromOcr)
+                    } else {
+                        handler.postDelayed({ if (alive(run)) poll() }, 320L)
+                    }
+                }
                 return
             }
 
