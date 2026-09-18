@@ -2003,18 +2003,29 @@ private fun aarishAiWaitForNextRecordedTarget(
 
     private fun aarishBestForegroundPackageForOcr(): String? {
         return try {
-            // AARISH_FOREGROUND_PACKAGE_RESOLVER_V2
-            // Prefer the active application root. Window lists may put IME/accessibility
-            // overlays before the app, which can create a false package mismatch.
-            val activePkg = try {
-                rootInActiveWindow?.packageName?.toString()
-            } catch (_: Throwable) {
-                null
-            }
-            if (!activePkg.isNullOrBlank()) return activePkg
-
+            // AARISH_FOREGROUND_PACKAGE_RESOLVER_V3
+            // IME can become the accessibility "active" root on some OEMs. Resolve an
+            // active/focused APPLICATION window first, then other application windows.
             val wins = try { windows } catch (_: Throwable) { null }
+
             if (wins != null) {
+                for (w in wins) {
+                    val isApplication = try {
+                        w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    val isForegroundApp = try {
+                        w.isActive || w.isFocused
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    if (!isApplication || !isForegroundApp) continue
+
+                    val pkg = try { w.root?.packageName?.toString() } catch (_: Throwable) { null }
+                    if (!pkg.isNullOrBlank()) return pkg
+                }
+
                 for (w in wins) {
                     val isApplication = try {
                         w.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION
@@ -2026,13 +2037,23 @@ private fun aarishAiWaitForNextRecordedTarget(
                     val pkg = try { w.root?.packageName?.toString() } catch (_: Throwable) { null }
                     if (!pkg.isNullOrBlank()) return pkg
                 }
+            }
 
-                // Last fallback for unusual OEM windows.
+            // Generic active-root fallback for unusual OEM window classifications.
+            val activePkg = try {
+                rootInActiveWindow?.packageName?.toString()
+            } catch (_: Throwable) {
+                null
+            }
+            if (!activePkg.isNullOrBlank()) return activePkg
+
+            if (wins != null) {
                 for (w in wins) {
                     val pkg = try { w.root?.packageName?.toString() } catch (_: Throwable) { null }
                     if (!pkg.isNullOrBlank()) return pkg
                 }
             }
+
             null
         } catch (_: Throwable) {
             null
