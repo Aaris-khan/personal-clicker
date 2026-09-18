@@ -1711,13 +1711,37 @@ private fun aarishAiWaitForNextRecordedTarget(
                 tapHPercent = tapPatch?.height()?.toFloat()?.div(sh) ?: 0f
             )
 
-            // Bound private evidence storage so long-term recording use cannot grow forever.
+            // AARISH_EVIDENCE_PAIR_RETENTION_V2
+            // Keep 180 complete recording bundles. Counting JPG and .vfp separately could
+            // delete only one half of a live pair and silently disable visual recovery.
             try {
-                dir.listFiles()
-                    ?.filter { it.isFile && it.name.startsWith("step_") }
+                val jpgs = dir.listFiles()
+                    ?.filter {
+                        it.isFile &&
+                            it.name.startsWith("step_") &&
+                            it.name.endsWith(".jpg", ignoreCase = true)
+                    }
                     ?.sortedByDescending { it.lastModified() }
-                    ?.drop(180)
-                    ?.forEach { it.delete() }
+                    .orEmpty()
+
+                jpgs.drop(180).forEach { oldJpg ->
+                    try { java.io.File(oldJpg.absolutePath + ".vfp").delete() } catch (_: Throwable) {}
+                    try { oldJpg.delete() } catch (_: Throwable) {}
+                }
+
+                // Remove sidecars whose reference image no longer exists.
+                dir.listFiles()
+                    ?.filter {
+                        it.isFile &&
+                            it.name.startsWith("step_") &&
+                            it.name.endsWith(".jpg.vfp", ignoreCase = true)
+                    }
+                    ?.forEach { sidecar ->
+                        val jpgPath = sidecar.absolutePath.removeSuffix(".vfp")
+                        if (!java.io.File(jpgPath).exists()) {
+                            try { sidecar.delete() } catch (_: Throwable) {}
+                        }
+                    }
             } catch (_: Throwable) {}
 
             try { scaled.recycle() } catch (_: Throwable) {}
@@ -3450,6 +3474,25 @@ private fun aarishAiWaitForNextRecordedTarget(
             screenH / 2f
         }
 
+        fun sameVisualRegion(a: Candidate, b: Candidate): Boolean {
+            val minW = kotlin.math.min(a.bounds.width(), b.bounds.width()).toFloat().coerceAtLeast(1f)
+            val minH = kotlin.math.min(a.bounds.height(), b.bounds.height()).toFloat().coerceAtLeast(1f)
+            val dx = kotlin.math.abs(a.bounds.exactCenterX() - b.bounds.exactCenterX())
+            val dy = kotlin.math.abs(a.bounds.exactCenterY() - b.bounds.exactCenterY())
+
+            // Dense/refinement scans naturally generate many overlapping windows for the
+            // SAME physical control. They must not become a fake "runner-up" ambiguity.
+            return dx <= minW * 0.44f && dy <= minH * 0.44f
+        }
+
+        fun better(a: Candidate, b: Candidate): Boolean {
+            return a.similarity > b.similarity + 0.0001f ||
+                (
+                    kotlin.math.abs(a.similarity - b.similarity) <= 0.0001f &&
+                        a.oldPositionDistance < b.oldPositionDistance
+                    )
+        }
+
         fun remember(bounds: Rect, similarity: Float) {
             if (similarity <= 0f) return
             val cx = bounds.exactCenterX()
@@ -3459,30 +3502,24 @@ private fun aarishAiWaitForNextRecordedTarget(
                     kotlin.math.abs(cy - oldY) / screenH.coerceAtLeast(1f)
 
             val candidate = Candidate(Rect(bounds), similarity, oldDistance)
-            val oldBest = best
-            val betterThanBest =
-                oldBest == null ||
-                    candidate.similarity > oldBest.similarity + 0.0001f ||
-                    (
-                        kotlin.math.abs(candidate.similarity - oldBest.similarity) <= 0.0001f &&
-                            candidate.oldPositionDistance < oldBest.oldPositionDistance
-                        )
 
-            if (betterThanBest) {
-                second = oldBest
+            val currentBest = best
+            if (currentBest != null && sameVisualRegion(candidate, currentBest)) {
+                if (better(candidate, currentBest)) best = candidate
+                return
+            }
+
+            val currentSecond = second
+            if (currentSecond != null && sameVisualRegion(candidate, currentSecond)) {
+                if (better(candidate, currentSecond)) second = candidate
+                return
+            }
+
+            if (currentBest == null || better(candidate, currentBest)) {
+                second = currentBest
                 best = candidate
-            } else {
-                val oldSecond = second
-                if (
-                    oldSecond == null ||
-                    candidate.similarity > oldSecond.similarity + 0.0001f ||
-                    (
-                        kotlin.math.abs(candidate.similarity - oldSecond.similarity) <= 0.0001f &&
-                            candidate.oldPositionDistance < oldSecond.oldPositionDistance
-                        )
-                ) {
-                    second = candidate
-                }
+            } else if (currentSecond == null || better(candidate, currentSecond)) {
+                second = candidate
             }
         }
 
@@ -3556,11 +3593,12 @@ private fun aarishAiWaitForNextRecordedTarget(
         val dualAxis = savedV != null
         val minSimilarity = if (dualAxis) 0.875f else 0.91f
         val clearMargin = if (dualAxis) 0.040f else 0.055f
-        val veryStrong = winner.similarity >= if (dualAxis) 0.955f else 0.97f
+        // AARISH_VISUAL_DISTINCT_RUNNER_GUARD_V4
+        // High confidence alone must NEVER override a second distinct physical match.
+        // Two identical icons/rows at different locations are ambiguous by definition.
         val clear =
             runner == null ||
-                winner.similarity - runner.similarity >= clearMargin ||
-                veryStrong
+                winner.similarity - runner.similarity >= clearMargin
 
         if (winner.similarity < minSimilarity || !clear) return null
 
@@ -3629,11 +3667,11 @@ private fun aarishAiWaitForNextRecordedTarget(
         data class Candidate(
             val box: AarishOcrBox,
             val semantic: Float,
-            val score: Float
+            val score: Float,
+            val rowKey: String
         )
 
-        var best: Candidate? = null
-        var second: Candidate? = null
+        val candidates = mutableListOf<Candidate>()
 
         for (box in boxes) {
             val direct = aarishNormOcr(box.text)
@@ -3663,23 +3701,51 @@ private fun aarishAiWaitForNextRecordedTarget(
 
             // Position is deliberately only a tiny tie-breaker.
             val score = semantic * 100f + shape * 4f - distancePenalty * 1.5f
-            val candidate = Candidate(box, semantic, score)
-
-            if (best == null || candidate.score > best!!.score) {
-                second = best
-                best = candidate
-            } else if (second == null || candidate.score > second!!.score) {
-                second = candidate
-            }
+            candidates.add(
+                Candidate(
+                    box = box,
+                    semantic = semantic,
+                    score = score,
+                    rowKey = row
+                )
+            )
         }
 
-        val winner = best ?: return null
-        val runner = second
+        val ranked = candidates.sortedWith(
+            compareByDescending<Candidate> { it.score }
+                .thenByDescending { it.semantic }
+        )
+        val winner = ranked.firstOrNull() ?: return null
+
+        fun sameLogicalOcrRegion(a: Candidate, b: Candidate): Boolean {
+            val ay = a.box.bounds.exactCenterY()
+            val by = b.box.bounds.exactCenterY()
+            val rowTol = kotlin.math.max(
+                10f,
+                kotlin.math.max(a.box.bounds.height(), b.box.bounds.height()).toFloat() * 0.95f
+            )
+            val sameRow = kotlin.math.abs(ay - by) <= rowTol && a.rowKey == b.rowKey
+            if (!sameRow) return false
+
+            // Same OCR row may contain several words of one logical action ("Create images").
+            // But very distant same-row duplicates remain separate ambiguous candidates.
+            val dx = kotlin.math.abs(a.box.bounds.exactCenterX() - b.box.bounds.exactCenterX())
+            val localSpan = kotlin.math.max(
+                a.box.bounds.width(),
+                b.box.bounds.width()
+            ).toFloat().coerceAtLeast(1f)
+            return dx <= localSpan * 4.5f
+        }
+
+        val runner = ranked.firstOrNull { !sameLogicalOcrRegion(winner, it) }
+
+        // AARISH_OCR_DISTINCT_RUNNER_GUARD_V2
+        // Exact OCR text is not enough to auto-click when the same label exists at
+        // another distinct location. Context/visual/VLM must resolve that case.
         val clear =
             runner == null ||
                 winner.semantic - runner.semantic >= 0.055f ||
-                winner.score - runner.score >= 5.5f ||
-                winner.semantic >= 0.985f
+                winner.score - runner.score >= 5.5f
 
         if (winner.semantic < 0.90f || !clear) return null
         return winner.box to winner.semantic
