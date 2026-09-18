@@ -85,6 +85,9 @@ class MemoryClipboardCaptureActivity : Activity() {
             window.decorView.alpha = 0f
 
             window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            // Clipboard contents can be sensitive. Keep this transient helper out of
+            // screenshots/screen recordings even though the window itself is 1x1/transparent.
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
             window.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL)
             window.addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS)
             window.addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN)
