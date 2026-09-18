@@ -1476,29 +1476,154 @@ private fun aarishAiWaitForNextRecordedTarget(
         return same / 64f
     }
 
+    // AARISH_VISUAL_FINGERPRINT_V2
+    // Second vertical hash reduces collisions between visually-similar rows/icons
+    // without adding OpenCV, a network call or a heavy model.
+    private fun aarishVisualVHash(
+        bitmap: android.graphics.Bitmap,
+        screenBounds: Rect,
+        screenW: Float,
+        screenH: Float
+    ): String? {
+        if (screenBounds.width() < 8 || screenBounds.height() < 8) return null
+        if (screenW <= 1f || screenH <= 1f || bitmap.width <= 1 || bitmap.height <= 1) return null
+
+        val left = (screenBounds.left / screenW * bitmap.width).toInt().coerceIn(0, bitmap.width - 1)
+        val top = (screenBounds.top / screenH * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
+        val right = (screenBounds.right / screenW * bitmap.width).toInt().coerceIn(left + 1, bitmap.width)
+        val bottom = (screenBounds.bottom / screenH * bitmap.height).toInt().coerceIn(top + 1, bitmap.height)
+        val w = right - left
+        val h = bottom - top
+        if (w < 6 || h < 6) return null
+
+        val samples = Array(9) { IntArray(8) }
+        var minLum = 255
+        var maxLum = 0
+        for (yy in 0 until 9) {
+            val fy = (yy + 0.5f) / 9f
+            val py = (top + fy * h).toInt().coerceIn(top, bottom - 1)
+            for (xx in 0 until 8) {
+                val fx = (xx + 0.5f) / 8f
+                val px = (left + fx * w).toInt().coerceIn(left, right - 1)
+                val color = try { bitmap.getPixel(px, py) } catch (_: Throwable) { return null }
+                val lum = (
+                    android.graphics.Color.red(color) * 30 +
+                        android.graphics.Color.green(color) * 59 +
+                        android.graphics.Color.blue(color) * 11
+                    ) / 100
+                samples[yy][xx] = lum
+                if (lum < minLum) minLum = lum
+                if (lum > maxLum) maxLum = lum
+            }
+        }
+        if (maxLum - minLum < 16) return null
+
+        val bits = StringBuilder(64)
+        for (yy in 0 until 8) {
+            for (xx in 0 until 8) {
+                bits.append(if (samples[yy][xx] > samples[yy + 1][xx]) '1' else '0')
+            }
+        }
+        return bits.toString()
+    }
+
+    private data class AarishVisualFingerprintBundle(
+        val boundsH: String? = null,
+        val boundsV: String? = null,
+        val tapH: String? = null,
+        val tapV: String? = null,
+        val tapWPercent: Float = 0f,
+        val tapHPercent: Float = 0f
+    )
+
+    private data class AarishVisualHit(
+        val bounds: Rect,
+        val clickAtCenter: Boolean,
+        val confidence: Float
+    )
+
+    private val aarishVisualMatchExecutor by lazy {
+        java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "AarishVisualMatcher").apply { isDaemon = true }
+        }
+    }
+
+    private fun aarishVisualPairSimilarity(
+        savedH: String?,
+        savedV: String?,
+        liveH: String?,
+        liveV: String?
+    ): Float {
+        val h = aarishVisualFingerprintSimilarity(savedH, liveH)
+        val v = aarishVisualFingerprintSimilarity(savedV, liveV)
+        return when {
+            h > 0f && v > 0f -> (h * 0.56f + v * 0.44f).coerceIn(0f, 1f)
+            h > 0f -> h
+            v > 0f -> v
+            else -> 0f
+        }
+    }
+
     private fun aarishVisualFingerprintSidecar(evidencePath: String): java.io.File =
         java.io.File(evidencePath + ".vfp")
 
-    private fun aarishWriteVisualFingerprintSidecar(evidencePath: String, hash: String?) {
-        if (hash.isNullOrBlank()) return
+    private fun aarishWriteVisualFingerprintSidecarV2(
+        evidencePath: String,
+        boundsH: String?,
+        boundsV: String?,
+        tapH: String?,
+        tapV: String?,
+        tapWPercent: Float,
+        tapHPercent: Float
+    ) {
+        if (boundsH.isNullOrBlank() && boundsV.isNullOrBlank() &&
+            tapH.isNullOrBlank() && tapV.isNullOrBlank()
+        ) return
         try {
-            aarishVisualFingerprintSidecar(evidencePath).writeText("V1|BOUNDS|$hash", Charsets.UTF_8)
+            val raw = listOf(
+                "V2",
+                "BH=${boundsH.orEmpty()}",
+                "BV=${boundsV.orEmpty()}",
+                "TPH=${tapH.orEmpty()}",
+                "TPV=${tapV.orEmpty()}",
+                "TWP=${tapWPercent.coerceIn(0f, 1f)}",
+                "THP=${tapHPercent.coerceIn(0f, 1f)}"
+            ).joinToString("|")
+            aarishVisualFingerprintSidecar(evidencePath).writeText(raw, Charsets.UTF_8)
         } catch (_: Throwable) {}
     }
 
-    private fun aarishReadVisualFingerprint(gesture: RecordedGesture): String? {
+    private fun aarishReadVisualFingerprintBundle(gesture: RecordedGesture): AarishVisualFingerprintBundle? {
         val path = gesture.recordingEvidencePath.orEmpty()
         if (path.isBlank()) return null
         return try {
             val file = aarishVisualFingerprintSidecar(path)
-            if (!file.exists() || !file.isFile || file.length() > 256L) return null
+            if (!file.exists() || !file.isFile || file.length() > 1024L) return null
             val parts = file.readText(Charsets.UTF_8).trim().split("|")
-            parts.getOrNull(2)?.takeIf {
-                parts.getOrNull(0) == "V1" &&
-                    parts.getOrNull(1) == "BOUNDS" &&
-                    it.length == 64 &&
-                    it.all { ch -> ch == '0' || ch == '1' }
+
+            fun validHash(value: String?): String? = value?.takeIf {
+                it.length == 64 && it.all { ch -> ch == '0' || ch == '1' }
             }
+
+            if (parts.firstOrNull() == "V1" && parts.getOrNull(1) == "BOUNDS") {
+                val oldHash = validHash(parts.getOrNull(2)) ?: return null
+                return AarishVisualFingerprintBundle(boundsH = oldHash)
+            }
+            if (parts.firstOrNull() != "V2") return null
+
+            fun value(key: String): String = parts
+                .firstOrNull { it.startsWith("$key=") }
+                ?.substringAfter("=")
+                .orEmpty()
+
+            AarishVisualFingerprintBundle(
+                boundsH = validHash(value("BH")),
+                boundsV = validHash(value("BV")),
+                tapH = validHash(value("TPH")),
+                tapV = validHash(value("TPV")),
+                tapWPercent = value("TWP").toFloatOrNull()?.coerceIn(0f, 1f) ?: 0f,
+                tapHPercent = value("THP").toFloatOrNull()?.coerceIn(0f, 1f) ?: 0f
+            ).takeIf { it.boundsH != null || it.boundsV != null || it.tapH != null || it.tapV != null }
         } catch (_: Throwable) {
             null
         }
