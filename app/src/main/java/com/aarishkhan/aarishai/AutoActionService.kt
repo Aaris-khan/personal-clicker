@@ -3664,6 +3664,209 @@ private fun aarishAiWaitForNextRecordedTarget(
     // Accessibility candidates are preferred when present. If the UI is Canvas,
     // WebView or custom-rendered and exposes nothing useful, scan screenshot pixels
     // directly using the tap-centred dual-axis fingerprint.
+
+    // AARISH_ICON_SKETCH_RESCUE_V1
+    // For controls with no text/id/contentDescription: match the small clicked sketch
+    // plus a wider context patch. Old XY is only a tie-breaker.
+    private fun aarishDenseIconSketchSearch(
+        bitmap: android.graphics.Bitmap,
+        gesture: RecordedGesture,
+        screenW: Float,
+        screenH: Float,
+        runId: Int,
+        livePackageSnapshot: String
+    ): AarishVisualHit? {
+        if (!isSamePlaybackRun(runId)) return null
+        val ref = aarishLoadIconSketchReference(gesture) ?: return null
+
+        val savedPkg = aarishSavedPackageFromId(gesture)
+        val livePkg = livePackageSnapshot.trim().lowercase()
+        if (savedPkg.isNotBlank() && livePkg.isNotBlank() && savedPkg != livePkg) return null
+
+        data class Candidate(
+            val bounds: Rect,
+            val score: Float,
+            val oldDistance: Float
+        )
+
+        var best: Candidate? = null
+        var second: Candidate? = null
+        val oldX = if (hasSavedPercentAnchor(gesture)) gesture.xPercent.coerceIn(0f, 1f) * screenW else screenW / 2f
+        val oldY = if (hasSavedPercentAnchor(gesture)) gesture.yPercent.coerceIn(0f, 1f) * screenH else screenH / 2f
+        val density = resources.displayMetrics.density.coerceAtLeast(1f)
+
+        fun sameRegion(a: Candidate, b: Candidate): Boolean {
+            val minW = kotlin.math.min(a.bounds.width(), b.bounds.width()).toFloat().coerceAtLeast(1f)
+            val minH = kotlin.math.min(a.bounds.height(), b.bounds.height()).toFloat().coerceAtLeast(1f)
+            return kotlin.math.abs(a.bounds.exactCenterX() - b.bounds.exactCenterX()) <= minW * 0.45f &&
+                kotlin.math.abs(a.bounds.exactCenterY() - b.bounds.exactCenterY()) <= minH * 0.45f
+        }
+
+        fun better(a: Candidate, b: Candidate): Boolean {
+            return a.score > b.score + 0.0001f ||
+                (
+                    kotlin.math.abs(a.score - b.score) <= 0.0001f &&
+                        a.oldDistance < b.oldDistance
+                    )
+        }
+
+        fun remember(bounds: Rect, score: Float) {
+            if (score <= 0f) return
+            val distance =
+                kotlin.math.abs(bounds.exactCenterX() - oldX) / screenW.coerceAtLeast(1f) +
+                    kotlin.math.abs(bounds.exactCenterY() - oldY) / screenH.coerceAtLeast(1f)
+            val candidate = Candidate(Rect(bounds), score, distance)
+
+            val currentBest = best
+            if (currentBest != null && sameRegion(candidate, currentBest)) {
+                if (better(candidate, currentBest)) best = candidate
+                return
+            }
+
+            val currentSecond = second
+            if (currentSecond != null && sameRegion(candidate, currentSecond)) {
+                if (better(candidate, currentSecond)) second = candidate
+                return
+            }
+
+            if (currentBest == null || better(candidate, currentBest)) {
+                second = currentBest
+                best = candidate
+            } else if (currentSecond == null || better(candidate, currentSecond)) {
+                second = candidate
+            }
+        }
+
+        fun patchAt(cx: Float, cy: Float, wPct: Float, hPct: Float, scale: Float): Rect? {
+            val w = (wPct * screenW * scale).coerceAtLeast(10f)
+            val h = (hPct * screenH * scale).coerceAtLeast(10f)
+            val left = (cx - w / 2f).toInt()
+            val top = (cy - h / 2f).toInt()
+            val right = (cx + w / 2f).toInt()
+            val bottom = (cy + h / 2f).toInt()
+            if (left < 0 || top < 0 || right > screenW.toInt() || bottom > screenH.toInt()) return null
+            return Rect(left, top, right, bottom).takeIf { it.width() >= 8 && it.height() >= 8 }
+        }
+
+        fun featureScore(
+            savedH: String?,
+            savedV: String?,
+            savedE: String?,
+            liveBounds: Rect
+        ): Float {
+            val liveE = aarishVisualEdgeHash(bitmap, liveBounds, screenW, screenH) ?: return 0f
+            val edge = aarishVisualFingerprintSimilarity(savedE, liveE)
+            if (edge <= 0f) return 0f
+
+            val liveH = if (savedH != null) aarishVisualDHash(bitmap, liveBounds, screenW, screenH) else null
+            val liveV = if (savedV != null) aarishVisualVHash(bitmap, liveBounds, screenW, screenH) else null
+            val h = aarishVisualPolarityInvariantSimilarity(savedH, liveH)
+            val v = aarishVisualPolarityInvariantSimilarity(savedV, liveV)
+            val polarity = when {
+                h > 0f && v > 0f -> h * 0.55f + v * 0.45f
+                h > 0f -> h
+                v > 0f -> v
+                else -> 0f
+            }
+
+            return if (polarity > 0f) {
+                (edge * 0.58f + polarity * 0.42f).coerceIn(0f, 1f)
+            } else {
+                edge
+            }
+        }
+
+        fun evaluate(cx: Float, cy: Float, scale: Float) {
+            val core = patchAt(
+                cx,
+                cy,
+                ref.coreWPercent,
+                ref.coreHPercent,
+                scale
+            ) ?: return
+
+            val coreScore = featureScore(ref.coreH, ref.coreV, ref.coreE, core)
+            if (coreScore < 0.72f) return
+
+            val context = patchAt(
+                cx,
+                cy,
+                ref.contextWPercent,
+                ref.contextHPercent,
+                scale
+            )
+            val contextScore = if (
+                context != null &&
+                (ref.contextE != null || ref.contextH != null || ref.contextV != null)
+            ) {
+                featureScore(ref.contextH, ref.contextV, ref.contextE, context)
+            } else {
+                0f
+            }
+
+            val finalScore = if (contextScore > 0f) {
+                (coreScore * 0.72f + contextScore * 0.28f).coerceIn(0f, 1f)
+            } else {
+                coreScore
+            }
+            remember(core, finalScore)
+        }
+
+        // Multi-scale scan: icon may render at a slightly different density/size.
+        for (scale in floatArrayOf(0.78f, 0.90f, 1.0f, 1.12f, 1.28f)) {
+            if (!isSamePlaybackRun(runId)) return null
+            val coreW = (ref.coreWPercent * screenW * scale).coerceAtLeast(12f)
+            val coreH = (ref.coreHPercent * screenH * scale).coerceAtLeast(12f)
+            val step = kotlin.math.max(7f * density, kotlin.math.min(coreW, coreH) * 0.32f)
+
+            var cy = coreH / 2f
+            while (cy <= screenH - coreH / 2f) {
+                if (!isSamePlaybackRun(runId)) return null
+                var cx = coreW / 2f
+                while (cx <= screenW - coreW / 2f) {
+                    evaluate(cx, cy, scale)
+                    cx += step
+                }
+                cy += step
+            }
+        }
+
+        val coarse = best
+        if (coarse != null) {
+            val centerX = coarse.bounds.exactCenterX()
+            val centerY = coarse.bounds.exactCenterY()
+            val step = kotlin.math.max(2.5f * density, kotlin.math.min(coarse.bounds.width(), coarse.bounds.height()) * 0.09f)
+            val rx = kotlin.math.max(step * 3f, coarse.bounds.width() * 0.28f)
+            val ry = kotlin.math.max(step * 3f, coarse.bounds.height() * 0.28f)
+
+            for (scale in floatArrayOf(0.94f, 1.0f, 1.06f)) {
+                if (!isSamePlaybackRun(runId)) return null
+                var cy = centerY - ry
+                while (cy <= centerY + ry) {
+                    var cx = centerX - rx
+                    while (cx <= centerX + rx) {
+                        evaluate(cx, cy, scale)
+                        cx += step
+                    }
+                    cy += step
+                }
+            }
+        }
+
+        val winner = best ?: return null
+        val runner = second
+
+        // Strong icon match still must beat a distinct second location.
+        val clear = runner == null || winner.score - runner.score >= 0.055f
+        if (winner.score < 0.84f || !clear) return null
+
+        return AarishVisualHit(
+            bounds = Rect(winner.bounds),
+            clickAtCenter = true,
+            confidence = winner.score
+        )
+    }
+
     private fun aarishDenseScreenshotVisualSearch(
         bitmap: android.graphics.Bitmap,
         gesture: RecordedGesture,
