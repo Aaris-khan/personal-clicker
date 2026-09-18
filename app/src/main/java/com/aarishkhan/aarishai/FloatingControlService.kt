@@ -540,7 +540,7 @@ class FloatingControlService : Service() {
             return
         }
         forceNextXyOnlyRecord = true
-        Toast.makeText(this, "x y coordinates on", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "XY coordinate activated", Toast.LENGTH_SHORT).show()
     }
 fun pokePanelToFront() {
         handler.post {
@@ -5427,7 +5427,7 @@ private fun recordWaitAiAction() {
     pendingDiscardConfirm = false
     updateUIState("DONE", true, false, true)
     restorePanelUI()
-    Toast.makeText(this, "⏳ AI WAIT recorded: next recorded target ka wait karega", Toast.LENGTH_LONG).show()
+    Toast.makeText(this, "AI waiting activated", Toast.LENGTH_SHORT).show()
 }
 
 private fun showSystemActionRecorderDialog() {
