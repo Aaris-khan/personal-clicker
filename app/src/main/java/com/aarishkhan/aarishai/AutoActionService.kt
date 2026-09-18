@@ -839,7 +839,31 @@ class AutoActionService : AccessibilityService() {
         if (!isSamePlaybackRun(runId)) return
 
         val orderedGestures = gestures.sortedBy { it.delayFromStart }
-        val sequenceStartTime = android.os.SystemClock.elapsedRealtime()
+
+        // AARISH_RELATIVE_INTENT_TIMING_V1
+        // Playback timing is step-relative, not tied to a wall-clock deadline from sequence start.
+        // If a previous step needs slow loading / semantic recovery / AI rescue, later intentional
+        // pauses must not collapse to zero merely because the original absolute schedule is "late".
+        fun recordedGestureDurationMs(g: RecordedGesture): Long {
+            return g.points.maxOfOrNull { it.t.coerceAtLeast(0L) }
+                ?.coerceAtMost(600_000L)
+                ?: 0L
+        }
+
+        fun recordedGapBefore(index: Int): Long {
+            val current = orderedGestures.getOrNull(index) ?: return 0L
+            if (index <= 0) return current.delayFromStart.coerceAtLeast(0L)
+
+            val previous = orderedGestures[index - 1]
+            val previousRecordedEnd = (
+                previous.delayFromStart.coerceAtLeast(0L) +
+                    recordedGestureDurationMs(previous)
+                ).coerceAtLeast(previous.delayFromStart.coerceAtLeast(0L))
+
+            return (current.delayFromStart.coerceAtLeast(0L) - previousRecordedEnd)
+                .coerceAtLeast(0L)
+                .coerceAtMost(24L * 60L * 60L * 1000L)
+        }
 
         fun cleanupDone(message: String) {
             if (!isCurrentCallbackRun(runId)) return
@@ -1059,8 +1083,7 @@ class AutoActionService : AccessibilityService() {
             }
 
             val gesture = orderedGestures[index]
-            val elapsed = android.os.SystemClock.elapsedRealtime() - sequenceStartTime
-            val delay = (gesture.delayFromStart - elapsed).coerceAtLeast(0L)
+            val delay = recordedGapBefore(index)
 
             val task = object : Runnable {
                 override fun run() {
