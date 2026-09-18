@@ -3727,6 +3727,41 @@ private fun aarishAiWaitForNextRecordedTarget(
                             val roots = collectSmartSearchRoots(anchorX.toInt(), anchorY.toInt())
                             val savedPkg = aarishSavedPackageFromId(gesture)
 
+                            fun finishWithUniversalOcrRescue() {
+                                if (!isSamePlaybackRun(runId)) {
+                                    try { bitmap.recycle() } catch (_: Throwable) {}
+                                    callback(null)
+                                    return
+                                }
+
+                                aarishProcessOcrBoxesFromBitmapV29(
+                                    bitmap = bitmap,
+                                    onSuccess = { boxes ->
+                                        val hit = aarishUniversalOcrRescueBox(gesture, boxes)
+                                        try {
+                                            callback(
+                                                hit?.let { pair ->
+                                                    AarishVisualHit(
+                                                        bounds = Rect(pair.first.bounds),
+                                                        clickAtCenter = true,
+                                                        confidence = pair.second
+                                                    )
+                                                }
+                                            )
+                                        } finally {
+                                            try { bitmap.recycle() } catch (_: Throwable) {}
+                                        }
+                                    },
+                                    onFailure = {
+                                        try {
+                                            callback(null)
+                                        } finally {
+                                            try { bitmap.recycle() } catch (_: Throwable) {}
+                                        }
+                                    }
+                                )
+                            }
+
                             data class AccessibilityVisualCandidate(
                                 val bounds: Rect,
                                 val visual: Float,
@@ -3828,8 +3863,7 @@ private fun aarishAiWaitForNextRecordedTarget(
                             }
 
                             if (fp.tapH == null && fp.tapV == null) {
-                                callback(null)
-                                try { bitmap.recycle() } catch (_: Throwable) {}
+                                finishWithUniversalOcrRescue()
                                 return
                             }
 
@@ -3847,10 +3881,17 @@ private fun aarishAiWaitForNextRecordedTarget(
                                 }
 
                                 handler.post {
-                                    try {
-                                        callback(if (isSamePlaybackRun(runId)) dense else null)
-                                    } finally {
+                                    if (!isSamePlaybackRun(runId)) {
                                         try { bitmap.recycle() } catch (_: Throwable) {}
+                                        callback(null)
+                                    } else if (dense != null) {
+                                        try {
+                                            callback(dense)
+                                        } finally {
+                                            try { bitmap.recycle() } catch (_: Throwable) {}
+                                        }
+                                    } else {
+                                        finishWithUniversalOcrRescue()
                                     }
                                 }
                             }
@@ -4037,7 +4078,11 @@ private fun trySmartTargetAfterShortSettle(
 
         val token = beginActiveGesture()
         val startedAt = android.os.SystemClock.elapsedRealtime()
-        val maxWait = waitMs.coerceIn(1_000L, 15_000L)
+        val maxWait = if (!recordedGesture.recordingEvidencePath.isNullOrBlank()) {
+            kotlin.math.max(waitMs, 6_500L).coerceIn(1_000L, 15_000L)
+        } else {
+            waitMs.coerceIn(1_000L, 15_000L)
+        }
         val pollEvery = 160L
 
         var finished = false
