@@ -843,7 +843,9 @@ class AiSidecarController(private val service: AutoActionService) {
             } catch (_: Throwable) {
                 false
             }
-            if (setOk && nodeContainsRequest(node, requestMarker, prompt)) return true
+            // ACTION_SET_TEXT can succeed while this node object still exposes stale text.
+            // Do not paste a second copy here; fresh-node verification happens before submit.
+            if (setOk) return true
             if (nodeContainsRequest(node, requestMarker, prompt)) return true
             return pastePromptViaClipboard(node, prompt)
         }
