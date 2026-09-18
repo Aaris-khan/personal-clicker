@@ -161,7 +161,12 @@ object LocalVisionLocator {
         val path = gesture.recordingEvidencePath?.trim().orEmpty()
         if (path.isBlank()) return null
 
-        val file = try { java.io.File(path) } catch (_: Throwable) { return null }
+        val markedFile = try { java.io.File(path) } catch (_: Throwable) { return null }
+        val cleanFile = try { java.io.File(path + ".refimg") } catch (_: Throwable) { null }
+        val file = cleanFile
+            ?.takeIf { it.exists() && it.isFile && it.length() in 1L..(8L * 1024L * 1024L) }
+            ?: markedFile
+
         if (!file.exists() || !file.isFile) return null
         if (file.length() <= 0L || file.length() > 8L * 1024L * 1024L) return null
 
@@ -236,7 +241,7 @@ object LocalVisionLocator {
         val imageGuide = if (hasReferenceImage) {
             """
 IMAGE ORDER:
-1) REFERENCE image from recording time. The user's selected point is visibly marked with a red/yellow ring/cross.
+1) REFERENCE image from recording time. Prefer the visual content itself; recorded_anchor gives the original selected point. Older recordings may also show a red/yellow tap marker.
 2) CURRENT live screenshot. Find the same logical control here.
 
 Use the reference image as primary visual evidence. Match icon/shape/text/row/context, not old absolute coordinates.
