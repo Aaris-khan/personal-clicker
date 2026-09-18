@@ -246,6 +246,15 @@ class AutoActionService : AccessibilityService() {
                 Toast.makeText(context, "Accessibility Service ready nahi hai", Toast.LENGTH_SHORT).show()
                 return false
             }
+
+            // AARISH_AI_RECORDING_EXCLUSION_V4_GUARD
+            // Never let a caller bypass the UI-level parking step: an active recording
+            // glass would intercept autonomous touches and create false recordings.
+            if (FloatingControlService.instance?.isRecordingActive() == true) {
+                Toast.makeText(context, "Recording glass active hai; pehle recording segment DONE karo", Toast.LENGTH_LONG).show()
+                return false
+            }
+
             if (service.isPlayingInternal) service.stopPlaybackInternal()
             return service.aiSidecarController.startMission(goal, provider)
         }
