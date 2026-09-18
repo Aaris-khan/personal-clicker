@@ -5559,7 +5559,18 @@ fun notifyExternalWindowChangedFromAccessibility() {
             // During ghost/live replay the app's TYPE_VIEW_CLICKED event is not a new
             // user action: it is authoritative confirmation of the gesture we just
             // injected on behalf of the user's recorded tap. Patch that step in place.
-            val patched = captureView?.patchLatestGestureFromAccessibility(snapshot) == true
+            val confirmationWindow =
+                liveReplayActive ||
+                    liveReplayQueueDraining ||
+                    (
+                        lastLiveReplayAt > 0L &&
+                            now >= lastLiveReplayAt &&
+                            now - lastLiveReplayAt <= 1800L &&
+                            now <= semanticClickMuteUntil
+                        )
+
+            val patched = confirmationWindow &&
+                captureView?.patchLatestGestureFromAccessibility(snapshot) == true
             if (patched) {
                 lastSemanticAccessibilityClickAt = now
                 lastSemanticAccessibilityClickKey = semanticSnapshotKey(snapshot)
