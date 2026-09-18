@@ -1985,22 +1985,9 @@ private fun aarishAiWaitForNextRecordedTarget(
 
 
 
-    // AARISH_CORE_ONLY_VISUAL_DISABLED
-    // OpenCV-style bitmap/template visual logic removed. Magnetic + MLKit OCR + XY fallback remain.
-
-    private data class AarishVisualMatch(
-        val x: Float,
-        val y: Float,
-        val quality: Float
-    )
-
-    private fun aarishHasVisualTemplate(g: RecordedGesture): Boolean = false
-
-
-
-
-
-
+    // AARISH_DETERMINISTIC_VISUAL_FINGERPRINT_V1
+    // Heavy template/OpenCV logic remains absent. The only visual fallback is the
+    // bounded local dHash fingerprint used after semantic/OCR matching cannot decide.
 
     private fun aarishHasOcrIdentity(g: RecordedGesture): Boolean {
         return g.targetText.orEmpty().startsWith("OCR:") ||
