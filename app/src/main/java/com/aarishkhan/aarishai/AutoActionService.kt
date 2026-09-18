@@ -9260,7 +9260,12 @@ val root = window.root ?: continue
 
 
     override fun onInterrupt() {
+        // AARISH_AI_INTERRUPT_FAIL_CLOSED_V1
+        // Accessibility interruption means executor/verifier guarantees are temporarily
+        // unavailable. Stop both replay and Autonomous AI rather than letting queued
+        // sidecar callbacks keep acting without a trustworthy live accessibility channel.
         stopPlaybackInternal(showToast = false)
+        try { aiSidecarController.stop("accessibility interrupted") } catch (_: Throwable) {}
     }
 
 
