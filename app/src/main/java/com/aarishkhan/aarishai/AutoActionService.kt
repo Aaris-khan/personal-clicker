@@ -3372,6 +3372,151 @@ private fun aarishAiWaitForNextRecordedTarget(
         }
     }
 
+    private fun aarishTryRevealOffscreenStrongTarget(gesture: RecordedGesture): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M) return false
+        if (!aarishHasPrimaryIdentity(gesture)) return false
+
+        val screenW = resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
+        val screenH = resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
+        val anchorX = if (hasSavedPercentAnchor(gesture)) {
+            gesture.xPercent.coerceIn(0f, 1f) * screenW
+        } else {
+            gesture.points.firstOrNull()?.x ?: (screenW / 2f)
+        }
+        val anchorY = if (hasSavedPercentAnchor(gesture)) {
+            gesture.yPercent.coerceIn(0f, 1f) * screenH
+        } else {
+            gesture.points.firstOrNull()?.y ?: (screenH / 2f)
+        }
+
+        val roots = aarishSimpleFullTreeMagneticRoots(anchorX.toInt(), anchorY.toInt())
+        if (roots.isEmpty()) return false
+
+        val savedPkg = aarishSavedPackageFromId(gesture)
+        val savedId = gesture.targetId?.trim().orEmpty()
+        val savedUnique = savedId.takeIf { it.startsWith("uid:") }?.removePrefix("uid:")
+        val savedTail = if (savedUnique == null) idTail(savedId) else ""
+        val savedText = gesture.targetText?.trim().orEmpty()
+        val savedDesc = gesture.targetDesc?.trim().orEmpty()
+
+        data class RevealCandidate(
+            val node: AccessibilityNodeInfo,
+            val score: Int,
+            val hardId: Boolean
+        )
+
+        var best: RevealCandidate? = null
+        var second: RevealCandidate? = null
+        val seen = hashSetOf<String>()
+
+        fun remember(candidate: RevealCandidate) {
+            val oldBest = best
+            if (oldBest == null || candidate.score > oldBest.score) {
+                second = oldBest
+                best = candidate
+            } else if (second == null || candidate.score > second!!.score) {
+                second = candidate
+            }
+        }
+
+        for (root in roots) {
+            val stack = java.util.ArrayDeque<AccessibilityNodeInfo>()
+            stack.add(root)
+            var scanned = 0
+
+            while (stack.isNotEmpty() && scanned++ < 6200) {
+                val node = stack.removeLast()
+
+                val count = safeChildCount(node)
+                for (i in count - 1 downTo 0) {
+                    safeChild(node, i)?.let(stack::add)
+                }
+
+                if (!safeEnabled(node)) continue
+
+                val actionNode = findClickableParent(node) ?: node
+                val pkg = aarishNodePackage(actionNode).ifBlank { aarishNodePackage(node) }
+                if (savedPkg.isNotBlank() && pkg.isNotBlank() && pkg != savedPkg) continue
+
+                val nodeId = safeId(node)
+                val actionId = safeId(actionNode)
+                val nodeUid = safeUniqueId(node)
+                val actionUid = safeUniqueId(actionNode)
+
+                val hardId = when {
+                    !savedUnique.isNullOrBlank() ->
+                        nodeUid == savedUnique || actionUid == savedUnique
+                    savedId.isNotBlank() ->
+                        nodeId == savedId ||
+                            actionId == savedId ||
+                            (
+                                savedTail.isNotBlank() &&
+                                    (idTail(nodeId) == savedTail || idTail(actionId) == savedTail)
+                                )
+                    else -> false
+                }
+
+                val textExact = savedText.isNotBlank() && (
+                    labelsEqual(savedText, safeText(node)) ||
+                        labelsEqual(savedText, safeDesc(node)) ||
+                        labelsEqual(savedText, safeText(actionNode)) ||
+                        labelsEqual(savedText, safeDesc(actionNode))
+                    )
+
+                val descExact = savedDesc.isNotBlank() && (
+                    labelsEqual(savedDesc, safeDesc(node)) ||
+                        labelsEqual(savedDesc, safeText(node)) ||
+                        labelsEqual(savedDesc, safeDesc(actionNode)) ||
+                        labelsEqual(savedDesc, safeText(actionNode))
+                    )
+
+                if (!hardId && !textExact && !descExact) continue
+
+                val bounds = Rect()
+                safeBounds(actionNode, bounds)
+                val key = listOf(
+                    pkg,
+                    safeClass(actionNode).orEmpty(),
+                    safeId(actionNode).orEmpty(),
+                    safeUniqueId(actionNode).orEmpty(),
+                    bounds.flattenToString()
+                ).joinToString("|")
+                if (!seen.add(key)) continue
+
+                var score = 0
+                if (hardId) score += 520
+                if (textExact) score += 230
+                if (descExact) score += 210
+
+                val role = roleSimilarity(gesture.targetRoleFlags, roleFlagsOf(actionNode))
+                val dna = dnaSimilarity(gesture.targetTreePath, extractTreePathDNA(actionNode))
+                val neighbor = aarishDirectionalNeighborSimilarity(gesture.targetSiblingText, actionNode)
+                score += (role * 70f).toInt()
+                score += (dna * 95f).toInt()
+                score += (neighbor * 55f).toInt()
+
+                remember(RevealCandidate(actionNode, score, hardId))
+            }
+        }
+
+        val winner = best ?: return false
+        val runner = second
+        val clear = winner.hardId ||
+            runner == null ||
+            winner.score - runner.score >= 42
+        if (!clear) return false
+
+        val alreadyVisible = safeVisible(winner.node)
+        if (alreadyVisible) return false
+
+        return try {
+            winner.node.performAction(AccessibilityNodeInfo.ACTION_SHOW_ON_SCREEN)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+
 private fun trySmartTargetAfterShortSettle(
         recordedGesture: RecordedGesture,
         runId: Int,
@@ -3398,6 +3543,7 @@ private fun trySmartTargetAfterShortSettle(
 
         var finished = false
         var currentTask: Runnable? = null
+        var lastRevealAttemptAt = 0L
 
         fun finishOnce() {
             if (finished) return
@@ -3456,7 +3602,15 @@ private fun trySmartTargetAfterShortSettle(
                 null
             }
 
-            if (retryMatch == null) return false
+            if (retryMatch == null) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                val elapsed = now - startedAt
+                if (elapsed >= 520L && now - lastRevealAttemptAt >= 900L) {
+                    lastRevealAttemptAt = now
+                    try { aarishTryRevealOffscreenStrongTarget(recordedGesture) } catch (_: Throwable) {}
+                }
+                return false
+            }
 
             val screenW = resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
             val screenH = resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
