@@ -36,6 +36,13 @@ class FloatingControlService : Service() {
         fun setAiScreenshotChromeHidden(hidden: Boolean) {
             instance?.applyAiScreenshotChromeHidden(hidden)
         }
+
+        // AARISH_PLAYBACK_GESTURE_PASS_THROUGH_V1
+        // Saved PLAY keeps a small STOP panel visible. Synthetic coordinate taps must
+        // temporarily pass through that accessibility overlay, just like live replay.
+        fun setPlaybackGesturePassThrough(enabled: Boolean) {
+            instance?.applyPlaybackGesturePassThrough(enabled)
+        }
     }
 
     fun isRecordingActive(): Boolean = isRecording
@@ -100,6 +107,70 @@ class FloatingControlService : Service() {
         }
     }
 
+
+
+    // AARISH_PLAYBACK_GESTURE_PASS_THROUGH_V1
+    private fun applyPlaybackGesturePassThrough(enabled: Boolean) {
+        fun applyNow() {
+            val panel = panelView ?: return
+            val lp = (panel.layoutParams as? WindowManager.LayoutParams) ?: panelParams ?: return
+            val notTouchable = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            val notFocusable = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+
+            if (enabled) {
+                if (playbackGesturePassThroughDepth == 0) {
+                    playbackPanelWasNotTouchable = (lp.flags and notTouchable) != 0
+                }
+                playbackGesturePassThroughDepth++
+                lp.flags = lp.flags or notTouchable or notFocusable
+            } else {
+                if (playbackGesturePassThroughDepth > 0) playbackGesturePassThroughDepth--
+                if (playbackGesturePassThroughDepth == 0 && !playbackPanelWasNotTouchable) {
+                    lp.flags = (lp.flags and notTouchable.inv()) or notFocusable
+                }
+                if (playbackGesturePassThroughDepth == 0) {
+                    playbackPanelWasNotTouchable = false
+                }
+            }
+
+            panelParams = lp
+            try {
+                if (::windowManager.isInitialized && panel.parent != null) {
+                    aarishAccessWmV13().updateViewLayout(panel, lp)
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            applyNow()
+        } else {
+            handler.post { applyNow() }
+        }
+    }
+
+    private fun forceRestorePlaybackPanelTouchability() {
+        val panel = panelView ?: run {
+            playbackGesturePassThroughDepth = 0
+            playbackPanelWasNotTouchable = false
+            return
+        }
+        val lp = (panel.layoutParams as? WindowManager.LayoutParams) ?: panelParams ?: return
+        val notTouchable = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        val notFocusable = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+
+        playbackGesturePassThroughDepth = 0
+        playbackPanelWasNotTouchable = false
+        lp.flags = (lp.flags and notTouchable.inv()) or notFocusable
+        panelParams = lp
+
+        try {
+            if (::windowManager.isInitialized && panel.parent != null) {
+                aarishAccessWmV13().updateViewLayout(panel, lp)
+            }
+        } catch (_: Throwable) {
+        }
+    }
 
     // AARISH_MEMORY_SCOPE_FIX_V2_MEMBER_HELPERS
     fun consumeMemoryCopyArmCode(): Int {
@@ -584,6 +655,8 @@ fun pokePanelToFront() {
     private var oldPanelX = 30
     private var oldPanelY = 120
     private var panelHiddenForPlayback = false
+    private var playbackGesturePassThroughDepth = 0
+    private var playbackPanelWasNotTouchable = false
 
     private lateinit var label: TextView
     private lateinit var btnStart: Button
@@ -1421,6 +1494,9 @@ private fun clampPanelToScreen(params: WindowManager.LayoutParams, panel: View) 
 }
 
 private fun restorePanelUI() {
+    // If playback was stopped while a synthetic tap had temporarily ghosted the panel,
+    // restore STOP/controls immediately instead of waiting for a gesture callback.
+    forceRestorePlaybackPanelTouchability()
     val shouldRestorePlaybackPosition = panelHiddenForPlayback
     panelHiddenForPlayback = false
 

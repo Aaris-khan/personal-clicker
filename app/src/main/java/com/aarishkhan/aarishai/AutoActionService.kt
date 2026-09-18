@@ -7762,11 +7762,18 @@ addRoot(window.root, 0)
         val sy = y.coerceIn(2f, sh)
         val completed = java.util.concurrent.atomic.AtomicBoolean(false)
         var attemptSerial = 0
+        var playbackPassThroughArmed = false
 
         fun aliveNow(): Boolean = runId == null || isSamePlaybackRun(runId)
 
         fun finish(ok: Boolean) {
-            if (completed.compareAndSet(false, true)) onDone(ok)
+            if (completed.compareAndSet(false, true)) {
+                if (playbackPassThroughArmed) {
+                    FloatingControlService.setPlaybackGesturePassThrough(false)
+                    playbackPassThroughArmed = false
+                }
+                onDone(ok)
+            }
         }
 
         aarishShowVisualClickIndicator(sx, sy)
@@ -7843,7 +7850,19 @@ addRoot(window.root, 0)
             }, 1450L)
         }
 
-        dispatchAttempt(0)
+        if (runId != null) {
+            // Saved PLAY differs from live replay: its floating STOP panel is normally
+            // still touchable. Make only the short injection window pass-through and
+            // wait for WindowManager to apply the flag before dispatching the touch.
+            FloatingControlService.setPlaybackGesturePassThrough(true)
+            playbackPassThroughArmed = true
+            handler.postDelayed({
+                if (aliveNow()) dispatchAttempt(0) else finish(false)
+            }, 95L)
+        } else {
+            dispatchAttempt(0)
+        }
+
         showTinyToast("XY direct")
         return true
     }
