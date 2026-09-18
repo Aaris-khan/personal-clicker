@@ -4265,37 +4265,41 @@ private fun aarishAiWaitForNextRecordedTarget(
                                     gesture = gesture
                                 ) { target ->
                                     handler.post {
-                                        if (!isSamePlaybackRun(runId) || target?.found != true) {
-                                            callback(null)
-                                            return@post
-                                        }
+                                        try {
+                                            if (!isSamePlaybackRun(runId) || target?.found != true) {
+                                                callback(null)
+                                                return@post
+                                            }
 
-                                        val cx = (target.xPercent.coerceIn(0f, 1f) * screenW)
-                                            .coerceIn(2f, (screenW - 2f).coerceAtLeast(2f))
-                                        val cy = (target.yPercent.coerceIn(0f, 1f) * screenH)
-                                            .coerceIn(2f, (screenH - 2f).coerceAtLeast(2f))
-                                        val halfW = kotlin.math.max(
-                                            10f,
-                                            gesture.targetWPercent.coerceIn(0f, 0.40f) * screenW / 2f
-                                        )
-                                        val halfH = kotlin.math.max(
-                                            10f,
-                                            gesture.targetHPercent.coerceIn(0f, 0.25f) * screenH / 2f
-                                        )
-                                        val bounds = Rect(
-                                            (cx - halfW).toInt().coerceAtLeast(0),
-                                            (cy - halfH).toInt().coerceAtLeast(0),
-                                            (cx + halfW).toInt().coerceAtMost(screenW.toInt()),
-                                            (cy + halfH).toInt().coerceAtMost(screenH.toInt())
-                                        )
-
-                                        callback(
-                                            AarishVisualHit(
-                                                bounds = bounds,
-                                                clickAtCenter = true,
-                                                confidence = target.confidence
+                                            val cx = (target.xPercent.coerceIn(0f, 1f) * screenW)
+                                                .coerceIn(2f, (screenW - 2f).coerceAtLeast(2f))
+                                            val cy = (target.yPercent.coerceIn(0f, 1f) * screenH)
+                                                .coerceIn(2f, (screenH - 2f).coerceAtLeast(2f))
+                                            val halfW = kotlin.math.max(
+                                                10f,
+                                                gesture.targetWPercent.coerceIn(0f, 0.40f) * screenW / 2f
                                             )
-                                        )
+                                            val halfH = kotlin.math.max(
+                                                10f,
+                                                gesture.targetHPercent.coerceIn(0f, 0.25f) * screenH / 2f
+                                            )
+                                            val bounds = Rect(
+                                                (cx - halfW).toInt().coerceAtLeast(0),
+                                                (cy - halfH).toInt().coerceAtLeast(0),
+                                                (cx + halfW).toInt().coerceAtMost(screenW.toInt()),
+                                                (cy + halfH).toInt().coerceAtMost(screenH.toInt())
+                                            )
+
+                                            callback(
+                                                AarishVisualHit(
+                                                    bounds = bounds,
+                                                    clickAtCenter = true,
+                                                    confidence = target.confidence
+                                                )
+                                            )
+                                        } finally {
+                                            try { bitmap.recycle() } catch (_: Throwable) {}
+                                        }
                                     }
                                 }
                             }
