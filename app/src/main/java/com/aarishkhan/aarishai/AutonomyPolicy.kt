@@ -86,4 +86,49 @@ internal object AutonomyPolicy {
         return true
     }
 
+    fun shouldUseReliableForcedXyTap(
+        hasMovement: Boolean,
+        durationMs: Long
+    ): Boolean = !hasMovement && durationMs.coerceAtLeast(0L) < 450L
+
+    fun resolveForcedXyPoint(
+        hasPercentAnchor: Boolean,
+        xPercent: Float,
+        yPercent: Float,
+        rawX: Float,
+        rawY: Float,
+        recordedScreenW: Int,
+        recordedScreenH: Int,
+        liveScreenW: Int,
+        liveScreenH: Int
+    ): Pair<Float, Float> {
+        val liveW = liveScreenW.coerceAtLeast(1).toFloat()
+        val liveH = liveScreenH.coerceAtLeast(1).toFloat()
+
+        val percentValid =
+            hasPercentAnchor &&
+                !xPercent.isNaN() && !xPercent.isInfinite() && xPercent in 0f..1f &&
+                !yPercent.isNaN() && !yPercent.isInfinite() && yPercent in 0f..1f
+
+        val x = if (percentValid) {
+            xPercent * liveW
+        } else if (recordedScreenW > 0) {
+            rawX * (liveW / recordedScreenW.toFloat())
+        } else {
+            rawX
+        }
+
+        val y = if (percentValid) {
+            yPercent * liveH
+        } else if (recordedScreenH > 0) {
+            rawY * (liveH / recordedScreenH.toFloat())
+        } else {
+            rawY
+        }
+
+        val maxX = (liveW - 2f).coerceAtLeast(2f)
+        val maxY = (liveH - 2f).coerceAtLeast(2f)
+        return x.coerceIn(2f, maxX) to y.coerceIn(2f, maxY)
+    }
+
 }

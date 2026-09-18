@@ -3334,9 +3334,15 @@ private fun aarishAiWaitForNextRecordedTarget(
         }
 
         if (aarishIsForceXyOnlyGesture(recordedGesture)) {
-            // AARISH_FORCE_XY_ONLY_DIRECT_DISPATCH_V1
+            // AARISH_FORCE_XY_RELIABLE_TAP_V2
+            // XY means "this coordinate", not "replay my tiny finger jitter".
+            // Simple taps use a coordinate-anchored ACTION_CLICK when possible, then a
+            // stationary accessibility tap fallback. Swipes/long-presses keep raw replay.
+            if (performReliableForcedXySimpleTap(recordedGesture, runId)) return
+
             showTinyToast("XY playback")
-            performGestureAt(firstPoint.x, firstPoint.y, points, runId, recordedGesture)
+            val forcedPoint = aarishResolvedForcedXyPoint(recordedGesture)
+            performGestureAt(forcedPoint.first, forcedPoint.second, points, runId, recordedGesture)
             return
         }
 
@@ -6630,7 +6636,18 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
             ?.take(8)
             ?.forEach { addRaw(it) }
 
-        return seeds.filter { it.isNotBlank() }.distinct().take(20)
+        // AARISH_MAGNET_SIBLING_SEED_V2
+        // Modern Compose/icon controls sometimes expose their stable human label only
+        // in a sibling/neighbor node. Promote a few stable sibling labels as secondary
+        // selector seeds so a moved icon can still be found when its own semantics blink.
+        gesture.targetSiblingText
+            ?.split("|", "•", ">", "\n")
+            ?.mapNotNull { aarishStableHumanActionLabel(it) }
+            ?.filter { it.length in 3..56 }
+            ?.take(6)
+            ?.forEach { addRaw(it) }
+
+        return seeds.filter { it.isNotBlank() }.distinct().take(24)
     }
 
     // AARISH_SELECTOR_SEED_V1: resource-id/text/direct selector seeds before fuzzy scoring.
@@ -7690,6 +7707,175 @@ addRoot(window.root, 0)
         }
 
         return false
+    }
+
+
+    // AARISH_FORCE_XY_RELIABLE_TAP_V2
+    private fun aarishResolvedForcedXyPoint(gesture: RecordedGesture): Pair<Float, Float> {
+        val first = gesture.points.firstOrNull()
+        val liveW = resources.displayMetrics.widthPixels.coerceAtLeast(1)
+        val liveH = resources.displayMetrics.heightPixels.coerceAtLeast(1)
+        return AutonomyPolicy.resolveForcedXyPoint(
+            hasPercentAnchor = hasSavedPercentAnchor(gesture),
+            xPercent = gesture.xPercent,
+            yPercent = gesture.yPercent,
+            rawX = first?.x ?: liveW / 2f,
+            rawY = first?.y ?: liveH / 2f,
+            recordedScreenW = gesture.recordedScreenW,
+            recordedScreenH = gesture.recordedScreenH,
+            liveScreenW = liveW,
+            liveScreenH = liveH
+        )
+    }
+
+    private fun aarishTryCoordinateAnchoredNodeClick(x: Float, y: Float): Boolean {
+        val px = x.toInt()
+        val py = y.toInt()
+        val root = try { getRealAppRootForPoint(px, py) } catch (_: Throwable) { null } ?: return false
+        val touched = try { findDeepestNodeAtCoordinate(root, px, py) } catch (_: Throwable) { null } ?: return false
+        val action = try { findClickableParent(touched) ?: touched } catch (_: Throwable) { touched }
+
+        if (!safeVisible(action) || !safeEnabled(action) || !safeClickable(action)) return false
+        val bounds = Rect()
+        if (!safeBounds(action, bounds) || !bounds.contains(px, py)) return false
+        if (bounds.width() <= 0 || bounds.height() <= 0 || aarishAreaRatio(bounds) > 0.78f) return false
+
+        return try {
+            action.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun aarishDispatchReliableCoordinateTap(
+        x: Float,
+        y: Float,
+        runId: Int?,
+        onDone: (Boolean) -> Unit
+    ): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.N) return false
+        if (runId != null && !isSamePlaybackRun(runId)) return false
+
+        val sw = (resources.displayMetrics.widthPixels.toFloat() - 2f).coerceAtLeast(2f)
+        val sh = (resources.displayMetrics.heightPixels.toFloat() - 2f).coerceAtLeast(2f)
+        val sx = x.coerceIn(2f, sw)
+        val sy = y.coerceIn(2f, sh)
+        val completed = java.util.concurrent.atomic.AtomicBoolean(false)
+        var attemptSerial = 0
+
+        fun aliveNow(): Boolean = runId == null || isSamePlaybackRun(runId)
+
+        fun finish(ok: Boolean) {
+            if (completed.compareAndSet(false, true)) onDone(ok)
+        }
+
+        aarishShowVisualClickIndicator(sx, sy)
+
+        // Coordinate anchored, not semantic search: if the exact point currently lies
+        // inside a clickable Accessibility node, ACTION_CLICK is more reliable than a
+        // synthetic touch on Compose/custom controls.
+        if (aarishTryCoordinateAnchoredNodeClick(sx, sy)) {
+            showTinyToast("XY direct")
+            handler.postDelayed({ finish(true) }, 170L)
+            return true
+        }
+
+        fun dispatchAttempt(attempt: Int) {
+            if (!aliveNow()) {
+                finish(false)
+                return
+            }
+
+            val serial = ++attemptSerial
+            val duration = if (attempt == 0) 90L else 125L
+            val path = Path().apply {
+                moveTo(sx, sy)
+                // Keep DOWN/UP at the same coordinate. The old 3.8px micro-drag could
+                // produce a ripple while a custom control rejected it as a click.
+                lineTo(sx, sy)
+            }
+
+            fun retryOrFinish() {
+                if (completed.get() || serial != attemptSerial) return
+                if (attempt == 0 && aliveNow()) {
+                    handler.postDelayed({ dispatchAttempt(1) }, 65L)
+                } else {
+                    finish(false)
+                }
+            }
+
+            val gesture = try {
+                GestureDescription.Builder()
+                    .addStroke(GestureDescription.StrokeDescription(path, 0L, duration))
+                    .build()
+            } catch (_: Throwable) {
+                retryOrFinish()
+                return
+            }
+
+            val accepted = try {
+                dispatchGesture(
+                    gesture,
+                    object : AccessibilityService.GestureResultCallback() {
+                        override fun onCompleted(gestureDescription: GestureDescription?) {
+                            super.onCompleted(gestureDescription)
+                            if (serial == attemptSerial) finish(true)
+                        }
+
+                        override fun onCancelled(gestureDescription: GestureDescription?) {
+                            super.onCancelled(gestureDescription)
+                            retryOrFinish()
+                        }
+                    },
+                    null
+                )
+            } catch (_: Throwable) {
+                false
+            }
+
+            if (!accepted) {
+                retryOrFinish()
+                return
+            }
+
+            handler.postDelayed({
+                if (!completed.get() && serial == attemptSerial) retryOrFinish()
+            }, 1450L)
+        }
+
+        dispatchAttempt(0)
+        showTinyToast("XY direct")
+        return true
+    }
+
+    private fun performReliableForcedXySimpleTap(
+        gesture: RecordedGesture,
+        runId: Int
+    ): Boolean {
+        if (!isSamePlaybackRun(runId)) return false
+        val ordered = gesture.points
+            .filter { !it.x.isNaN() && !it.x.isInfinite() && !it.y.isNaN() && !it.y.isInfinite() }
+            .sortedBy { it.t.coerceAtLeast(0L) }
+        if (ordered.isEmpty()) return false
+
+        val rawDuration = ordered.last().t.coerceAtLeast(0L)
+        val movement = hasRealMovement(ordered)
+        if (!AutonomyPolicy.shouldUseReliableForcedXyTap(movement, rawDuration)) return false
+
+        val point = aarishResolvedForcedXyPoint(gesture)
+        val token = beginActiveGesture()
+        val started = aarishDispatchReliableCoordinateTap(
+            x = point.first,
+            y = point.second,
+            runId = runId
+        ) {
+            handler.postDelayed({
+                if (isCurrentCallbackRun(runId)) finishActiveGesture(token)
+            }, 85L)
+        }
+
+        if (!started && isCurrentCallbackRun(runId)) finishActiveGesture(token)
+        return started
     }
 
 private fun shouldUseSelectionLongPress(match: SmartMatch?, gesture: RecordedGesture): Boolean {
@@ -9322,6 +9508,23 @@ val root = window.root ?: continue
             val startT = raw0.first().t.coerceAtLeast(0L)
             val endT = raw0.last().t.coerceAtLeast(startT)
             val rawTapDuration = (endT - startT).coerceAtLeast(0L)
+
+            // AARISH_FORCE_XY_RELIABLE_LIVE_V2
+            // The immediate live confirmation after recording must behave exactly like
+            // saved playback; otherwise the user sees a ripple but the underlying app
+            // may reject the tiny replayed drag.
+            if (aarishIsForceXyOnlyGesture(gesture) &&
+                AutonomyPolicy.shouldUseReliableForcedXyTap(movement, rawTapDuration)
+            ) {
+                val point = aarishResolvedForcedXyPoint(gesture)
+                if (aarishDispatchReliableCoordinateTap(point.first, point.second, null) {
+                        finishOnce()
+                    }
+                ) {
+                    return
+                }
+            }
+
             val duration = (if (!movement) kotlin.math.max(145L, rawTapDuration) else kotlin.math.max(55L, rawTapDuration)).coerceAtMost(600000L) // AARISH_HUMAN_LIKE_BLINK_TAP_V1
 
             // Long tap ko chunks me dispatch karo.

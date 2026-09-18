@@ -87,4 +87,43 @@ class AutonomyPolicyTest {
         )
     }
 
+    @Test
+    fun forcedXyReliableTap_isOnlyForSimpleTap() {
+        assertTrue(AutonomyPolicy.shouldUseReliableForcedXyTap(false, 0L))
+        assertTrue(AutonomyPolicy.shouldUseReliableForcedXyTap(false, 449L))
+        assertFalse(AutonomyPolicy.shouldUseReliableForcedXyTap(false, 450L))
+        assertFalse(AutonomyPolicy.shouldUseReliableForcedXyTap(true, 90L))
+    }
+
+    @Test
+    fun forcedXyPoint_prefersNormalizedAnchorAndScalesFallback() {
+        val normalized = AutonomyPolicy.resolveForcedXyPoint(
+            hasPercentAnchor = true,
+            xPercent = 0.25f,
+            yPercent = 0.75f,
+            rawX = 100f,
+            rawY = 200f,
+            recordedScreenW = 1000,
+            recordedScreenH = 2000,
+            liveScreenW = 1200,
+            liveScreenH = 2400
+        )
+        org.junit.Assert.assertEquals(300f, normalized.first, 0.01f)
+        org.junit.Assert.assertEquals(1800f, normalized.second, 0.01f)
+
+        val scaled = AutonomyPolicy.resolveForcedXyPoint(
+            hasPercentAnchor = false,
+            xPercent = Float.NaN,
+            yPercent = Float.NaN,
+            rawX = 250f,
+            rawY = 500f,
+            recordedScreenW = 1000,
+            recordedScreenH = 2000,
+            liveScreenW = 1200,
+            liveScreenH = 2400
+        )
+        org.junit.Assert.assertEquals(300f, scaled.first, 0.01f)
+        org.junit.Assert.assertEquals(600f, scaled.second, 0.01f)
+    }
+
 }

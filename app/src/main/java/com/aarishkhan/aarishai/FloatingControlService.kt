@@ -6075,6 +6075,38 @@ private fun saveRecording() {
         Toast.makeText(this, "Save already chal raha hai", Toast.LENGTH_SHORT).show()
         return
     }
+
+    // AARISH_SAVE_EVIDENCE_BARRIER_V2
+    // Screenshot/OCR evidence is asynchronous. If DONE/SAVE is pressed immediately
+    // after the last magnetic tap, extracting the view now can permanently lose that
+    // target's late visual/semantic evidence. Freeze touches and wait for that one
+    // capture transaction to settle before copying the recording buffer.
+    val evidenceView = if (isRecording) captureView else null
+    if (evidenceView != null && evidenceView.hasPendingTargetEvidenceCapture()) {
+        isSavingRecording = true
+        try { aarishSetGlassGhostModeSafe(true) } catch (_: Throwable) {}
+        val barrierStarted = android.os.SystemClock.uptimeMillis()
+        Toast.makeText(this, "Final target lock ho raha hai…", Toast.LENGTH_SHORT).show()
+
+        val barrier = object : Runnable {
+            override fun run() {
+                val sameView = isRecording && captureView === evidenceView
+                val pending = sameView && evidenceView.hasPendingTargetEvidenceCapture()
+                val timedOut = android.os.SystemClock.uptimeMillis() - barrierStarted >= 8_900L
+
+                if (pending && !timedOut) {
+                    handler.postDelayed(this, 80L)
+                    return
+                }
+
+                isSavingRecording = false
+                saveRecording()
+            }
+        }
+        handler.postDelayed(barrier, 80L)
+        return
+    }
+
     isSavingRecording = true
     try {
     if (isRecording) {
@@ -7870,6 +7902,10 @@ fun addAccessibilitySnapshotGesture(snapshot: TargetSnapshot): Boolean {
     return true
 }
 // AARISH_TOUCH_CAPTURE_SEMANTIC_BRIDGE_V3_END
+
+    fun hasPendingTargetEvidenceCapture(): Boolean {
+        return ocrSavePending && ocrActiveSerial > 0
+    }
 
     fun hasRecordedSomething(): Boolean {
         return currentPoints.isNotEmpty() || recordedGestures.isNotEmpty()
