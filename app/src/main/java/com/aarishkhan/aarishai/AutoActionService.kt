@@ -7508,11 +7508,15 @@ val root = window.root ?: continue
         if (type != AccessibilityEvent.TYPE_VIEW_CLICKED) return
 
         val service = floating ?: return
-        if (!service.shouldRecordAccessibilitySemanticClick()) return
 
         val pkg = event.packageName?.toString()?.lowercase().orEmpty()
         if (isAarishSemanticBridgeBlockedPackage(pkg)) return
 
+        // AARISH_CONFIRMED_CLICK_FINGERPRINT_V1
+        // Always pass the real clicked node to the recorder while recording.
+        // FloatingControlService decides whether this event patches the just-injected
+        // user tap in place or represents a separate Share/Dialog semantic click.
+        if (!service.isRecordingActive() || isPlayingInternal) return
         val snapshot = buildAarishSemanticSnapshotFromEvent(event) ?: return
         service.recordAccessibilitySemanticClickFromSnapshot(snapshot)
     }
