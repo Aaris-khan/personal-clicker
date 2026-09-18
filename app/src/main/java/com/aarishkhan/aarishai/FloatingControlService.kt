@@ -40,6 +40,35 @@ class FloatingControlService : Service() {
 
     fun isRecordingActive(): Boolean = isRecording
 
+    // AARISH_AI_RECORDING_EXCLUSION_V4
+    // Autonomous execution must never run underneath the full-screen recording glass.
+    // Park the current segment exactly like DONE: keep all unsaved gestures in memory,
+    // remove only the touch-intercepting glass, and let the user SAVE/+ADD later.
+    fun parkRecordingForAutonomousMission(): Boolean {
+        if (!isRecording) return true
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) return false
+
+        return try {
+            extractAndAppendGestures()
+            isRecording = false
+            aarishResetLiveReplayStateSafe(forceSolid = false)
+            safeRemoveView(captureView)
+            captureView = null
+            glassHiddenAt = android.os.SystemClock.uptimeMillis()
+            nextNavigationGapOverride = null
+            pendingDiscardConfirm = false
+
+            val hasOld = GestureStore.hasRecording(this)
+            val hasUnsaved = unsavedGestures.isNotEmpty()
+            val nextText = if (hasUnsaved) "+ ADD" else if (hasOld) "PLAY" else "START"
+            updateUIState(nextText, hasUnsaved, hasOld, true)
+            restorePanelUI()
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     // AARISH_AI_CLEAN_CAPTURE_V1_OVERLAY
     private var aiCapturePanelAlpha: Float? = null
     private var aiCaptureMemoryPopupAlpha: Float? = null
@@ -5355,6 +5384,11 @@ private fun showAiMissionDialogV1() {
                 input.error = "Prompt likho"
                 return@setOnClickListener
             }
+            if (!parkRecordingForAutonomousMission()) {
+                Toast.makeText(this, "Recording glass safely park nahi hua; mission start roka gaya", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+
             val started = AutoActionService.startAutonomousMission(this, goal, provider)
             if (started) {
                 dialog.dismiss()
