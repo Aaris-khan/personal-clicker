@@ -574,7 +574,8 @@ class AiSidecarController(private val service: AutoActionService) {
         val contract = buildString {
             appendLine("OUTPUT CONTRACT — MANDATORY AND HIGHEST PRIORITY:")
             appendLine("Return exactly ONE plain-text machine line, no markdown and no prose:")
-            appendLine("AARIS::${requestId}::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
+            appendLine("AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
+            appendLine("Replace <request-id> with the exact REQUEST IDENTIFIER value shown in this request.")
             appendLine("Allowed ACTION values only: TAP, TAP_XY, LONG_TAP, SET_TEXT, SCROLL, BACK, HOME, WAIT, OPEN_APP, DONE, FAIL.")
             appendLine("Never place the delimiter sequence :: inside ELEMENT, PAYLOAD, EXPECTED, or VISUAL.")
             appendLine("VISUAL = exact pixel token from the attached image; NONE if no image is attached; MISSING only if an expected image cannot be read. Never invent a token.")
@@ -657,7 +658,7 @@ class AiSidecarController(private val service: AutoActionService) {
         return buildString {
             append(fixed)
             appendLine(elements.ifBlank { "(UI element list omitted by prompt budget)" })
-            appendLine("FINAL RESPONSE PREFIX: AARIS::$requestId::")
+            appendLine("FINAL RESPONSE: use the exact REQUEST IDENTIFIER above in the <request-id> field.")
             append("FINAL RESPONSE SUFFIX: ::END")
         }.take(maxPromptChars)
     }
