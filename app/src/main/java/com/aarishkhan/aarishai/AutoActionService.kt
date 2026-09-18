@@ -3510,7 +3510,7 @@ private fun aarishAiWaitForNextRecordedTarget(
         if (alreadyVisible) return false
 
         return try {
-            winner.node.performAction(AccessibilityNodeInfo.ACTION_SHOW_ON_SCREEN)
+            winner.node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id)
         } catch (_: Throwable) {
             false
         }
