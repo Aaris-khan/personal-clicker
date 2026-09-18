@@ -6005,8 +6005,12 @@ private fun captureTargetSnapshotInternal(
     val parentContext = collectNodeTextLimited(safeParent(clickNode), 50, 560)
     val grandParentContext = collectNodeTextLimited(safeParent(safeParent(clickNode)), 34, 360)
 
-    val primaryText = firstClean(clickText, touchText, clickDesc, touchDesc, idTail(clickId), idTail(touchId))
-    val primaryDesc = firstClean(clickDesc, touchDesc, clickText, touchText)
+    // AARISH_DETERMINISTIC_TOUCHED_LABEL_PRIORITY_V8
+    // If the user taps the visible label inside a larger clickable parent (e.g. "Gemini"
+    // inside "Ask Gemini"), preserve that exact touched label as primary identity.
+    // Parent id/role/context is still recorded separately for strong action grounding.
+    val primaryText = firstClean(touchText, clickText, touchDesc, clickDesc, idTail(clickId), idTail(touchId))
+    val primaryDesc = firstClean(touchDesc, clickDesc, touchText, clickText)
 
     // AARISH_PRECISION_FILES_IDENTITY_V3
     val directFilesWordPrimaryV3 =
