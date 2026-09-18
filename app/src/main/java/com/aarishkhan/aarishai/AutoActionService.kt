@@ -3727,6 +3727,54 @@ private fun aarishAiWaitForNextRecordedTarget(
                             val roots = collectSmartSearchRoots(anchorX.toInt(), anchorY.toInt())
                             val savedPkg = aarishSavedPackageFromId(gesture)
 
+                            fun finishWithLocalVisionRescue() {
+                                if (!isSamePlaybackRun(runId)) {
+                                    try { bitmap.recycle() } catch (_: Throwable) {}
+                                    callback(null)
+                                    return
+                                }
+
+                                LocalVisionLocator.locate(
+                                    context = this@AutoActionService,
+                                    bitmap = bitmap,
+                                    gesture = gesture
+                                ) { target ->
+                                    handler.post {
+                                        if (!isSamePlaybackRun(runId) || target?.found != true) {
+                                            callback(null)
+                                            return@post
+                                        }
+
+                                        val cx = (target.xPercent.coerceIn(0f, 1f) * screenW)
+                                            .coerceIn(2f, (screenW - 2f).coerceAtLeast(2f))
+                                        val cy = (target.yPercent.coerceIn(0f, 1f) * screenH)
+                                            .coerceIn(2f, (screenH - 2f).coerceAtLeast(2f))
+                                        val halfW = kotlin.math.max(
+                                            10f,
+                                            gesture.targetWPercent.coerceIn(0f, 0.40f) * screenW / 2f
+                                        )
+                                        val halfH = kotlin.math.max(
+                                            10f,
+                                            gesture.targetHPercent.coerceIn(0f, 0.25f) * screenH / 2f
+                                        )
+                                        val bounds = Rect(
+                                            (cx - halfW).toInt().coerceAtLeast(0),
+                                            (cy - halfH).toInt().coerceAtLeast(0),
+                                            (cx + halfW).toInt().coerceAtMost(screenW.toInt()),
+                                            (cy + halfH).toInt().coerceAtMost(screenH.toInt())
+                                        )
+
+                                        callback(
+                                            AarishVisualHit(
+                                                bounds = bounds,
+                                                clickAtCenter = true,
+                                                confidence = target.confidence
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+
                             fun finishWithUniversalOcrRescue() {
                                 if (!isSamePlaybackRun(runId)) {
                                     try { bitmap.recycle() } catch (_: Throwable) {}
@@ -3738,26 +3786,26 @@ private fun aarishAiWaitForNextRecordedTarget(
                                     bitmap = bitmap,
                                     onSuccess = { boxes ->
                                         val hit = aarishUniversalOcrRescueBox(gesture, boxes)
-                                        try {
-                                            callback(
-                                                hit?.let { pair ->
+                                        if (hit != null) {
+                                            try {
+                                                callback(
                                                     AarishVisualHit(
-                                                        bounds = Rect(pair.first.bounds),
+                                                        bounds = Rect(hit.first.bounds),
                                                         clickAtCenter = true,
-                                                        confidence = pair.second
+                                                        confidence = hit.second
                                                     )
-                                                }
-                                            )
-                                        } finally {
-                                            try { bitmap.recycle() } catch (_: Throwable) {}
+                                                )
+                                            } finally {
+                                                try { bitmap.recycle() } catch (_: Throwable) {}
+                                            }
+                                        } else {
+                                            // Deterministic OCR exhausted; only now allow the
+                                            // optional local VLM to reason about the screenshot.
+                                            finishWithLocalVisionRescue()
                                         }
                                     },
                                     onFailure = {
-                                        try {
-                                            callback(null)
-                                        } finally {
-                                            try { bitmap.recycle() } catch (_: Throwable) {}
-                                        }
+                                        finishWithLocalVisionRescue()
                                     }
                                 )
                             }
@@ -4079,7 +4127,8 @@ private fun trySmartTargetAfterShortSettle(
         val token = beginActiveGesture()
         val startedAt = android.os.SystemClock.elapsedRealtime()
         val maxWait = if (!recordedGesture.recordingEvidencePath.isNullOrBlank()) {
-            kotlin.math.max(waitMs, 6_500L).coerceIn(1_000L, 15_000L)
+            val rescueFloor = if (LocalVisionLocator.isEnabled(this)) 14_000L else 6_500L
+            kotlin.math.max(waitMs, rescueFloor).coerceIn(1_000L, 15_000L)
         } else {
             waitMs.coerceIn(1_000L, 15_000L)
         }
