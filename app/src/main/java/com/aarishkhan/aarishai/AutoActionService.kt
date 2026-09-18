@@ -4128,6 +4128,112 @@ private fun trySmartTargetAfterShortSettle(
         return out.toString().take(maxChars)
     }
 
+    private fun aarishNeighborToken(raw: String?): String {
+        return normalizeUltraText(raw)
+            .replace(' ', '_')
+            .take(54)
+    }
+
+    private fun aarishDirectionalNeighborProfile(node: AccessibilityNodeInfo?): String {
+        if (node == null) return ""
+        val parent = safeParent(node) ?: return ""
+
+        val self = Rect()
+        if (!safeBounds(node, self) || self.width() <= 0 || self.height() <= 0) return ""
+
+        data class Neighbor(val text: String, val distance: Float)
+        var left: Neighbor? = null
+        var right: Neighbor? = null
+        var up: Neighbor? = null
+        var down: Neighbor? = null
+
+        val sx = self.exactCenterX()
+        val sy = self.exactCenterY()
+        val count = safeChildCount(parent)
+
+        fun keep(old: Neighbor?, candidate: Neighbor): Neighbor =
+            if (old == null || candidate.distance < old.distance) candidate else old
+
+        for (i in 0 until count) {
+            val child = safeChild(parent, i) ?: continue
+            val cb = Rect()
+            if (!safeBounds(child, cb) || cb.width() <= 0 || cb.height() <= 0) continue
+
+            val sameNode = cb == self && safeClass(child) == safeClass(node)
+            if (sameNode) continue
+
+            val rawLabel = collectNodeTextLimited(child, maxNodes = 16, maxChars = 110)
+            val label = aarishNeighborToken(rawLabel)
+            if (label.length < 2) continue
+
+            val cx = cb.exactCenterX()
+            val cy = cb.exactCenterY()
+            val dx = cx - sx
+            val dy = cy - sy
+
+            val rowTol = maxOf(self.height(), cb.height()).toFloat() * 0.85f + 10f
+            val colTol = maxOf(self.width(), cb.width()).toFloat() * 0.70f + 10f
+
+            if (kotlin.math.abs(dy) <= rowTol) {
+                if (dx < 0f) left = keep(left, Neighbor(label, kotlin.math.abs(dx) + kotlin.math.abs(dy) * 1.8f))
+                if (dx > 0f) right = keep(right, Neighbor(label, kotlin.math.abs(dx) + kotlin.math.abs(dy) * 1.8f))
+            }
+
+            if (kotlin.math.abs(dx) <= colTol) {
+                if (dy < 0f) up = keep(up, Neighbor(label, kotlin.math.abs(dy) + kotlin.math.abs(dx) * 1.8f))
+                if (dy > 0f) down = keep(down, Neighbor(label, kotlin.math.abs(dy) + kotlin.math.abs(dx) * 1.8f))
+            }
+        }
+
+        return "a11y_left=${left?.text.orEmpty()}|" +
+            "a11y_right=${right?.text.orEmpty()}|" +
+            "a11y_up=${up?.text.orEmpty()}|" +
+            "a11y_down=${down?.text.orEmpty()}"
+    }
+
+    private fun aarishDirectionalNeighborValue(raw: String?, key: String): String {
+        val prefix = "$key="
+        return raw.orEmpty()
+            .split("|")
+            .firstOrNull { it.startsWith(prefix) }
+            ?.removePrefix(prefix)
+            .orEmpty()
+    }
+
+    private fun aarishDirectionalNeighborSimilarity(
+        savedRaw: String?,
+        node: AccessibilityNodeInfo?
+    ): Float {
+        if (savedRaw.isNullOrBlank() || node == null) return 0f
+        if (!savedRaw.contains("a11y_left=") &&
+            !savedRaw.contains("a11y_right=") &&
+            !savedRaw.contains("a11y_up=") &&
+            !savedRaw.contains("a11y_down=")
+        ) return 0f
+
+        val live = aarishDirectionalNeighborProfile(node)
+        if (live.isBlank()) return 0f
+
+        var weighted = 0f
+        var total = 0f
+
+        fun add(key: String, weight: Float) {
+            val a = aarishDirectionalNeighborValue(savedRaw, key)
+            val b = aarishDirectionalNeighborValue(live, key)
+            if (a.isBlank() || b.isBlank()) return
+            total += weight
+            weighted += tokenSimilarity(a, b) * weight
+        }
+
+        add("a11y_left", 1.25f)
+        add("a11y_right", 1.25f)
+        add("a11y_up", 1.0f)
+        add("a11y_down", 1.0f)
+
+        return if (total <= 0f) 0f else (weighted / total).coerceIn(0f, 1f)
+    }
+
+
     private fun roleFlagsOf(node: AccessibilityNodeInfo?): String {
         if (node == null) return ""
 
@@ -4772,6 +4878,11 @@ private fun aarishGeometryFallbackWhenIdentityMissing(gesture: RecordedGesture):
         if (bestContext >= 0.62f && bestContext - runnerContext >= 0.10f) return false
         if (runnerContext >= 0.62f && runnerContext - bestContext >= 0.08f) return true
 
+        val bestNeighbor = aarishDirectionalNeighborSimilarity(gesture.targetSiblingText, best.node)
+        val runnerNeighbor = aarishDirectionalNeighborSimilarity(gesture.targetSiblingText, runner.node)
+        if (bestNeighbor >= 0.68f && bestNeighbor - runnerNeighbor >= 0.12f) return false
+        if (runnerNeighbor >= 0.68f && runnerNeighbor - bestNeighbor >= 0.10f) return true
+
         val bestRole = roleSimilarity(gesture.targetRoleFlags, roleFlagsOf(best.node))
         val runnerRole = roleSimilarity(gesture.targetRoleFlags, roleFlagsOf(runner.node))
         if (bestRole >= 0.70f && bestRole - runnerRole >= 0.16f) return false
@@ -5341,6 +5452,8 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
                 tokenSimilarity(gesture.targetSiblingText, siblingText),
                 tokenSimilarity(gesture.targetSiblingText, semanticWindow) * 0.72f
             )
+            val directionalNeighborSim =
+                aarishDirectionalNeighborSimilarity(gesture.targetSiblingText, actionNode)
 
             val roleSim = roleSimilarity(gesture.targetRoleFlags, roleFlagsOf(actionNode))
             val dnaSim = dnaSimilarity(gesture.targetTreePath, extractTreePathDNA(actionNode))
@@ -5362,6 +5475,10 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
             if (siblingSim >= 0.86f) score += 38
             else if (siblingSim >= 0.64f) score += 20
             else if (siblingSim >= 0.46f) score += 7
+
+            if (directionalNeighborSim >= 0.88f) score += 34
+            else if (directionalNeighborSim >= 0.70f) score += 20
+            else if (directionalNeighborSim >= 0.52f) score += 8
 
             if (roleSim >= 0.80f) score += 24
             else if (roleSim >= 0.55f) score += 10
@@ -5638,6 +5755,10 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
         best = maxOf(best, tokenSimilarity(gesture.targetContextText, mergedContext) * 0.82f)
         best = maxOf(best, tokenSimilarity(gesture.targetChildText, nodeContext) * 0.72f)
         best = maxOf(best, tokenSimilarity(gesture.targetSiblingText, siblingContext) * 0.68f)
+        best = maxOf(
+            best,
+            aarishDirectionalNeighborSimilarity(gesture.targetSiblingText, actionNode) * 0.74f
+        )
         best = maxOf(best, roleSimilarity(gesture.targetRoleFlags, roleFlagsOf(actionNode)) * 0.58f)
         best = maxOf(best, dnaSimilarity(gesture.targetTreePath, extractTreePathDNA(actionNode)) * 0.74f)
 
@@ -6428,7 +6549,13 @@ private fun captureTargetSnapshotInternal(
             .filter { it.isNotBlank() }
             .joinToString(" | ")
             .take(700),
-        targetSiblingText = siblingContext.take(700),
+        targetSiblingText = listOf(
+            siblingContext,
+            aarishDirectionalNeighborProfile(clickNode)
+        )
+            .filter { it.isNotBlank() }
+            .joinToString(" | ")
+            .take(900),
         targetRoleFlags = listOf(
             roleFlagsOf(touchedNode),
             roleFlagsOf(clickNode)
@@ -7467,7 +7594,13 @@ val root = window.root ?: continue
                 .filter { it.isNotBlank() }
                 .joinToString(" | ")
                 .take(700),
-            targetSiblingText = siblingContext.take(700),
+            targetSiblingText = listOf(
+            siblingContext,
+            aarishDirectionalNeighborProfile(clickNode)
+        )
+            .filter { it.isNotBlank() }
+            .joinToString(" | ")
+            .take(900),
             targetRoleFlags = listOf(
                 roleFlagsOf(touchedNode),
                 roleFlagsOf(clickNode)
