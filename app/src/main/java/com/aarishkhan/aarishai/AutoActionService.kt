@@ -1684,12 +1684,32 @@ private fun aarishAiWaitForNextRecordedTarget(
                     (b.width().toFloat() * b.height().toFloat()) /
                     (screenW.coerceAtLeast(1f) * screenH.coerceAtLeast(1f)) <= 0.58f
             }
-            if (fingerprintBounds != null) {
-                aarishWriteVisualFingerprintSidecar(
-                    file.absolutePath,
-                    aarishVisualDHash(source, fingerprintBounds, screenW, screenH)
-                )
-            }
+
+            // AARISH_SCREENSHOT_ONLY_TAP_PATCH_V1
+            // Always save a local patch around the finger. This works even when a
+            // Canvas/WebView/custom UI exposes no accessibility node at all.
+            val sw = screenW.coerceAtLeast(1f)
+            val sh = screenH.coerceAtLeast(1f)
+            val tapPatchW = kotlin.math.min(96f * density, sw * 0.30f).coerceAtLeast(48f)
+            val tapPatchH = kotlin.math.min(72f * density, sh * 0.16f).coerceAtLeast(40f)
+            val maxX = sw.toInt().coerceAtLeast(1)
+            val maxY = sh.toInt().coerceAtLeast(1)
+            val tapPatch = Rect(
+                (tapX - tapPatchW / 2f).toInt().coerceIn(0, maxX - 1),
+                (tapY - tapPatchH / 2f).toInt().coerceIn(0, maxY - 1),
+                (tapX + tapPatchW / 2f).toInt().coerceIn(1, maxX),
+                (tapY + tapPatchH / 2f).toInt().coerceIn(1, maxY)
+            ).takeIf { it.width() >= 8 && it.height() >= 8 }
+
+            aarishWriteVisualFingerprintSidecarV2(
+                evidencePath = file.absolutePath,
+                boundsH = fingerprintBounds?.let { aarishVisualDHash(source, it, sw, sh) },
+                boundsV = fingerprintBounds?.let { aarishVisualVHash(source, it, sw, sh) },
+                tapH = tapPatch?.let { aarishVisualDHash(source, it, sw, sh) },
+                tapV = tapPatch?.let { aarishVisualVHash(source, it, sw, sh) },
+                tapWPercent = tapPatch?.width()?.toFloat()?.div(sw) ?: 0f,
+                tapHPercent = tapPatch?.height()?.toFloat()?.div(sh) ?: 0f
+            )
 
             // Bound private evidence storage so long-term recording use cannot grow forever.
             try {
