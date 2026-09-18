@@ -792,7 +792,9 @@ class AiSidecarController(private val service: AutoActionService) {
                     type = "image/png"
                     setPackage(provider.packageName)
                     putExtra(Intent.EXTRA_STREAM, uri)
-                    putExtra(Intent.EXTRA_TEXT, prompt)
+                    // AARISH_AI_SINGLE_TEXT_OWNER_V7:
+                    // Share intent owns only the image. Prompt text is injected exactly once
+                    // by the verified composer transaction after the provider is ready.
                     clipData = ClipData.newUri(service.contentResolver, "Aarish AI visual evidence", uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
