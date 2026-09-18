@@ -261,7 +261,8 @@ class AiSidecarController(private val service: AutoActionService) {
                     state.fingerprint,
                     command.action,
                     command.elementKey,
-                    command.payload.take(180)
+                    command.payload.take(180),
+                    command.expected.take(180)
                 ).joinToString("|")
                 if (plannerSignature == lastPlannerSignature) {
                     repeatedPlannerSignatureCount++
@@ -282,7 +283,21 @@ class AiSidecarController(private val service: AutoActionService) {
                     if (rescueMode) {
                         failTurn(run, "Rescue must reproduce the recorded $rescueExpectedAction before DONE")
                     } else {
-                        finishMission(true, command.payload.ifBlank { "Task complete" })
+                        // AARISH_AI_DONE_REVALIDATE_V4
+                        // Provider app is foreground while it answers. Return to the target and
+                        // prove completion from the live target state before declaring success.
+                        returnToTarget(run, lastTargetPackage) {
+                            if (!alive(run)) return@returnToTarget
+                            verifyDoneEvidence(run, state, command) { verified, proof ->
+                                if (!alive(run)) return@verifyDoneEvidence
+                                if (verified) {
+                                    rememberHistory("DONE verified -> $proof")
+                                    finishMission(true, command.payload.ifBlank { "Task complete" })
+                                } else {
+                                    failTurn(run, "DONE rejected: $proof")
+                                }
+                            }
+                        }
                     }
                     return@askPhysicalAi
                 }
@@ -443,6 +458,7 @@ class AiSidecarController(private val service: AutoActionService) {
         val history = actionHistory.joinToString("\n") { "- $it" }
         return buildString {
             appendLine("You are the recovery/planning brain for an Android UI automation agent.")
+            appendLine("STATELESS TRANSACTION: use only this request's USER GOAL, CURRENT PACKAGE, LAST OUTCOME, RECENT ACTION HISTORY, UI elements and attached evidence. Ignore unrelated earlier chat history.")
             appendLine("USER GOAL: $missionGoal")
             appendLine("REQUEST IDENTIFIER: $requestId")
             appendLine("STEP: $missionStep")
@@ -467,8 +483,9 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine("Do not perform payments, purchases, money transfers, account deletion, installs/uninstalls, or permission/security changes autonomously.")
             // AARISH_AI_DONE_EVIDENCE_V3
             appendLine("Use DONE only when the CURRENT visible screen/state provides evidence that the user's goal is complete; never mark DONE from assumption or an earlier screen.")
-            appendLine("Reply with ONE single machine line and no prose. Construct it as: word AARIS, two colons, request identifier, two colons, action name, two colons, element key or empty, two colons, payload/expected text.")
-            appendLine("For SET_TEXT put the text to type in the final field. For WAIT put milliseconds in the final field. For OPEN_APP put the app name in the final field. For DONE/FAIL put a short reason in the final field.")
+            appendLine("Reply with ONE single machine line and no prose using exactly six fields: AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>.")
+            appendLine("EXPECTED is the observable post-condition the executor must verify. For TAP/TAP_XY/LONG_TAP/SCROLL/DONE it is mandatory. Prefer visible text or semantic state. You may use PACKAGE=<package>, CLIPBOARD_CHANGE, or STATE_CHANGE only when that is genuinely the strongest observable proof.")
+            appendLine("For SET_TEXT put text to type in PAYLOAD and a short visible confirmation in EXPECTED when available. For WAIT put milliseconds in PAYLOAD. For OPEN_APP put the human app name in PAYLOAD and PACKAGE=<expected package> when known. For DONE put a short completion reason in PAYLOAD and concrete current-state proof in EXPECTED. FAIL uses PAYLOAD for the reason.")
         }.take(15000)
     }
 
@@ -760,14 +777,23 @@ class AiSidecarController(private val service: AutoActionService) {
         val line = text.lineSequence().map { it.trim() }.lastOrNull { it.contains(marker) } ?: return null
         val start = line.indexOf(marker)
         if (start < 0) return null
-        val raw = line.substring(start).take(4000)
-        val parts = raw.split("::", limit = 5)
+        val raw = line.substring(start).take(5000)
+        val parts = raw.split("::", limit = 6)
         if (parts.size < 4 || parts[0] != "AARIS" || parts[1] != requestId) return null
         val action = parts[2].trim().uppercase(Locale.US)
         val element = parts.getOrNull(3).orEmpty().trim()
         val payload = parts.getOrNull(4).orEmpty().trim()
+        val expected = parts.getOrNull(5).orEmpty().trim()
         if (action !in setOf("TAP", "TAP_XY", "LONG_TAP", "SET_TEXT", "SCROLL", "BACK", "HOME", "WAIT", "OPEN_APP", "DONE", "FAIL")) return null
-        return AiCommand(action = action, elementKey = element, payload = payload, expected = payload)
+
+        // AARISH_AI_PROTOCOL_V4: old five-field responses still parse, but new
+        // providers get a dedicated EXPECTED field so payload and proof are not conflated.
+        return AiCommand(
+            action = action,
+            elementKey = element,
+            payload = payload,
+            expected = expected
+        )
     }
 
     private fun returnToTarget(run: Int, pkg: String, callback: () -> Unit) {
@@ -776,34 +802,69 @@ class AiSidecarController(private val service: AutoActionService) {
             callback()
             return
         }
-
-        var moved = false
-        try {
-            val am = service.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
-            @Suppress("DEPRECATION")
-            val tasks = am?.getRecentTasks(50, android.app.ActivityManager.RECENT_IGNORE_UNAVAILABLE).orEmpty()
-            val hit = tasks.firstOrNull { info ->
-                info.baseIntent?.component?.packageName == pkg || info.origActivity?.packageName == pkg
-            }
-            if (hit != null && am != null) {
-                try {
-                    am.moveTaskToFront(hit.id, 0)
-                    moved = true
-                } catch (_: Throwable) {}
-            }
-        } catch (_: Throwable) {}
-
-        if (!moved) {
-            try {
-                val launch = service.packageManager.getLaunchIntentForPackage(pkg)
-                if (launch != null) {
-                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                    service.startActivity(launch)
-                }
-            } catch (_: Throwable) {}
+        if (isPackageForeground(pkg)) {
+            callback()
+            return
         }
 
-        waitForTargetWindow(run, pkg, 0, callback)
+        // AARISH_AI_PSEUDO_API_RETURN_V4
+        // The AI app was opened on top of the target. First try BACK so the exact
+        // target task/navigation state is preserved. Only then fall back to task
+        // movement or relaunching, which can reset some applications.
+        fun hardReturn() {
+            if (!alive(run)) return
+            var moved = false
+            try {
+                val am = service.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+                @Suppress("DEPRECATION")
+                val tasks = am?.getRecentTasks(50, android.app.ActivityManager.RECENT_IGNORE_UNAVAILABLE).orEmpty()
+                val hit = tasks.firstOrNull { info ->
+                    info.baseIntent?.component?.packageName == pkg || info.origActivity?.packageName == pkg
+                }
+                if (hit != null && am != null) {
+                    try {
+                        am.moveTaskToFront(hit.id, 0)
+                        moved = true
+                    } catch (_: Throwable) {}
+                }
+            } catch (_: Throwable) {}
+
+            if (!moved) {
+                try {
+                    val launch = service.packageManager.getLaunchIntentForPackage(pkg)
+                    if (launch != null) {
+                        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                        service.startActivity(launch)
+                    }
+                } catch (_: Throwable) {}
+            }
+            waitForTargetWindow(run, pkg, 0, callback)
+        }
+
+        val backSent = try {
+            service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+        } catch (_: Throwable) {
+            false
+        }
+
+        if (!backSent) {
+            hardReturn()
+            return
+        }
+
+        fun awaitBack(attempt: Int) {
+            if (!alive(run)) return
+            if (isPackageForeground(pkg)) {
+                handler.postDelayed({ if (alive(run)) callback() }, 120L)
+                return
+            }
+            if (attempt >= 6) {
+                hardReturn()
+                return
+            }
+            handler.postDelayed({ awaitBack(attempt + 1) }, 140L)
+        }
+        handler.postDelayed({ awaitBack(0) }, 120L)
     }
 
     private fun isPackageForeground(pkg: String): Boolean = try {
@@ -923,6 +984,76 @@ class AiSidecarController(private val service: AutoActionService) {
         }
     }
 
+    // AARISH_AI_EVIDENCE_VERIFIER_V4
+    private fun expectedMatchesState(state: ScreenState?, expectedRaw: String): Boolean {
+        val stateNow = state ?: return false
+        val expected = expectedRaw.replace(Regex("\\s+"), " ").trim()
+        if (expected.isBlank()) return false
+
+        if (expected.startsWith("PACKAGE=", ignoreCase = true)) {
+            val wanted = expected.substringAfter('=').trim()
+            return wanted.isNotBlank() && stateNow.packageName.equals(wanted, ignoreCase = true)
+        }
+        if (expected.equals("STATE_CHANGE", ignoreCase = true) ||
+            expected.equals("CLIPBOARD_CHANGE", ignoreCase = true)
+        ) return false
+
+        val hay = stateNow.elements.take(140).joinToString(" | ") { e ->
+            listOf(e.text, e.desc, e.viewId.substringAfterLast('/'), e.context).joinToString(" ")
+        }
+        if (hay.isBlank()) return false
+        if (uiTokenSimilarity(expected, hay) >= 0.72f) return true
+
+        val needle = normalizeUiText(expected)
+        val normalizedHay = normalizeUiText(hay)
+        return needle.length >= 3 && normalizedHay.contains(needle)
+    }
+
+    private fun textEntryMatches(before: ScreenState, command: AiCommand): Boolean {
+        val saved = before.elements.firstOrNull { it.key.equals(command.elementKey, true) } ?: return false
+        val live = findBestLiveMatch(saved) ?: return false
+        val liveText = try { live.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+        val wanted = normalizeUiText(command.payload)
+        if (wanted.isBlank()) return false
+        val actual = normalizeUiText(liveText)
+        return actual == wanted || actual.contains(wanted.take(180))
+    }
+
+    private fun verifyDoneEvidence(
+        run: Int,
+        planned: ScreenState,
+        command: AiCommand,
+        callback: (Boolean, String) -> Unit
+    ) {
+        if (!alive(run)) return
+        val live = captureStateWithoutScreenshot()
+        if (live == null) {
+            callback(false, "target state unreadable")
+            return
+        }
+        if (live.packageName != planned.packageName) {
+            callback(false, "target package changed before DONE proof")
+            return
+        }
+
+        val expected = command.expected.trim()
+        if (expected.isBlank()) {
+            callback(false, "AI supplied no observable DONE evidence")
+            return
+        }
+        if (expected.equals("STATE_CHANGE", ignoreCase = true) ||
+            expected.equals("CLIPBOARD_CHANGE", ignoreCase = true)
+        ) {
+            callback(false, "DONE needs concrete visible/package evidence")
+            return
+        }
+        if (expectedMatchesState(live, expected)) {
+            callback(true, "evidence matched: ${expected.take(120)}")
+        } else {
+            callback(false, "expected evidence not present: ${expected.take(120)}")
+        }
+    }
+
     private fun verifyAfterAction(
         run: Int,
         before: ScreenState,
@@ -932,21 +1063,61 @@ class AiSidecarController(private val service: AutoActionService) {
     ) {
         if (!alive(run)) return
         val started = SystemClock.elapsedRealtime()
+
         fun poll(attempt: Int) {
             if (!alive(run)) return
             val now = captureStateWithoutScreenshot()
-            val changed = now != null && now.fingerprint != before.fingerprint
-            val clipChanged = readClipboard().let { it.isNotBlank() && it != clipboardBefore }
-            if (changed || clipChanged || command.action == "WAIT") {
-                callback(true, when {
-                    changed -> "screen state changed"
-                    clipChanged -> "clipboard changed"
-                    else -> "action completed"
-                })
+            val changed = now != null &&
+                (now.packageName != before.packageName || now.fingerprint != before.fingerprint)
+            val clipboardAfter = readClipboard()
+            val clipChanged = clipboardAfter.isNotBlank() && clipboardAfter != clipboardBefore
+            val expected = command.expected.trim()
+
+            val verified = when (command.action) {
+                "WAIT" -> true
+                "SET_TEXT" -> textEntryMatches(before, command) ||
+                    (expected.isNotBlank() && expectedMatchesState(now, expected))
+                "OPEN_APP" -> {
+                    val wantedPkg = resolveLaunchPackageByLabel(command.payload)
+                    wantedPkg != null && now?.packageName == wantedPkg
+                }
+                "TAP", "TAP_XY", "LONG_TAP", "SCROLL" -> when {
+                    expected.startsWith("PACKAGE=", ignoreCase = true) -> expectedMatchesState(now, expected)
+                    expected.equals("CLIPBOARD_CHANGE", ignoreCase = true) -> clipChanged
+                    expected.equals("STATE_CHANGE", ignoreCase = true) -> changed
+                    expected.isNotBlank() -> expectedMatchesState(now, expected)
+                    rescueMode -> changed || clipChanged
+                    else -> false
+                }
+                "BACK", "HOME" -> when {
+                    expected.startsWith("PACKAGE=", ignoreCase = true) -> expectedMatchesState(now, expected)
+                    expected.isNotBlank() -> expectedMatchesState(now, expected) || changed
+                    else -> changed
+                }
+                else -> changed
+            }
+
+            if (verified) {
+                val proof = when {
+                    command.action == "SET_TEXT" -> "text entry verified"
+                    command.action == "OPEN_APP" -> "target app foreground"
+                    expected.equals("CLIPBOARD_CHANGE", ignoreCase = true) -> "clipboard changed"
+                    expected.isNotBlank() && expectedMatchesState(now, expected) -> "expected state visible"
+                    changed -> "screen/package state changed"
+                    else -> "action-specific proof matched"
+                }
+                callback(true, proof)
                 return
             }
-            if (attempt >= 14 || SystemClock.elapsedRealtime() - started > 4500L) {
-                callback(false, "no observable state change")
+
+            if (attempt >= 16 || SystemClock.elapsedRealtime() - started > 5200L) {
+                val reason = when {
+                    command.action in setOf("TAP", "TAP_XY", "LONG_TAP", "SCROLL") && expected.isBlank() && !rescueMode ->
+                        "planner supplied no observable post-condition"
+                    expected.isNotBlank() -> "expected post-condition not observed: ${expected.take(120)}"
+                    else -> "no action-specific proof observed"
+                }
+                callback(false, reason)
                 return
             }
             handler.postDelayed({ poll(attempt + 1) }, 300L)
@@ -1679,9 +1850,9 @@ class AiSidecarController(private val service: AutoActionService) {
         return blocked.any(text::contains)
     }
 
-    private fun openAppByLabel(labelRaw: String): Boolean {
+    private fun resolveLaunchPackageByLabel(labelRaw: String): String? {
         val wanted = labelRaw.trim().lowercase(Locale.US)
-        if (wanted.isBlank()) return false
+        if (wanted.isBlank()) return null
         return try {
             val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
             val matches = service.packageManager.queryIntentActivities(q, 0)
@@ -1692,10 +1863,18 @@ class AiSidecarController(private val service: AutoActionService) {
                     label.contains(wanted) || wanted.contains(label) -> 600
                     else -> 0
                 }
-            } ?: return false
+            } ?: return null
             val appLabel = info.loadLabel(service.packageManager)?.toString().orEmpty().lowercase(Locale.US)
-            if (!(appLabel == wanted || appLabel.contains(wanted) || wanted.contains(appLabel))) return false
-            val pkg = info.activityInfo.packageName
+            if (!(appLabel == wanted || appLabel.contains(wanted) || wanted.contains(appLabel))) return null
+            info.activityInfo.packageName
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun openAppByLabel(labelRaw: String): Boolean {
+        val pkg = resolveLaunchPackageByLabel(labelRaw) ?: return false
+        return try {
             val launch = service.packageManager.getLaunchIntentForPackage(pkg) ?: return false
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
             service.startActivity(launch)
