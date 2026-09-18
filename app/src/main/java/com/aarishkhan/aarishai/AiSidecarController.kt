@@ -714,45 +714,71 @@ class AiSidecarController(private val service: AutoActionService) {
             return
         }
 
-        val setOk = try {
-            val args = Bundle().apply {
-                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, prompt)
-            }
-            composer.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-        } catch (_: Throwable) {
-            false
+        // AARISH_AI_COMPOSER_COMMIT_V4
+        // ACTION_SET_TEXT returning true is not proof that the provider actually owns the
+        // complete request. Verify the unique request marker before pressing Send.
+        val requestMarker = prompt.lineSequence()
+            .firstOrNull { it.startsWith("REQUEST IDENTIFIER:") }
+            ?.trim()
+            .orEmpty()
+
+        fun composerHasRequest(node: AccessibilityNodeInfo?): Boolean {
+            val n = node ?: return false
+            val value = try { n.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+            if (value.isBlank()) return false
+            if (requestMarker.isNotBlank() && value.contains(requestMarker)) return true
+            val prefix = prompt.take(120)
+            return prefix.isNotBlank() && value.contains(prefix)
         }
 
-        // AARISH_AI_DIRECT_COMPOSER_V1_SET_OR_PASTE
-        if (!setOk) {
-            val existing = try { composer.text?.toString().orEmpty() } catch (_: Throwable) { "" }
-            val proof = prompt.take(96)
-            val alreadyThere = proof.isNotBlank() && existing.contains(proof)
-            val pasted = if (!alreadyThere) pastePromptViaClipboard(composer, prompt) else true
-            if (!alreadyThere && !pasted) {
-                callback(false)
+        fun writePrompt(node: AccessibilityNodeInfo): Boolean {
+            val setOk = try {
+                val args = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, prompt)
+                }
+                node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            } catch (_: Throwable) {
+                false
+            }
+            if (setOk) return true
+            if (composerHasRequest(node)) return true
+            return pastePromptViaClipboard(node, prompt)
+        }
+
+        if (!writePrompt(composer)) {
+            callback(false)
+            return
+        }
+
+        fun clickVerifiedSend(repairAttempt: Int) {
+            if (!alive(run)) return
+            val latest = findRootForPackage(provider.packageName)
+            val latestComposer = latest?.let(::findEditable) ?: composer
+
+            if (!composerHasRequest(latestComposer)) {
+                if (repairAttempt >= 1 || !pastePromptViaClipboard(latestComposer, prompt)) {
+                    callback(false)
+                    return
+                }
+                handler.postDelayed({ clickVerifiedSend(repairAttempt + 1) }, 420L)
                 return
             }
-        }
 
-        handler.postDelayed({
-            if (!alive(run)) return@postDelayed
-            val latest = findRootForPackage(provider.packageName)
-            val latestComposer = latest?.let(::findEditable)
-            val send = latest?.let { findSendNode(it, latestComposer ?: composer) }
+            val send = latest?.let { findSendNode(it, latestComposer) }
             val ok = send != null && clickNode(send)
             if (ok) {
                 callback(true)
-            } else {
-                handler.postDelayed({
-                    if (!alive(run)) return@postDelayed
-                    val retryRoot = findRootForPackage(provider.packageName)
-                    val retryComposer = retryRoot?.let(::findEditable)
-                    val retry = retryRoot?.let { findSendNode(it, retryComposer ?: composer) }
-                    callback(retry != null && clickNode(retry))
-                }, 800L)
+                return
             }
-        }, 650L)
+
+            if (repairAttempt >= 1) {
+                callback(false)
+                return
+            }
+            handler.postDelayed({ clickVerifiedSend(repairAttempt + 1) }, 750L)
+        }
+
+        handler.postDelayed({ clickVerifiedSend(0) }, 650L)
     }
 
     private fun waitForCompleteResponse(run: Int, provider: Provider, requestId: String, callback: (AiCommand?) -> Unit) {
