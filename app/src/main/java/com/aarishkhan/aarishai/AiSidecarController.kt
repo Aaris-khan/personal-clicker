@@ -2179,7 +2179,10 @@ class AiSidecarController(private val service: AutoActionService) {
         var bestScore = Int.MIN_VALUE
 
         walk(root, 3500) { n ->
-            val editable = try { n.isEditable } catch (_: Throwable) { false }
+            val actions = try { n.actionList.orEmpty() } catch (_: Throwable) { emptyList() }
+            val editableFlag = try { n.isEditable } catch (_: Throwable) { false }
+            val setTextCapable = actions.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }
+            val editable = editableFlag || setTextCapable
             val enabled = try { n.isEnabled } catch (_: Throwable) { false }
             val visible = try { n.isVisibleToUser } catch (_: Throwable) { false }
             if (!editable || !enabled || !visible) return@walk
