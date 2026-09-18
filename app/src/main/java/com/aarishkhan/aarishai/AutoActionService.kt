@@ -4931,25 +4931,26 @@ private fun trySmartTargetAfterShortSettle(
                         .sortedBy { it.t.coerceAtLeast(0L) }
                     val fallbackDuration = fallbackPoints.maxOfOrNull { it.t.coerceAtLeast(0L) } ?: 0L
                     val fallbackMovement = fallbackPoints.isNotEmpty() && hasRealMovement(fallbackPoints)
-                    val savedPkg = recordedGesture.targetPackage?.trim().orEmpty()
+                    val savedPkg = recordedGesture.targetPackage?.trim().orEmpty().ifBlank {
+                        try { aarishSavedPackageFromId(recordedGesture).trim() } catch (_: Throwable) { "" }
+                    }
                     val livePkg = try { aarishBestForegroundPackageForOcr()?.trim().orEmpty() } catch (_: Throwable) { "" }
-                    val samePackage = savedPkg.isNotBlank() &&
-                        livePkg.isNotBlank() &&
-                        savedPkg.equals(livePkg, ignoreCase = true)
 
                     val screenW = resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
                     val screenH = resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
-                    val orientationSafe =
-                        recordedGesture.recordedScreenW <= 0 ||
-                            recordedGesture.recordedScreenH <= 0 ||
-                            ((recordedGesture.recordedScreenW > recordedGesture.recordedScreenH) == (screenW > screenH))
+                    val safeCoordinateFallback = AutonomyPolicy.allowsRecordedTapCoordinateFallback(
+                        savedPackageRaw = savedPkg,
+                        livePackageRaw = livePkg,
+                        hasPercentAnchor = hasSavedPercentAnchor(recordedGesture),
+                        hasMovement = fallbackMovement,
+                        durationMs = fallbackDuration,
+                        recordedScreenW = recordedGesture.recordedScreenW,
+                        recordedScreenH = recordedGesture.recordedScreenH,
+                        liveScreenW = screenW.toInt(),
+                        liveScreenH = screenH.toInt()
+                    )
 
-                    if (!fallbackMovement &&
-                        fallbackDuration < 450L &&
-                        hasSavedPercentAnchor(recordedGesture) &&
-                        samePackage &&
-                        orientationSafe
-                    ) {
+                    if (safeCoordinateFallback) {
                         finished = true
                         currentTask?.let {
                             try { scheduledTasks.remove(it) } catch (_: Throwable) {}

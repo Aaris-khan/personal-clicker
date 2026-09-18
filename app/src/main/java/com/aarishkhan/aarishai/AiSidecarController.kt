@@ -1563,25 +1563,8 @@ class AiSidecarController(private val service: AutoActionService) {
         return actual == wanted || actual.contains(wanted.take(180))
     }
 
-    private fun missionAllowsPackageOnlyDone(): Boolean {
-        val goal = normalizeUiText(missionGoal)
-        if (goal.isBlank()) return false
-
-        val openIntent = listOf(
-            "open", "launch", "start", "switch to", "go to",
-            "kholo", "khol", "chalao", "खोल", "खोलो", "चलाओ"
-        ).any { goal.contains(it) }
-        if (!openIntent) return false
-
-        val beyondOpenIntent = listOf(
-            "send", "message", "type", "write", "reply", "search", "find",
-            "call", "share", "upload", "download", "select", "tap", "click",
-            "bhej", "bhejo", "likh", "dhund", "dhoond", "भेज", "लिख",
-            "ढूंढ", "खोज", "कॉल", "शेयर"
-        ).any { goal.contains(it) }
-
-        return !beyondOpenIntent
-    }
+    private fun missionAllowsPackageOnlyDone(): Boolean =
+        AutonomyPolicy.allowsPackageOnlyDone(missionGoal)
 
     private fun verifyDoneEvidence(
         run: Int,
@@ -2730,11 +2713,10 @@ class AiSidecarController(private val service: AutoActionService) {
                 .sortedByDescending { it.score }
 
             val winner = ranked.firstOrNull() ?: return null
-            if (winner.score < 620) return null
             val runner = ranked.drop(1).firstOrNull()
-            if (winner.score < 1000 && runner != null && winner.score - runner.score < 120) {
-                // Ambiguous partial app names are safer to re-plan than to launch the
-                // wrong application and continue acting there.
+            if (!AutonomyPolicy.isUnambiguousLaunchMatch(winner.score, runner?.score)) {
+                // Exact-label ties are ambiguous too (two apps can expose the same
+                // launcher label). Re-plan instead of silently picking list order.
                 return null
             }
             winner.packageName
