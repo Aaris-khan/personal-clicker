@@ -3620,6 +3620,22 @@ private fun trySmartTargetAfterShortSettle(
     private fun safeId(node: AccessibilityNodeInfo?): String? =
         try { node?.viewIdResourceName } catch (_: Exception) { null }
 
+    // AARISH_DETERMINISTIC_COMPOSE_TAG_V8
+    // Compose exposes testTag in AccessibilityNodeInfo.extras even when there is no
+    // classic Android resource id. This gives us a stable semantic selector on modern UIs.
+    private fun safeComposeTestTag(node: AccessibilityNodeInfo?): String? {
+        if (node == null || android.os.Build.VERSION.SDK_INT < 19) return null
+        return try {
+            node.extras
+                ?.getString("androidx.compose.ui.semantics.testTag")
+                ?.replace(Regex("\\s+"), " ")
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private fun safeClass(node: AccessibilityNodeInfo?): String? =
         try { node?.className?.toString() } catch (_: Exception) { null }
 
@@ -3657,6 +3673,33 @@ private fun trySmartTargetAfterShortSettle(
             .trim()
     }
 
+    private fun aarishEditSimilarity(aRaw: String, bRaw: String): Float {
+        val a = aRaw.take(64)
+        val b = bRaw.take(64)
+        if (a == b) return 1f
+        if (a.isEmpty() || b.isEmpty()) return 0f
+        if (kotlin.math.abs(a.length - b.length) > 4) return 0f
+
+        var prev = IntArray(b.length + 1) { it }
+        var curr = IntArray(b.length + 1)
+        for (i in 1..a.length) {
+            curr[0] = i
+            for (j in 1..b.length) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                curr[j] = minOf(
+                    curr[j - 1] + 1,
+                    prev[j] + 1,
+                    prev[j - 1] + cost
+                )
+            }
+            val swap = prev
+            prev = curr
+            curr = swap
+        }
+        val maxLen = maxOf(a.length, b.length).coerceAtLeast(1)
+        return (1f - prev[b.length].toFloat() / maxLen.toFloat()).coerceIn(0f, 1f)
+    }
+
     private fun tokenSimilarity(saved: String?, current: String?): Float {
         val a = normalizeUltraText(saved)
         val b = normalizeUltraText(current)
@@ -3665,16 +3708,29 @@ private fun trySmartTargetAfterShortSettle(
         if (a == b) return 1f
         if (a.length >= 2 && b.length >= 2 && (a.contains(b) || b.contains(a))) return 0.92f
 
+        // Single human-readable labels such as "Gemini" survive a small spelling/OCR
+        // difference, but short words stay exact to avoid dangerous false matches.
+        if (!a.contains(' ') && !b.contains(' ') && a.length >= 5 && b.length >= 5) {
+            val edit = aarishEditSimilarity(a, b)
+            if (edit >= 0.84f) return (0.78f + (edit - 0.84f) * 1.25f).coerceAtMost(0.98f)
+        }
+
         val aTokens = a.split(" ").filter { it.length >= 2 }.distinct()
         val bTokens = b.split(" ").filter { it.length >= 2 }.distinct()
 
         if (aTokens.isEmpty() || bTokens.isEmpty()) return 0f
 
+        fun tokenMatches(token: String, other: String): Boolean {
+            if (token == other) return true
+            if (token.length >= 4 && other.length >= 4 &&
+                (token.contains(other) || other.contains(token))
+            ) return true
+            return token.length >= 5 && other.length >= 5 &&
+                aarishEditSimilarity(token, other) >= 0.86f
+        }
+
         val hits = aTokens.count { token ->
-            bTokens.any { other ->
-                token == other ||
-                    (token.length >= 4 && other.length >= 4 && (token.contains(other) || other.contains(token)))
-            }
+            bTokens.any { other -> tokenMatches(token, other) }
         }
 
         val recall = hits.toFloat() / aTokens.size.toFloat()
@@ -3690,8 +3746,9 @@ private fun trySmartTargetAfterShortSettle(
         val text = safeText(node).orEmpty()
         val desc = safeDesc(node).orEmpty()
         val id = safeId(node)?.substringAfterLast("/").orEmpty()
+        val composeTag = safeComposeTestTag(node).orEmpty()
 
-        return listOf(text, desc, id)
+        return listOf(text, desc, id, composeTag)
             .filter { it.isNotBlank() }
             .joinToString(" | ")
     }
@@ -3764,9 +3821,9 @@ private fun trySmartTargetAfterShortSettle(
     private fun roleFlagsOf(node: AccessibilityNodeInfo?): String {
         if (node == null) return ""
 
-        val flags = mutableListOf<String>()
+        val flags = linkedSetOf<String>()
 
-        try { if (node.isClickable) flags.add("click") } catch (_: Exception) {}
+        try { if (safeClickable(node)) flags.add("click") } catch (_: Exception) {}
         try { if (node.isLongClickable) flags.add("long") } catch (_: Exception) {}
         try { if (node.isEditable) flags.add("edit") } catch (_: Exception) {}
         try { if (node.isScrollable) flags.add("scroll") } catch (_: Exception) {}
@@ -3776,21 +3833,89 @@ private fun trySmartTargetAfterShortSettle(
         try { if (node.isVisibleToUser) flags.add("visible") } catch (_: Exception) {}
         try { if (node.isFocusable) flags.add("focus") } catch (_: Exception) {}
 
+        val cls = safeClass(node).orEmpty().substringAfterLast('.').lowercase()
+        when {
+            cls.contains("imagebutton") -> flags.add("kind=imagebutton")
+            cls.contains("button") -> flags.add("kind=button")
+            cls.contains("edit") -> flags.add("kind=edit")
+            cls.contains("switch") -> flags.add("kind=switch")
+            cls.contains("checkbox") -> flags.add("kind=check")
+            cls.contains("radio") -> flags.add("kind=radio")
+            cls.contains("tab") -> flags.add("kind=tab")
+            cls.contains("image") -> flags.add("kind=image")
+            cls.contains("text") -> flags.add("kind=text")
+            cls.contains("list") || cls.contains("recycler") -> flags.add("kind=list")
+            cls.isNotBlank() -> flags.add("kind=view")
+        }
+
+        try {
+            val actions = node.actionList.orEmpty().map { it.id }.toSet()
+            if (actions.contains(AccessibilityNodeInfo.ACTION_CLICK)) flags.add("act=click")
+            if (actions.contains(AccessibilityNodeInfo.ACTION_LONG_CLICK)) flags.add("act=long")
+            if (actions.contains(AccessibilityNodeInfo.ACTION_SET_TEXT)) flags.add("act=settext")
+            if (actions.contains(AccessibilityNodeInfo.ACTION_COPY)) flags.add("act=copy")
+            if (actions.contains(AccessibilityNodeInfo.ACTION_PASTE)) flags.add("act=paste")
+            if (actions.contains(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) ||
+                actions.contains(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
+            ) flags.add("act=scroll")
+        } catch (_: Throwable) {}
+
+        val b = Rect()
+        if (safeBounds(node, b) && b.width() > 0 && b.height() > 0) {
+            val ratio = b.width().toFloat() / b.height().toFloat().coerceAtLeast(1f)
+            val screenArea = (
+                resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f) *
+                    resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
+                )
+            val area = (b.width().toFloat() * b.height().toFloat()) / screenArea
+
+            flags.add(
+                when {
+                    ratio >= 4.0f -> "shape=bar"
+                    ratio >= 2.0f -> "shape=wide"
+                    ratio <= 0.55f -> "shape=tall"
+                    ratio <= 1.35f -> "shape=compact"
+                    else -> "shape=rect"
+                }
+            )
+            flags.add(
+                when {
+                    area < 0.0025f -> "size=tiny"
+                    area < 0.010f -> "size=small"
+                    area < 0.050f -> "size=medium"
+                    else -> "size=large"
+                }
+            )
+        }
+
+        if (!safeComposeTestTag(node).isNullOrBlank()) flags.add("composeTag")
+
         return flags.joinToString("|")
     }
 
     private fun roleSimilarity(savedFlags: String?, currentFlags: String?): Float {
         if (savedFlags.isNullOrBlank() || currentFlags.isNullOrBlank()) return 0f
 
-        val saved = savedFlags.split("|").filter { it.isNotBlank() }
-        if (saved.isEmpty()) return 0f
+        val saved = savedFlags.split("|").map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        val current = currentFlags.split("|").map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        if (saved.isEmpty() || current.isEmpty()) return 0f
 
-        var hits = 0
-        for (f in saved) {
-            if (currentFlags.contains(f)) hits++
+        var hitWeight = 0f
+        var totalWeight = 0f
+        for (flag in saved) {
+            val weight = when {
+                flag.startsWith("kind=") -> 2.2f
+                flag.startsWith("shape=") -> 1.8f
+                flag.startsWith("size=") -> 1.2f
+                flag.startsWith("act=") -> 1.7f
+                flag == "click" || flag == "edit" || flag == "check" || flag == "scroll" -> 1.6f
+                flag == "enabled" || flag == "visible" || flag == "focus" -> 0.25f
+                else -> 0.8f
+            }
+            totalWeight += weight
+            if (current.contains(flag)) hitWeight += weight
         }
-
-        return hits.toFloat() / saved.size.toFloat()
+        return if (totalWeight <= 0f) 0f else (hitWeight / totalWeight).coerceIn(0f, 1f)
     }
 
     private fun extractTreePathDNA(node: AccessibilityNodeInfo?): String {
@@ -3841,17 +3966,27 @@ private fun trySmartTargetAfterShortSettle(
 
         val a = saved.split("/").filter { it.isNotBlank() }
         val b = current.split("/").filter { it.isNotBlank() }
-
         if (a.isEmpty() || b.isEmpty()) return 0f
 
         val minLen = minOf(a.size, b.size)
-        var leafMatches = 0
+        var exactLeafMatches = 0
+        var classLeafMatches = 0
 
         for (i in 1..minLen) {
-            if (a[a.size - i] == b[b.size - i]) leafMatches++
+            val aa = a[a.size - i]
+            val bb = b[b.size - i]
+            if (aa == bb) exactLeafMatches++
+
+            // Sibling/list reordering changes [index] but not the semantic ancestry.
+            val ac = aa.substringBefore("[")
+            val bc = bb.substringBefore("[")
+            if (ac.equals(bc, ignoreCase = true)) classLeafMatches++
         }
 
-        return leafMatches.toFloat() / maxOf(a.size, b.size).toFloat()
+        val denom = maxOf(a.size, b.size).toFloat().coerceAtLeast(1f)
+        val indexed = exactLeafMatches.toFloat() / denom
+        val classOnly = classLeafMatches.toFloat() / denom
+        return maxOf(indexed, classOnly * 0.88f).coerceIn(0f, 1f)
     }
 
 
@@ -4103,6 +4238,22 @@ addRoot(window.root)
                 var score = directScore
                 score += (smartIdentityConfidence(actionNode, gesture) * 95f).toInt()
                 score += aarishActionabilityBonus(actionNode)
+
+                val semanticWindow = aarishSemanticWindow(node, 1300)
+                val contextSim = maxOf(
+                    tokenSimilarity(gesture.targetContextText, semanticWindow),
+                    tokenSimilarity(gesture.targetSiblingText, collectSiblingText(actionNode, 420)) * 0.82f
+                )
+                val roleSim = roleSimilarity(gesture.targetRoleFlags, roleFlagsOf(actionNode))
+                val shapeSim = aarishShapeSimilarity(bounds, gesture)
+                if (contextSim >= 0.82f) score += 42
+                else if (contextSim >= 0.62f) score += 24
+                else if (contextSim >= 0.44f) score += 9
+                if (roleSim >= 0.82f) score += 30
+                else if (roleSim >= 0.60f) score += 16
+                if (shapeSim >= 0.86f) score += 28
+                else if (shapeSim >= 0.68f) score += 15
+                else if (shapeSim >= 0.48f) score += 6
 
                 val nodePkg = aarishNodePackage(actionNode).ifBlank { aarishNodePackage(node) }
                 if (savedPkg.isNotBlank() && nodePkg == savedPkg) score += 28
@@ -4773,6 +4924,13 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
                 else if (wDiff < 0.16f && hDiff < 0.16f) score += 7
             }
 
+            // Scale-independent shape fingerprint helps distinguish round/icon/tiny/wide
+            // controls even when layout position and absolute size change.
+            val shapeSim = aarishShapeSimilarity(bounds, gesture)
+            if (shapeSim >= 0.90f) score += 34
+            else if (shapeSim >= 0.76f) score += 22
+            else if (shapeSim >= 0.58f) score += 10
+
             if (gesture.targetLeft >= 0 &&
                 gesture.targetTop >= 0 &&
                 gesture.targetRight > gesture.targetLeft &&
@@ -4868,6 +5026,39 @@ private fun findBestSmartTarget(gesture: RecordedGesture): SmartMatch? {
         return intersection.toFloat() / smaller.toFloat()
     }
 
+
+    private fun aarishShapeSimilarity(bounds: Rect, gesture: RecordedGesture): Float {
+        if (bounds.width() <= 0 || bounds.height() <= 0 ||
+            gesture.targetWPercent <= 0f || gesture.targetHPercent <= 0f
+        ) return 0f
+
+        val recordedScreenW = gesture.recordedScreenW.toFloat().coerceAtLeast(1f)
+        val recordedScreenH = gesture.recordedScreenH.toFloat().coerceAtLeast(1f)
+        val savedAspect = (
+            (gesture.targetWPercent / gesture.targetHPercent.coerceAtLeast(0.0001f)) *
+                (recordedScreenW / recordedScreenH)
+            ).coerceIn(0.05f, 30f)
+        val currentAspect = (
+            bounds.width().toFloat() / bounds.height().toFloat().coerceAtLeast(1f)
+            ).coerceIn(0.05f, 30f)
+
+        val logGap = kotlin.math.abs(
+            kotlin.math.ln(savedAspect.toDouble()) - kotlin.math.ln(currentAspect.toDouble())
+        ).toFloat()
+        val aspectScore = (1f - logGap / 1.35f).coerceIn(0f, 1f)
+
+        val screenW = resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
+        val screenH = resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
+        val savedArea = (gesture.targetWPercent * gesture.targetHPercent).coerceAtLeast(0.00001f)
+        val currentArea = (
+            (bounds.width() / screenW) * (bounds.height() / screenH)
+            ).coerceAtLeast(0.00001f)
+        val areaScore = (
+            minOf(savedArea, currentArea) / maxOf(savedArea, currentArea)
+            ).coerceIn(0f, 1f)
+
+        return (aspectScore * 0.72f + areaScore * 0.28f).coerceIn(0f, 1f)
+    }
 
     private fun projectedTapDistance(bounds: Rect, gesture: RecordedGesture): Float {
         if (!hasSavedPercentAnchor(gesture) || bounds.width() <= 0 || bounds.height() <= 0) {
@@ -5686,6 +5877,10 @@ private fun captureTargetSnapshotInternal(
 
     val clickOwn = ownLabelOf(clickNode)
     val touchOwn = ownLabelOf(touchedNode)
+    val composeTags = listOfNotNull(
+        safeComposeTestTag(touchedNode),
+        safeComposeTestTag(clickNode)
+    ).distinct().joinToString(" | ")
     val clickContext = collectNodeTextLimited(clickNode, 84, 860)
     val touchContext = collectNodeTextLimited(touchedNode, 52, 560)
     val siblingContext = listOf(
@@ -5729,7 +5924,7 @@ private fun captureTargetSnapshotInternal(
         targetClass = firstClean(safeClass(clickNode), safeClass(touchedNode)),
         targetPackage = firstClean(aarishNodePackage(clickNode), aarishNodePackage(touchedNode)),
 
-        targetContextText = listOf(clickOwn, touchOwn, clickContext, touchContext, parentContext, grandParentContext)
+        targetContextText = listOf(composeTags, clickOwn, touchOwn, clickContext, touchContext, parentContext, grandParentContext)
             .filter { it.isNotBlank() }
             .joinToString(" | ")
             .take(1100),
