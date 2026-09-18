@@ -1527,6 +1527,152 @@ private fun aarishAiWaitForNextRecordedTarget(
         return bits.toString()
     }
 
+
+    // AARISH_ICON_SKETCH_EDGE_HASH_V1
+    // Captures WHERE edges exist, not whether they are dark or light. This makes an
+    // outline icon resilient to dark/light theme inversion and modest color changes.
+    private fun aarishVisualEdgeHash(
+        bitmap: android.graphics.Bitmap,
+        screenBounds: Rect,
+        screenW: Float,
+        screenH: Float
+    ): String? {
+        if (screenBounds.width() < 8 || screenBounds.height() < 8) return null
+        if (screenW <= 1f || screenH <= 1f || bitmap.width <= 1 || bitmap.height <= 1) return null
+
+        val left = (screenBounds.left / screenW * bitmap.width).toInt().coerceIn(0, bitmap.width - 1)
+        val top = (screenBounds.top / screenH * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
+        val right = (screenBounds.right / screenW * bitmap.width).toInt().coerceIn(left + 1, bitmap.width)
+        val bottom = (screenBounds.bottom / screenH * bitmap.height).toInt().coerceIn(top + 1, bitmap.height)
+        val w = right - left
+        val h = bottom - top
+        if (w < 6 || h < 6) return null
+
+        val lum = Array(10) { IntArray(10) }
+        for (yy in 0 until 10) {
+            val fy = (yy + 0.5f) / 10f
+            val py = (top + fy * h).toInt().coerceIn(top, bottom - 1)
+            for (xx in 0 until 10) {
+                val fx = (xx + 0.5f) / 10f
+                val px = (left + fx * w).toInt().coerceIn(left, right - 1)
+                val color = try { bitmap.getPixel(px, py) } catch (_: Throwable) { return null }
+                lum[yy][xx] = (
+                    android.graphics.Color.red(color) * 30 +
+                        android.graphics.Color.green(color) * 59 +
+                        android.graphics.Color.blue(color) * 11
+                    ) / 100
+            }
+        }
+
+        val mags = IntArray(64)
+        var at = 0
+        var maxMag = 0
+        for (yy in 1..8) {
+            for (xx in 1..8) {
+                val gx = kotlin.math.abs(lum[yy][xx + 1] - lum[yy][xx - 1])
+                val gy = kotlin.math.abs(lum[yy + 1][xx] - lum[yy - 1][xx])
+                val mag = gx + gy
+                mags[at++] = mag
+                if (mag > maxMag) maxMag = mag
+            }
+        }
+        if (maxMag < 18) return null
+
+        val sorted = mags.copyOf()
+        sorted.sort()
+        val threshold = kotlin.math.max(12, sorted[sorted.size / 2] + 4)
+
+        val bits = StringBuilder(64)
+        for (mag in mags) bits.append(if (mag >= threshold) '1' else '0')
+        if (bits.count { it == '1' } < 4) return null
+        return bits.toString()
+    }
+
+    private fun aarishVisualPolarityInvariantSimilarity(a: String?, b: String?): Float {
+        if (a == null || b == null || a.length != 64 || b.length != 64) return 0f
+        val normal = aarishVisualFingerprintSimilarity(a, b)
+        return kotlin.math.max(normal, 1f - normal).coerceIn(0f, 1f)
+    }
+
+    private data class AarishIconSketchReference(
+        val coreH: String?,
+        val coreV: String?,
+        val coreE: String,
+        val contextH: String?,
+        val contextV: String?,
+        val contextE: String?,
+        val coreWPercent: Float,
+        val coreHPercent: Float,
+        val contextWPercent: Float,
+        val contextHPercent: Float
+    )
+
+    private fun aarishLoadIconSketchReference(gesture: RecordedGesture): AarishIconSketchReference? {
+        val evidencePath = gesture.recordingEvidencePath?.trim().orEmpty()
+        if (evidencePath.isBlank()) return null
+
+        val clean = try { java.io.File(evidencePath + ".refimg") } catch (_: Throwable) { return null }
+        if (!clean.exists() || !clean.isFile || clean.length() !in 1L..(8L * 1024L * 1024L)) return null
+
+        val bitmap = try {
+            android.graphics.BitmapFactory.decodeFile(clean.absolutePath)
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+
+        return try {
+            val sw = bitmap.width.toFloat().coerceAtLeast(1f)
+            val sh = bitmap.height.toFloat().coerceAtLeast(1f)
+            val xPct = if (hasSavedPercentAnchor(gesture)) gesture.xPercent.coerceIn(0f, 1f) else return null
+            val yPct = if (hasSavedPercentAnchor(gesture)) gesture.yPercent.coerceIn(0f, 1f) else return null
+            val cx = xPct * sw
+            val cy = yPct * sh
+
+            val density = resources.displayMetrics.density.coerceAtLeast(1f)
+            val recordedW = gesture.recordedScreenW.takeIf { it > 0 }?.toFloat()
+                ?: resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
+            val recordedH = gesture.recordedScreenH.takeIf { it > 0 }?.toFloat()
+                ?: resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
+
+            val coreWPct = (44f * density / recordedW).coerceIn(0.035f, 0.18f)
+            val coreHPct = (44f * density / recordedH).coerceIn(0.020f, 0.12f)
+            val contextWPct = (92f * density / recordedW).coerceIn(coreWPct, 0.32f)
+            val contextHPct = (76f * density / recordedH).coerceIn(coreHPct, 0.20f)
+
+            fun patch(wPct: Float, hPct: Float): Rect? {
+                val w = (wPct * sw).coerceAtLeast(10f)
+                val h = (hPct * sh).coerceAtLeast(10f)
+                return Rect(
+                    (cx - w / 2f).toInt().coerceIn(0, bitmap.width - 1),
+                    (cy - h / 2f).toInt().coerceIn(0, bitmap.height - 1),
+                    (cx + w / 2f).toInt().coerceIn(1, bitmap.width),
+                    (cy + h / 2f).toInt().coerceIn(1, bitmap.height)
+                ).takeIf { it.width() >= 8 && it.height() >= 8 }
+            }
+
+            val core = patch(coreWPct, coreHPct) ?: return null
+            val context = patch(contextWPct, contextHPct)
+            val coreE = aarishVisualEdgeHash(bitmap, core, sw, sh) ?: return null
+
+            AarishIconSketchReference(
+                coreH = aarishVisualDHash(bitmap, core, sw, sh),
+                coreV = aarishVisualVHash(bitmap, core, sw, sh),
+                coreE = coreE,
+                contextH = context?.let { aarishVisualDHash(bitmap, it, sw, sh) },
+                contextV = context?.let { aarishVisualVHash(bitmap, it, sw, sh) },
+                contextE = context?.let { aarishVisualEdgeHash(bitmap, it, sw, sh) },
+                coreWPercent = coreWPct,
+                coreHPercent = coreHPct,
+                contextWPercent = contextWPct,
+                contextHPercent = contextHPct
+            )
+        } catch (_: Throwable) {
+            null
+        } finally {
+            try { bitmap.recycle() } catch (_: Throwable) {}
+        }
+    }
+
     private data class AarishVisualFingerprintBundle(
         val boundsH: String? = null,
         val boundsV: String? = null,
