@@ -237,10 +237,15 @@ class AiSidecarController(private val service: AutoActionService) {
             val provider = selectProvider(state.packageName)
             if (provider == null) {
                 val targetAi = Provider.values().firstOrNull { it.packageName == state.packageName }
-                finishMission(
-                    false,
-                    if (targetAi != null) "Target app ${targetAi.name} hai; agent brain ke liye doosra AI install/select karo" else "ChatGPT/Gemini installed nahi mila"
-                )
+                val reason = when {
+                    targetAi != null ->
+                        "Target app ${targetAi.name} hai; agent brain ke liye doosra AI install/select karo"
+                    providerPreference != "AUTO" ->
+                        "Selected AI provider $providerPreference available nahi hai"
+                    else ->
+                        "ChatGPT/Gemini installed nahi mila"
+                }
+                finishMission(false, reason)
                 return@captureTargetScreen
             }
             // AARISH_AI_REQUEST_ID_V4: collision-resistant correlation id for pseudo-API turns.
@@ -1574,11 +1579,14 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun collectActionable(root: AccessibilityNodeInfo, pkg: String): List<UiElement> {
-        val out = ArrayList<UiElement>()
+        // AARISH_AI_ACTIONABLE_PRIORITY_V4
+        // Traverse the whole bounded tree first. Static labels must never consume the
+        // candidate budget before later buttons/inputs are even seen.
+        val candidates = ArrayList<UiElement>()
         val stack = java.util.ArrayDeque<AccessibilityNodeInfo>()
         stack.add(root)
         var seen = 0
-        while (stack.isNotEmpty() && seen < 5000 && out.size < 140) {
+        while (stack.isNotEmpty() && seen < 5000) {
             val node = stack.removeLast(); seen++
             val visible = try { node.isVisibleToUser } catch (_: Throwable) { false }
             val enabled = try { node.isEnabled } catch (_: Throwable) { false }
@@ -1589,13 +1597,41 @@ class AiSidecarController(private val service: AutoActionService) {
             val id = try { node.viewIdResourceName.orEmpty() } catch (_: Throwable) { "" }
             val cls = node.className?.toString().orEmpty()
             val b = Rect(); try { node.getBoundsInScreen(b) } catch (_: Throwable) {}
-            if (visible && enabled && b.width() > 0 && b.height() > 0 && (clickable || editable || text.isNotBlank() || desc.isNotBlank())) {
-                out.add(UiElement("E${out.size + 1}", pkg, id, text, desc, cls, Rect(b), clickable, editable, enabled, buildUiContextHint(node)))
+            if (visible && enabled && b.width() > 0 && b.height() > 0 &&
+                (clickable || editable || text.isNotBlank() || desc.isNotBlank())
+            ) {
+                candidates.add(
+                    UiElement(
+                        "",
+                        pkg,
+                        id,
+                        text,
+                        desc,
+                        cls,
+                        Rect(b),
+                        clickable,
+                        editable,
+                        enabled,
+                        buildUiContextHint(node)
+                    )
+                )
             }
             val count = try { node.childCount } catch (_: Throwable) { 0 }
             for (i in 0 until count) try { node.getChild(i)?.let(stack::add) } catch (_: Throwable) {}
         }
-        return out
+
+        val ordered = candidates.sortedWith(
+            compareByDescending<UiElement> { it.editable }
+                .thenByDescending { it.clickable }
+                .thenByDescending { it.viewId.isNotBlank() }
+                .thenBy { it.bounds.top }
+                .thenBy { it.bounds.left }
+                .thenBy { it.bounds.width() * it.bounds.height() }
+        )
+
+        return ordered.take(140).mapIndexed { index, element ->
+            element.copy(key = "E${index + 1}")
+        }
     }
 
     private fun buildFingerprint(pkg: String, elements: List<UiElement>): String {
