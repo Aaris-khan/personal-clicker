@@ -3916,6 +3916,34 @@ private fun trySmartTargetAfterShortSettle(
         return try { node.tooltipText?.toString()?.trim()?.takeIf { it.isNotBlank() } } catch (_: Throwable) { null }
     }
 
+    private fun safeStateDescription(node: AccessibilityNodeInfo?): String? {
+        if (node == null || android.os.Build.VERSION.SDK_INT < 30) return null
+        return try { node.stateDescription?.toString()?.trim()?.takeIf { it.isNotBlank() } } catch (_: Throwable) { null }
+    }
+
+    private fun safePaneTitle(node: AccessibilityNodeInfo?): String? {
+        if (node == null || android.os.Build.VERSION.SDK_INT < 28) return null
+        return try { node.paneTitle?.toString()?.trim()?.takeIf { it.isNotBlank() } } catch (_: Throwable) { null }
+    }
+
+    private fun safeLabeledByText(node: AccessibilityNodeInfo?): String? {
+        if (node == null || android.os.Build.VERSION.SDK_INT < 17) return null
+        return try {
+            val labelNode = node.labeledBy ?: return null
+            listOf(
+                safeText(labelNode),
+                safeDesc(labelNode),
+                safeHintText(labelNode),
+                safeId(labelNode)?.substringAfterLast("/")
+            )
+                .filterNotNull()
+                .map { it.replace(Regex("\\s+"), " ").trim() }
+                .firstOrNull { it.isNotBlank() }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private fun safeClass(node: AccessibilityNodeInfo?): String? =
         try { node?.className?.toString() } catch (_: Exception) { null }
 
@@ -4110,10 +4138,12 @@ private fun trySmartTargetAfterShortSettle(
         try { if (node.isEditable) flags.add("edit") } catch (_: Exception) {}
         try { if (node.isScrollable) flags.add("scroll") } catch (_: Exception) {}
         try { if (node.isCheckable) flags.add("check") } catch (_: Exception) {}
-        try { if (node.isChecked) flags.add("checked") } catch (_: Exception) {}
+        try { if (node.isChecked) flags.add("checked") else if (node.isCheckable) flags.add("unchecked") } catch (_: Exception) {}
+        try { if (node.isSelected) flags.add("selected") } catch (_: Exception) {}
         try { if (node.isEnabled) flags.add("enabled") } catch (_: Exception) {}
         try { if (node.isVisibleToUser) flags.add("visible") } catch (_: Exception) {}
         try { if (node.isFocusable) flags.add("focus") } catch (_: Exception) {}
+        try { if (node.isPassword) flags.add("password") } catch (_: Exception) {}
 
         val cls = safeClass(node).orEmpty().substringAfterLast('.').lowercase()
         when {
@@ -4141,6 +4171,21 @@ private fun trySmartTargetAfterShortSettle(
                 actions.contains(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
             ) flags.add("act=scroll")
         } catch (_: Throwable) {}
+
+        try { if (node.collectionItemInfo != null) flags.add("collectionItem") } catch (_: Throwable) {}
+        try { if (node.collectionInfo != null) flags.add("collection") } catch (_: Throwable) {}
+        try { if (node.rangeInfo != null) flags.add("range") } catch (_: Throwable) {}
+
+        fun semanticToken(prefix: String, raw: String?) {
+            val norm = normalizeUltraText(raw)
+                .replace(' ', '_')
+                .take(42)
+            if (norm.length >= 2) flags.add("$prefix=$norm")
+        }
+
+        semanticToken("state", safeStateDescription(node))
+        semanticToken("pane", safePaneTitle(node))
+        semanticToken("label", safeLabeledByText(node))
 
         val b = Rect()
         if (safeBounds(node, b) && b.width() > 0 && b.height() > 0) {
@@ -4187,17 +4232,47 @@ private fun trySmartTargetAfterShortSettle(
         for (flag in saved) {
             val weight = when {
                 flag.startsWith("kind=") -> 2.2f
+                flag.startsWith("pane=") || flag.startsWith("label=") -> 2.0f
                 flag.startsWith("shape=") -> 1.8f
-                flag.startsWith("size=") -> 1.2f
                 flag.startsWith("act=") -> 1.7f
                 flag == "click" || flag == "edit" || flag == "check" || flag == "scroll" -> 1.6f
-                flag == "enabled" || flag == "visible" || flag == "focus" -> 0.25f
-                else -> 0.8f
+                flag == "collectionItem" || flag == "collection" || flag == "range" -> 1.25f
+                flag.startsWith("size=") -> 1.15f
+                // State can legitimately change while the logical target remains the same,
+                // so it is supporting evidence only, never a hard requirement.
+                flag.startsWith("state=") || flag == "checked" || flag == "unchecked" || flag == "selected" -> 0.55f
+                flag == "enabled" || flag == "visible" || flag == "focus" -> 0.20f
+                else -> 0.75f
             }
             totalWeight += weight
             if (current.contains(flag)) hitWeight += weight
         }
         return if (totalWeight <= 0f) 0f else (hitWeight / totalWeight).coerceIn(0f, 1f)
+    }
+
+    private fun aarishDnaSemanticHint(node: AccessibilityNodeInfo?): String {
+        if (node == null) return ""
+
+        val candidates = listOf(
+            safeComposeTestTag(node),
+            safeId(node)?.substringAfterLast("/"),
+            safePaneTitle(node),
+            safeLabeledByText(node),
+            safeDesc(node),
+            safeText(node)
+        )
+
+        for (raw in candidates) {
+            val norm = normalizeUltraText(raw)
+                .replace(' ', '_')
+                .take(30)
+            if (norm.length >= 2 &&
+                norm !in setOf("view", "text", "button", "image", "layout", "item")
+            ) {
+                return norm
+            }
+        }
+        return ""
     }
 
     private fun extractTreePathDNA(node: AccessibilityNodeInfo?): String {
@@ -4213,7 +4288,6 @@ private fun trySmartTargetAfterShortSettle(
             if (parent === current) break
 
             var index = -1
-
             if (parent != null) {
                 val currentBounds = Rect()
                 safeBounds(current, currentBounds)
@@ -4226,7 +4300,6 @@ private fun trySmartTargetAfterShortSettle(
 
                     val sameClass = safeClass(child) == safeClass(current)
                     val sameBounds = childBounds == currentBounds
-
                     if (sameClass && sameBounds) {
                         index = i
                         break
@@ -4234,7 +4307,11 @@ private fun trySmartTargetAfterShortSettle(
                 }
             }
 
-            parts.add("$cls[$index]")
+            val hint = aarishDnaSemanticHint(current)
+            parts.add(
+                if (hint.isBlank()) "$cls[$index]"
+                else "$cls[$index]{$hint}"
+            )
             current = parent
             depth++
         }
@@ -4250,25 +4327,44 @@ private fun trySmartTargetAfterShortSettle(
         val b = current.split("/").filter { it.isNotBlank() }
         if (a.isEmpty() || b.isEmpty()) return 0f
 
+        fun cls(part: String): String = part.substringBefore("[").substringBefore("{")
+        fun hint(part: String): String =
+            part.substringAfter("{", "").substringBefore("}", "").takeIf { it.isNotBlank() }.orEmpty()
+
         val minLen = minOf(a.size, b.size)
         var exactLeafMatches = 0
         var classLeafMatches = 0
+        var hintComparable = 0
+        var hintScore = 0f
 
         for (i in 1..minLen) {
             val aa = a[a.size - i]
             val bb = b[b.size - i]
             if (aa == bb) exactLeafMatches++
 
-            // Sibling/list reordering changes [index] but not the semantic ancestry.
-            val ac = aa.substringBefore("[")
-            val bc = bb.substringBefore("[")
-            if (ac.equals(bc, ignoreCase = true)) classLeafMatches++
+            if (cls(aa).equals(cls(bb), ignoreCase = true)) classLeafMatches++
+
+            val ah = hint(aa)
+            val bh = hint(bb)
+            if (ah.isNotBlank() && bh.isNotBlank()) {
+                hintComparable++
+                hintScore += tokenSimilarity(ah, bh)
+            }
         }
 
         val denom = maxOf(a.size, b.size).toFloat().coerceAtLeast(1f)
         val indexed = exactLeafMatches.toFloat() / denom
         val classOnly = classLeafMatches.toFloat() / denom
-        return maxOf(indexed, classOnly * 0.88f).coerceIn(0f, 1f)
+        val hintAvg = if (hintComparable > 0) hintScore / hintComparable.toFloat() else 0f
+
+        val structural = classOnly * 0.88f
+        val semanticAnchored = if (hintComparable > 0) {
+            (classOnly * 0.72f + hintAvg * 0.28f).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+
+        return maxOf(indexed, structural, semanticAnchored).coerceIn(0f, 1f)
     }
 
 
