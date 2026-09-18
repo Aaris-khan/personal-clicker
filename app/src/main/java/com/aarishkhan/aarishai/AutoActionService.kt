@@ -1191,13 +1191,9 @@ private fun aarishAiWaitForNextRecordedTarget(
     val startedAt = android.os.SystemClock.elapsedRealtime()
     val maxWaitMs = 30L * 60L * 1000L
     val pollMs = 1200L
-    val restartAsMaster = isMasterPlaybackInternal
-    val restartOwner = if (restartAsMaster && masterWorkflowOwner.isNotBlank()) {
-        masterWorkflowOwner
-    } else {
-        workflowOwner.ifBlank { initialConfigName }.ifBlank { GestureStore.getActiveConfigName(this) }
-    }
-
+    // AARISH_30M_WAIT_CONTINUE_V1
+    // Timeout belongs to this wait gate only. Replaying the complete workflow from
+    // the beginning can loop forever and repeat already-completed actions.
     var finished = false
     var currentTask: Runnable? = null
     var lastToastMs = 0L
@@ -1220,30 +1216,18 @@ private fun aarishAiWaitForNextRecordedTarget(
         if (isCurrentCallbackRun(runId)) finishActiveGesture(token)
     }
 
-    fun restartAfterTimeout() {
+    fun continueAfterTimeout() {
         if (finished) return
-        finished = true
-        clearTask()
         if (!isCurrentCallbackRun(runId)) {
-            finishActiveGesture(token)
+            finishWait()
             return
         }
 
-        showTinyToast("AI WAIT 30min → restart")
-        finishActiveGesture(token)
-
-        val owner = restartOwner.trim()
-        val masterMode = restartAsMaster
-        stopPlaybackInternal(showToast = false)
-
-        handler.postDelayed({
-            if (instance !== this@AutoActionService || owner.isBlank()) return@postDelayed
-            if (masterMode) playRecordedGestures(masterOwner = owner)
-            else {
-                GestureStore.setActiveConfigName(this@AutoActionService, owner)
-                playRecordedGestures()
-            }
-        }, 700L)
+        // Let the next recorded action execute its normal semantic + local visual
+        // recovery pipeline. If that still fails, its guarded same-app XY fallback
+        // is the final deterministic escape hatch.
+        showTinyToast("Smart wait 30min → fallback path")
+        finishWait()
     }
 
     fun norm(v: String?): String = v.orEmpty()
@@ -1341,7 +1325,7 @@ private fun aarishAiWaitForNextRecordedTarget(
             // Normal replay never asks any AI/VLM here. It only polls the live
             // Accessibility/selector tree until the recorded target becomes available.
             if (elapsed >= maxWaitMs) {
-                restartAfterTimeout()
+                continueAfterTimeout()
                 return
             }
 
@@ -4938,10 +4922,61 @@ private fun trySmartTargetAfterShortSettle(
 
                 val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
                 if (elapsed >= maxWait) {
+                    // AARISH_SAME_APP_XY_LAST_RESORT_V1
+                    // Semantic, OCR and local visual matching already had priority. For a
+                    // simple recorded tap, use XY only when we can prove we are still in
+                    // the same app and orientation. Never coordinate-fallback across apps.
+                    val fallbackPoints = recordedGesture.points
+                        .filter { !it.x.isNaN() && !it.x.isInfinite() && !it.y.isNaN() && !it.y.isInfinite() }
+                        .sortedBy { it.t.coerceAtLeast(0L) }
+                    val fallbackDuration = fallbackPoints.maxOfOrNull { it.t.coerceAtLeast(0L) } ?: 0L
+                    val fallbackMovement = fallbackPoints.isNotEmpty() && hasRealMovement(fallbackPoints)
+                    val savedPkg = recordedGesture.targetPackage?.trim().orEmpty()
+                    val livePkg = try { aarishBestForegroundPackageForOcr()?.trim().orEmpty() } catch (_: Throwable) { "" }
+                    val samePackage = savedPkg.isNotBlank() &&
+                        livePkg.isNotBlank() &&
+                        savedPkg.equals(livePkg, ignoreCase = true)
+
+                    val screenW = resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
+                    val screenH = resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
+                    val orientationSafe =
+                        recordedGesture.recordedScreenW <= 0 ||
+                            recordedGesture.recordedScreenH <= 0 ||
+                            ((recordedGesture.recordedScreenW > recordedGesture.recordedScreenH) == (screenW > screenH))
+
+                    if (!fallbackMovement &&
+                        fallbackDuration < 450L &&
+                        hasSavedPercentAnchor(recordedGesture) &&
+                        samePackage &&
+                        orientationSafe
+                    ) {
+                        finished = true
+                        currentTask?.let {
+                            try { scheduledTasks.remove(it) } catch (_: Throwable) {}
+                            try { handler.removeCallbacks(it) } catch (_: Throwable) {}
+                        }
+
+                        val x = (recordedGesture.xPercent.coerceIn(0f, 1f) * screenW)
+                            .coerceIn(2f, (screenW - 2f).coerceAtLeast(2f))
+                        val y = (recordedGesture.yPercent.coerceIn(0f, 1f) * screenH)
+                            .coerceIn(2f, (screenH - 2f).coerceAtLeast(2f))
+
+                        showTinyToast("Target unresolved → same-app XY fallback")
+                        aarishDispatchTapWithToken(
+                            x = x,
+                            y = y,
+                            runId = runId,
+                            token = token,
+                            label = "Guarded XY fallback",
+                            tapDurationMs = 105L,
+                            postGapMs = 90L
+                        )
+                        return
+                    }
+
                     // AARISH_NORMAL_REPLAY_NO_EXTERNAL_AI_V1
-                    // A missing recorded target is a deterministic replay failure.
-                    // Never open ChatGPT/Gemini or any model from this path.
-                    showTinyToast("Target nahi mila — deterministic playback stopped")
+                    // Cross-app / orientation-unsafe / non-tap misses remain fail-closed.
+                    showTinyToast("Target nahi mila — safe fallback unavailable")
                     finishOnce()
                     if (isSamePlaybackRun(runId)) stopPlaybackInternal(showToast = false)
                     return

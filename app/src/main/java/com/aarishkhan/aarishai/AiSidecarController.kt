@@ -119,6 +119,14 @@ class AiSidecarController(private val service: AutoActionService) {
     private var failureCount = 0
     private var lastOutcome = "Mission started"
     private var lastTargetPackage = ""
+
+    // AARISH_AUTONOMY_PROGRESS_WATCHDOG_V1
+    // A verified action is not automatically useful progress. Track the target state
+    // across planning turns so repeated WAIT/no-op loops trigger failover instead of
+    // burning the full step budget on an unchanged screen.
+    private var missionStartedAt = 0L
+    private var lastObservedTargetFingerprint = ""
+    private var stagnantTargetTurns = 0
     private var rescueCallback: ((Boolean) -> Unit)? = null
     private var rescueMode = false
     private var rescueExpectedAction = ""
@@ -194,6 +202,7 @@ class AiSidecarController(private val service: AutoActionService) {
         lastOutcome = "Mission started"
         lastTargetPackage = "" // AARISH_AI_STATE_OWNERSHIP_V1_START
         resetProviderHealth()
+        resetMissionProgressWatchdog()
         actionHistory.clear()
         rememberHistory("GOAL: $clean")
         val run = generation.incrementAndGet()
@@ -251,6 +260,7 @@ class AiSidecarController(private val service: AutoActionService) {
             lastTargetPackage = it // AARISH_AI_STATE_OWNERSHIP_V1_RESCUE
         }
         resetProviderHealth()
+        resetMissionProgressWatchdog()
         actionHistory.clear()
         rememberHistory("RECORDED STEP FAILED: ${target.ifBlank { "unknown target" }}")
         rescueMode = true
@@ -282,6 +292,14 @@ class AiSidecarController(private val service: AutoActionService) {
         if (!alive(run)) return
         val maxSteps = if (rescueMode) 6 else 40
         val maxFailures = if (rescueMode) 3 else 8
+        val runtimeLimitMs = if (rescueMode) 5L * 60L * 1000L else 30L * 60L * 1000L
+        if (missionStartedAt > 0L &&
+            SystemClock.elapsedRealtime() - missionStartedAt >= runtimeLimitMs
+        ) {
+            if (rescueMode) finishRescue(false)
+            else finishMission(false, "mission runtime limit reached without verified completion")
+            return
+        }
         if (missionStep >= maxSteps || failureCount >= maxFailures) {
             if (rescueMode) finishRescue(false) else finishMission(false, "retry/step limit")
             return
@@ -292,6 +310,35 @@ class AiSidecarController(private val service: AutoActionService) {
                 failTurn(run, "Target screen not readable")
                 return@captureTargetScreen
             }
+            // AARISH_AUTONOMY_PROGRESS_WATCHDOG_V1
+            val sameTargetState =
+                lastObservedTargetFingerprint.isNotBlank() &&
+                    state.fingerprint == lastObservedTargetFingerprint &&
+                    state.packageName == lastTargetPackage
+
+            if (sameTargetState) {
+                stagnantTargetTurns++
+            } else {
+                stagnantTargetTurns = 0
+            }
+            lastObservedTargetFingerprint = state.fingerprint
+
+            if (stagnantTargetTurns >= 3) {
+                val stalledProvider = lastProviderAttempt
+                if (stalledProvider != null) {
+                    markProviderFailure(stalledProvider, "target state unchanged across planning turns")
+                }
+                failureCount++
+                lastOutcome = "NO_PROGRESS: target screen stayed unchanged across repeated turns"
+                rememberHistory("NO-PROGRESS WATCHDOG: unchanged target state; provider failover/replan requested")
+                stagnantTargetTurns = 0
+                if (failureCount >= maxFailures) {
+                    if (rescueMode) finishRescue(false)
+                    else finishMission(false, "target state made no progress")
+                    return@captureTargetScreen
+                }
+            }
+
             lastTargetPackage = state.packageName
             val provider = selectProvider(state.packageName)
             if (provider == null) {
@@ -500,6 +547,12 @@ class AiSidecarController(private val service: AutoActionService) {
         lastProviderAttempt = null
         lastPlannerSignature = ""
         repeatedPlannerSignatureCount = 0
+    }
+
+    private fun resetMissionProgressWatchdog() {
+        missionStartedAt = SystemClock.elapsedRealtime()
+        lastObservedTargetFingerprint = ""
+        stagnantTargetTurns = 0
     }
 
     private fun providerInstalled(provider: Provider): Boolean = try {
@@ -1510,6 +1563,26 @@ class AiSidecarController(private val service: AutoActionService) {
         return actual == wanted || actual.contains(wanted.take(180))
     }
 
+    private fun missionAllowsPackageOnlyDone(): Boolean {
+        val goal = normalizeUiText(missionGoal)
+        if (goal.isBlank()) return false
+
+        val openIntent = listOf(
+            "open", "launch", "start", "switch to", "go to",
+            "kholo", "khol", "chalao", "खोल", "खोलो", "चलाओ"
+        ).any { goal.contains(it) }
+        if (!openIntent) return false
+
+        val beyondOpenIntent = listOf(
+            "send", "message", "type", "write", "reply", "search", "find",
+            "call", "share", "upload", "download", "select", "tap", "click",
+            "bhej", "bhejo", "likh", "dhund", "dhoond", "भेज", "लिख",
+            "ढूंढ", "खोज", "कॉल", "शेयर"
+        ).any { goal.contains(it) }
+
+        return !beyondOpenIntent
+    }
+
     private fun verifyDoneEvidence(
         run: Int,
         planned: ScreenState,
@@ -1538,6 +1611,24 @@ class AiSidecarController(private val service: AutoActionService) {
             callback(false, "DONE needs concrete visible/package evidence")
             return
         }
+
+        if (expected.startsWith("PACKAGE=", ignoreCase = true) &&
+            !missionAllowsPackageOnlyDone()
+        ) {
+            callback(false, "package-only proof is too weak for a multi-step goal")
+            return
+        }
+
+        val normalizedProof = normalizeUiText(expected)
+        if (normalizedProof in setOf(
+                "done", "success", "successful", "complete", "completed",
+                "task complete", "finished"
+            )
+        ) {
+            callback(false, "generic completion words are not observable proof")
+            return
+        }
+
         if (expectedMatchesState(live, expected)) {
             callback(true, "evidence matched: ${expected.take(120)}")
         } else {
@@ -2439,7 +2530,20 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun findBestLiveMatch(saved: UiElement): AccessibilityNodeInfo? {
-        val root = findRootForPackage(saved.packageName) ?: findBestTargetRoot() ?: return null
+        // AARISH_LIVE_MATCH_PACKAGE_GUARD_V1
+        // A stale E-key must never drift into another app just because a similar label
+        // exists there. If the planner captured a package, fail closed until that exact
+        // package has a live root and let the mission re-plan/recover.
+        val wantedPackage = saved.packageName.trim()
+        val root = if (wantedPackage.isNotBlank()) {
+            findRootForPackage(wantedPackage) ?: return null
+        } else {
+            findBestTargetRoot() ?: return null
+        }
+        if (wantedPackage.isNotBlank()) {
+            val livePackage = try { root.packageName?.toString().orEmpty() } catch (_: Throwable) { "" }
+            if (!livePackage.equals(wantedPackage, ignoreCase = true)) return null
+        }
         val screenW = service.resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
         val screenH = service.resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
         val savedIdTail = viewIdTail(saved.viewId)
@@ -2594,22 +2698,46 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun resolveLaunchPackageByLabel(labelRaw: String): String? {
-        val wanted = labelRaw.trim().lowercase(Locale.US)
+        val wanted = normalizeUiText(labelRaw)
         if (wanted.isBlank()) return null
         return try {
+            data class AppHit(val packageName: String, val score: Int)
+
             val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
             val matches = service.packageManager.queryIntentActivities(q, 0)
-            val info = matches.maxByOrNull { r ->
-                val label = r.loadLabel(service.packageManager)?.toString().orEmpty().lowercase(Locale.US)
-                when {
+            val byPackage = linkedMapOf<String, Int>()
+
+            for (r in matches) {
+                val packageName = r.activityInfo?.packageName.orEmpty()
+                if (packageName.isBlank()) continue
+                val label = normalizeUiText(
+                    r.loadLabel(service.packageManager)?.toString().orEmpty()
+                )
+                if (label.isBlank()) continue
+
+                val score = when {
                     label == wanted -> 1000
-                    label.contains(wanted) || wanted.contains(label) -> 600
+                    label.startsWith("$wanted ") || wanted.startsWith("$label ") -> 780
+                    label.contains(wanted) || wanted.contains(label) -> 620
                     else -> 0
                 }
-            } ?: return null
-            val appLabel = info.loadLabel(service.packageManager)?.toString().orEmpty().lowercase(Locale.US)
-            if (!(appLabel == wanted || appLabel.contains(wanted) || wanted.contains(appLabel))) return null
-            info.activityInfo.packageName
+                if (score > (byPackage[packageName] ?: 0)) byPackage[packageName] = score
+            }
+
+            val ranked = byPackage
+                .map { AppHit(it.key, it.value) }
+                .filter { it.score > 0 }
+                .sortedByDescending { it.score }
+
+            val winner = ranked.firstOrNull() ?: return null
+            if (winner.score < 620) return null
+            val runner = ranked.drop(1).firstOrNull()
+            if (winner.score < 1000 && runner != null && winner.score - runner.score < 120) {
+                // Ambiguous partial app names are safer to re-plan than to launch the
+                // wrong application and continue acting there.
+                return null
+            }
+            winner.packageName
         } catch (_: Throwable) {
             null
         }
