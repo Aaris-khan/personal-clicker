@@ -3759,7 +3759,12 @@ private fun aarishAiWaitForNextRecordedTarget(
     ): Boolean {
         if (!isSamePlaybackRun(runId)) return false
         if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return false
-        val fp = aarishReadVisualFingerprintBundle(gesture) ?: return false
+
+        // AARISH_RESCUE_WITHOUT_VFP_V1
+        // A flat/icon-only Canvas target may not produce a useful dHash sidecar.
+        // Do not abort the whole rescue chain: OCR and reference/current local vision
+        // can still recover the target from the saved evidence screenshot.
+        val fp = aarishReadVisualFingerprintBundle(gesture)
 
         val screenshotExecutor = java.util.concurrent.Executor { runnable -> handler.post(runnable) }
         return try {
@@ -3886,16 +3891,49 @@ private fun aarishAiWaitForNextRecordedTarget(
                             var second: AccessibilityVisualCandidate? = null
                             val seen = hashSetOf<String>()
 
+                            fun sameAccessibilityRegion(
+                                a: AccessibilityVisualCandidate,
+                                b: AccessibilityVisualCandidate
+                            ): Boolean {
+                                val minW = kotlin.math.min(a.bounds.width(), b.bounds.width()).toFloat().coerceAtLeast(1f)
+                                val minH = kotlin.math.min(a.bounds.height(), b.bounds.height()).toFloat().coerceAtLeast(1f)
+                                return kotlin.math.abs(a.bounds.exactCenterX() - b.bounds.exactCenterX()) <= minW * 0.30f &&
+                                    kotlin.math.abs(a.bounds.exactCenterY() - b.bounds.exactCenterY()) <= minH * 0.30f
+                            }
+
+                            fun betterAccessibility(
+                                a: AccessibilityVisualCandidate,
+                                b: AccessibilityVisualCandidate
+                            ): Boolean {
+                                return a.combined > b.combined + 0.0001f ||
+                                    (
+                                        kotlin.math.abs(a.combined - b.combined) <= 0.0001f &&
+                                            a.visual > b.visual
+                                        )
+                            }
+
                             fun remember(candidate: AccessibilityVisualCandidate) {
-                                if (best == null || candidate.combined > best!!.combined) {
-                                    second = best
+                                val currentBest = best
+                                if (currentBest != null && sameAccessibilityRegion(candidate, currentBest)) {
+                                    if (betterAccessibility(candidate, currentBest)) best = candidate
+                                    return
+                                }
+
+                                val currentSecond = second
+                                if (currentSecond != null && sameAccessibilityRegion(candidate, currentSecond)) {
+                                    if (betterAccessibility(candidate, currentSecond)) second = candidate
+                                    return
+                                }
+
+                                if (currentBest == null || betterAccessibility(candidate, currentBest)) {
+                                    second = currentBest
                                     best = candidate
-                                } else if (second == null || candidate.combined > second!!.combined) {
+                                } else if (currentSecond == null || betterAccessibility(candidate, currentSecond)) {
                                     second = candidate
                                 }
                             }
 
-                            if (fp.boundsH != null || fp.boundsV != null) {
+                            if (fp?.boundsH != null || fp?.boundsV != null) {
                                 for (root in roots) {
                                     val stack = java.util.ArrayDeque<AccessibilityNodeInfo>()
                                     stack.add(root)
@@ -3920,19 +3958,19 @@ private fun aarishAiWaitForNextRecordedTarget(
                                         val key = aarishBoundsKey(bounds) + ":" + safeClass(node).orEmpty()
                                         if (!seen.add(key)) continue
 
-                                        val liveH = if (fp.boundsH != null) {
+                                        val liveH = if (fp?.boundsH != null) {
                                             aarishVisualDHash(bitmap, bounds, screenW, screenH)
                                         } else {
                                             null
                                         }
-                                        val liveV = if (fp.boundsV != null) {
+                                        val liveV = if (fp?.boundsV != null) {
                                             aarishVisualVHash(bitmap, bounds, screenW, screenH)
                                         } else {
                                             null
                                         }
                                         val visual = aarishVisualPairSimilarity(
-                                            fp.boundsH,
-                                            fp.boundsV,
+                                            fp?.boundsH,
+                                            fp?.boundsV,
                                             liveH,
                                             liveV
                                         )
@@ -3976,7 +4014,8 @@ private fun aarishAiWaitForNextRecordedTarget(
                                 return
                             }
 
-                            if (fp.tapH == null && fp.tapV == null) {
+                            val denseFingerprint = fp
+                            if (denseFingerprint?.tapH == null && denseFingerprint?.tapV == null) {
                                 finishWithUniversalOcrRescue()
                                 return
                             }
@@ -3986,7 +4025,7 @@ private fun aarishAiWaitForNextRecordedTarget(
                                     aarishDenseScreenshotVisualSearch(
                                         bitmap,
                                         gesture,
-                                        fp,
+                                        denseFingerprint,
                                         screenW,
                                         screenH
                                     )
