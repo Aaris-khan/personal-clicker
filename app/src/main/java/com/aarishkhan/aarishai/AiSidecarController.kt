@@ -562,8 +562,9 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine("Do not perform payments, purchases, money transfers, account deletion, installs/uninstalls, or permission/security changes autonomously.")
             // AARISH_AI_DONE_EVIDENCE_V3
             appendLine("Use DONE only when the CURRENT visible screen/state provides evidence that the user's goal is complete; never mark DONE from assumption or an earlier screen.")
-            appendLine("Reply with ONE single machine line and no prose using exactly seven fields: AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>.")
+            appendLine("Reply with ONE single machine line and no prose using exactly eight fields: AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
             appendLine("VISUAL must be the exact token read from the attached screenshot pixels, NONE when no image is attached, or MISSING when an expected image cannot be read. Never invent a visual token.")
+            appendLine("The final literal END field is mandatory. Do not emit the machine line until every earlier field is complete.")
             appendLine("EXPECTED is the observable post-condition the executor must verify. For TAP/TAP_XY/LONG_TAP/SCROLL/DONE it is mandatory. Prefer visible text or semantic state. You may use PACKAGE=<package>, CLIPBOARD_CHANGE, or STATE_CHANGE only when that is genuinely the strongest observable proof.")
             appendLine("For SET_TEXT put text to type in PAYLOAD and a short visible confirmation in EXPECTED when available. For WAIT put milliseconds in PAYLOAD. For OPEN_APP put the human app name in PAYLOAD and PACKAGE=<expected package> when known. For DONE put a short completion reason in PAYLOAD and concrete current-state proof in EXPECTED. FAIL uses PAYLOAD for the reason.")
         }.take(15000)
@@ -668,12 +669,12 @@ class AiSidecarController(private val service: AutoActionService) {
             callback(null)
             return
         }
-        waitForProviderWindow(run, provider, 0) { root ->
-            if (!alive(run)) return@waitForProviderWindow
+        waitForProviderReadyComposer(run, provider, 0, 0) { root ->
+            if (!alive(run)) return@waitForProviderReadyComposer
             if (root == null) {
                 waitingForAi = false
                 callback(null)
-                return@waitForProviderWindow
+                return@waitForProviderReadyComposer
             }
             ensurePromptAndSend(run, provider, root, prompt) { sent ->
                 if (!alive(run)) return@ensurePromptAndSend
@@ -729,18 +730,39 @@ class AiSidecarController(private val service: AutoActionService) {
         } catch (_: Throwable) { false }
     }
 
-    private fun waitForProviderWindow(run: Int, provider: Provider, attempt: Int, callback: (AccessibilityNodeInfo?) -> Unit) {
+    // AARISH_AI_PROVIDER_READY_GATE_V6
+    // A provider window existing is not enough: share previews can appear before the
+    // actual composer is ready, and an older response may still be generating.
+    // Never inject into a busy provider session; wait for a stable editable composer.
+    private fun waitForProviderReadyComposer(
+        run: Int,
+        provider: Provider,
+        attempt: Int,
+        stableReadySamples: Int,
+        callback: (AccessibilityNodeInfo?) -> Unit
+    ) {
         if (!alive(run)) return
         val root = findRootForPackage(provider.packageName)
-        if (root != null) {
-            handler.postDelayed({ callback(findRootForPackage(provider.packageName)) }, 450L)
+        val composer = root?.let(::findEditable)
+        val busy = root?.let(::hasGeneratingIndicator) == true
+        val ready = root != null && composer != null && !busy
+
+        val nextStable = if (ready) stableReadySamples + 1 else 0
+        if (ready && nextStable >= 2) {
+            callback(root)
             return
         }
-        if (attempt >= 36) {
+
+        // Up to ~12s covers share-sheet/attachment/composer hydration without ever
+        // pressing Stop on a user's pre-existing generation.
+        if (attempt >= 60) {
             callback(null)
             return
         }
-        handler.postDelayed({ waitForProviderWindow(run, provider, attempt + 1, callback) }, 250L)
+        handler.postDelayed(
+            { waitForProviderReadyComposer(run, provider, attempt + 1, nextStable, callback) },
+            if (ready) 140L else 200L
+        )
     }
 
     // AARISH_AI_DIRECT_COMPOSER_V1
@@ -800,13 +822,21 @@ class AiSidecarController(private val service: AutoActionService) {
     private fun requestWasCommitted(
         provider: Provider,
         requestMarker: String,
-        prompt: String
+        prompt: String,
+        baselineUiSerial: Long
     ): Boolean {
         val root = findRootForPackage(provider.packageName) ?: return false
-        if (hasGeneratingIndicator(root)) return true
         val composer = findEditable(root)
         val stillInComposer = nodeContainsRequest(composer, requestMarker, prompt)
-        return !stillInComposer && requestMarkerOutsideComposer(root, requestMarker)
+
+        // Strongest proof: the unique request marker is now represented outside the editor.
+        if (!stillInComposer && requestMarkerOutsideComposer(root, requestMarker)) return true
+
+        // Some custom chat UIs do not expose the submitted user message text. In that case
+        // accept only a NEW generation transition after our submit attempt, never a spinner
+        // that was already present before injection.
+        val uiAdvanced = providerUiSerial.get() > baselineUiSerial
+        return !stillInComposer && uiAdvanced && hasGeneratingIndicator(root)
     }
 
     private fun performComposerNativeSubmit(composer: AccessibilityNodeInfo): Boolean {
@@ -838,18 +868,40 @@ class AiSidecarController(private val service: AutoActionService) {
         return false
     }
 
-    private fun ensurePromptAndSend(run: Int, provider: Provider, root: AccessibilityNodeInfo, prompt: String, callback: (Boolean) -> Unit) {
+    private fun ensurePromptAndSend(
+        run: Int,
+        provider: Provider,
+        root: AccessibilityNodeInfo,
+        prompt: String,
+        callback: (Boolean) -> Unit
+    ) {
         if (!alive(run)) return
-        val composer = findEditable(root)
-        if (composer == null) {
+        val firstComposer = findEditable(root)
+        if (firstComposer == null || hasGeneratingIndicator(root)) {
             callback(false)
             return
+        }
+
+        val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun finish(ok: Boolean) {
+            if (finished.compareAndSet(false, true)) callback(ok)
         }
 
         val requestMarker = prompt.lineSequence()
             .firstOrNull { it.startsWith("REQUEST IDENTIFIER:") }
             ?.trim()
             .orEmpty()
+        if (requestMarker.isBlank()) {
+            finish(false)
+            return
+        }
+
+        // Unique UUID marker must not already exist in provider history before this turn.
+        // If it somehow does, correlation is compromised and we fail closed.
+        if (requestMarkerOutsideComposer(root, requestMarker)) {
+            finish(false)
+            return
+        }
 
         fun writePrompt(node: AccessibilityNodeInfo): Boolean {
             val setOk = try {
@@ -860,94 +912,103 @@ class AiSidecarController(private val service: AutoActionService) {
             } catch (_: Throwable) {
                 false
             }
-            // ACTION_SET_TEXT can succeed while this node object still exposes stale text.
-            // Do not paste a second copy here; fresh-node verification happens before submit.
             if (setOk) return true
             if (nodeContainsRequest(node, requestMarker, prompt)) return true
             return pastePromptViaClipboard(node, prompt)
         }
 
-        if (!writePrompt(composer)) {
-            callback(false)
+        if (!writePrompt(firstComposer)) {
+            finish(false)
             return
         }
 
-        fun verifyCommit(afterMs: Long, onVerified: () -> Unit, onMissing: () -> Unit) {
-            handler.postDelayed({
-                if (!alive(run)) return@postDelayed
-                if (requestWasCommitted(provider, requestMarker, prompt)) onVerified() else onMissing()
-            }, afterMs)
+        fun waitForFreshPrompt(attempt: Int, onReady: (AccessibilityNodeInfo) -> Unit) {
+            if (!alive(run) || finished.get()) return
+            val latest = findRootForPackage(provider.packageName)
+            val composer = latest?.let(::findEditable)
+            if (latest != null &&
+                !hasGeneratingIndicator(latest) &&
+                composer != null &&
+                nodeContainsRequest(composer, requestMarker, prompt)
+            ) {
+                onReady(composer)
+                return
+            }
+            if (attempt >= 18) {
+                finish(false)
+                return
+            }
+            handler.postDelayed({ waitForFreshPrompt(attempt + 1, onReady) }, 140L)
         }
 
-        fun fallbackButtonSubmit(attempt: Int) {
-            if (!alive(run)) return
-            val latest = findRootForPackage(provider.packageName)
-            val latestComposer = latest?.let(::findEditable) ?: composer
-
-            if (!nodeContainsRequest(latestComposer, requestMarker, prompt)) {
-                // If it disappeared because native submit already committed, accept only with evidence.
-                if (latest != null && requestWasCommitted(provider, requestMarker, prompt)) {
-                    callback(true)
-                    return
-                }
-                if (attempt >= 1 || !pastePromptViaClipboard(latestComposer, prompt)) {
-                    callback(false)
-                    return
-                }
-                handler.postDelayed({ fallbackButtonSubmit(attempt + 1) }, 320L)
+        fun awaitCommitEvidence(
+            baselineUiSerial: Long,
+            attempt: Int = 0,
+            callbackEvidence: (Boolean) -> Unit
+        ) {
+            if (!alive(run) || finished.get()) return
+            if (requestWasCommitted(provider, requestMarker, prompt, baselineUiSerial)) {
+                callbackEvidence(true)
                 return
             }
-
-            val send = latest?.let { findSendNode(it, latestComposer) }
-            val clicked = send != null && clickNode(send)
-            if (!clicked) {
-                if (attempt >= 1) {
-                    callback(false)
-                } else {
-                    handler.postDelayed({ fallbackButtonSubmit(attempt + 1) }, 450L)
-                }
+            // ~3s: enough for a slow UI to move text into the transcript/start generation.
+            // IMPORTANT: after an accepted submit action we never submit again. This avoids
+            // duplicate prompts when the provider UI is merely slow to expose evidence.
+            if (attempt >= 20) {
+                callbackEvidence(false)
                 return
             }
-
-            // Never trust click=true. Prove the request left the composer / generation started.
-            verifyCommit(
-                afterMs = 380L,
-                onVerified = { callback(true) },
-                onMissing = {
-                    if (attempt >= 1) callback(false)
-                    else handler.postDelayed({ fallbackButtonSubmit(attempt + 1) }, 220L)
-                }
+            handler.postDelayed(
+                { awaitCommitEvidence(baselineUiSerial, attempt + 1, callbackEvidence) },
+                150L
             )
         }
 
-        fun capabilitySubmit() {
-            if (!alive(run)) return
+        fun buttonSubmitOnce(composer: AccessibilityNodeInfo) {
+            if (!alive(run) || finished.get()) return
             val latest = findRootForPackage(provider.packageName)
-            val latestComposer = latest?.let(::findEditable) ?: composer
-
-            if (!nodeContainsRequest(latestComposer, requestMarker, prompt)) {
-                if (!pastePromptViaClipboard(latestComposer, prompt)) {
-                    callback(false)
-                    return
-                }
-                handler.postDelayed({ capabilitySubmit() }, 300L)
+            val freshComposer = latest?.let(::findEditable) ?: composer
+            if (!nodeContainsRequest(freshComposer, requestMarker, prompt)) {
+                finish(
+                    latest != null && requestWasCommitted(
+                        provider,
+                        requestMarker,
+                        prompt,
+                        providerUiSerial.get()
+                    )
+                )
                 return
             }
 
-            val submitted = performComposerNativeSubmit(latestComposer)
-            if (!submitted) {
-                fallbackButtonSubmit(0)
+            val send = latest?.let { findSendNode(it, freshComposer) }
+            if (send == null) {
+                finish(false)
                 return
             }
 
-            verifyCommit(
-                afterMs = 420L,
-                onVerified = { callback(true) },
-                onMissing = { fallbackButtonSubmit(0) }
-            )
+            val baselineSerial = providerUiSerial.get()
+            val accepted = clickNode(send)
+            if (!accepted) {
+                finish(false)
+                return
+            }
+            awaitCommitEvidence(baselineSerial) { proved -> finish(proved) }
         }
 
-        handler.postDelayed({ capabilitySubmit() }, 260L)
+        waitForFreshPrompt(0) { composer ->
+            if (!alive(run) || finished.get()) return@waitForFreshPrompt
+
+            val baselineSerial = providerUiSerial.get()
+            val nativeAccepted = performComposerNativeSubmit(composer)
+            if (nativeAccepted) {
+                // Do not fall through to the Send button after an accepted native submit.
+                awaitCommitEvidence(baselineSerial) { proved -> finish(proved) }
+            } else {
+                // No native submit capability was accepted, so exactly one semantic/geometry
+                // Send-button attempt is allowed.
+                buttonSubmitOnce(composer)
+            }
+        }
     }
 
     private fun waitForCompleteResponse(run: Int, provider: Provider, requestId: String, callback: (AiCommand?) -> Unit) {
@@ -1030,18 +1091,18 @@ class AiSidecarController(private val service: AutoActionService) {
             val start = rawInput.indexOf(marker)
             if (start < 0) return null
             val raw = rawInput.substring(start).take(5000)
-            val parts = raw.split("::", limit = 7)
-            if (parts.size < 4 || parts[0].trim() != "AARIS" || parts[1].trim() != requestId) return null
+            val parts = raw.split("::", limit = 8)
+            if (parts.size != 8 || parts[0].trim() != "AARIS" || parts[1].trim() != requestId) return null
+            if (parts[7].trim().lineSequence().firstOrNull().orEmpty() != "END") return null
+
             val action = parts[2].trim().uppercase(Locale.US)
-            val element = parts.getOrNull(3).orEmpty().trim()
-            val payload = parts.getOrNull(4).orEmpty().trim()
-            val expected = parts.getOrNull(5).orEmpty().trim()
-            val visual = parts.getOrNull(6).orEmpty()
-                .lineSequence()
-                .firstOrNull()
-                .orEmpty()
-                .trim()
+            val element = parts[3].trim()
+            val payload = parts[4].trim()
+            val expected = parts[5].trim()
+            val visual = parts[6].trim()
             if (action !in setOf("TAP", "TAP_XY", "LONG_TAP", "SET_TEXT", "SCROLL", "BACK", "HOME", "WAIT", "OPEN_APP", "DONE", "FAIL")) return null
+            if (element.length > 200 || payload.length > 2400 || expected.length > 1400 || visual.length > 80) return null
+
             return AiCommand(
                 action = action,
                 elementKey = element,
@@ -1051,9 +1112,14 @@ class AiSidecarController(private val service: AutoActionService) {
             )
         }
 
-        val line = text.lineSequence().map { it.trim() }.lastOrNull { it.contains(marker) }
+        // Prefer a complete single accessibility node/line.
+        val line = text.lineSequence().map { it.trim() }.lastOrNull {
+            it.contains(marker) && it.contains("::END")
+        }
         decode(line.orEmpty())?.let { return it }
 
+        // Some custom UIs split the response across text nodes. Whitespace collapse is
+        // allowed, but the explicit END terminator prevents accepting a half-streamed line.
         val collapsed = text.replace(Regex("\\s+"), " ").trim()
         return decode(collapsed)
     }
