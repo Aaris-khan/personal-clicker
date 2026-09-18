@@ -81,6 +81,35 @@ class AiSidecarController(private val service: AutoActionService) {
 
     private val handler = Handler(Looper.getMainLooper())
     private val generation = AtomicInteger(0)
+    private var missionWakeLock: android.os.PowerManager.WakeLock? = null
+
+    @Suppress("DEPRECATION")
+    private fun acquireMissionWakeLock() {
+        releaseMissionWakeLock()
+        try {
+            val pm = service.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager ?: return
+            missionWakeLock = pm.newWakeLock(
+                android.os.PowerManager.SCREEN_DIM_WAKE_LOCK or
+                    android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "AarishAI:AutonomousMission"
+            ).apply {
+                setReferenceCounted(false)
+                // Hard timeout prevents a leak even if the service/process lifecycle is abnormal.
+                acquire(30L * 60L * 1000L)
+            }
+        } catch (_: Throwable) {
+            missionWakeLock = null
+        }
+    }
+
+    private fun releaseMissionWakeLock() {
+        try {
+            missionWakeLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Throwable) {
+        } finally {
+            missionWakeLock = null
+        }
+    }
 
     @Volatile private var missionRunning = false
     @Volatile private var waitingForAi = false
@@ -154,6 +183,7 @@ class AiSidecarController(private val service: AutoActionService) {
         if (clean.isBlank()) return false
         stop("restart")
         missionRunning = true
+        acquireMissionWakeLock()
         rescueMode = false
         rescueExpectedAction = ""
         rescueEvidenceSteps = emptyList() // AARISH_AI_RESCUE_EVIDENCE_V2_START_CLEAR
@@ -226,6 +256,7 @@ class AiSidecarController(private val service: AutoActionService) {
         rescueMode = true
         rescueCallback = callback
         missionRunning = true
+        acquireMissionWakeLock()
         val run = generation.incrementAndGet()
         toast("🧠 AI rescue")
         handler.post { nextMissionTurn(run) }
@@ -241,6 +272,7 @@ class AiSidecarController(private val service: AutoActionService) {
         rescueMode = false
         rescueExpectedAction = ""
         rescueCallback = null
+        releaseMissionWakeLock()
         handler.removeCallbacksAndMessages(null)
         try { pendingRescue?.invoke(false) } catch (_: Throwable) {}
         if (reason != "restart") toast("AI agent $reason")
@@ -432,6 +464,7 @@ class AiSidecarController(private val service: AutoActionService) {
         rescueCallback = null
         rescueMode = false
         rescueExpectedAction = ""
+        releaseMissionWakeLock()
         cb?.invoke(ok)
     }
 
@@ -442,6 +475,7 @@ class AiSidecarController(private val service: AutoActionService) {
         rescueExpectedAction = ""
         val cb = rescueCallback
         rescueCallback = null
+        releaseMissionWakeLock()
         toast(if (ok) "✅ $message" else "⚠️ $message")
         cb?.invoke(ok)
     }
