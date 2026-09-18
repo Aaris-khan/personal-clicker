@@ -447,8 +447,10 @@ class AiSidecarController(private val service: AutoActionService) {
         if (candidates.isEmpty()) return null
 
         when (providerPreference) {
-            "CHATGPT" -> Provider.CHATGPT.takeIf { it in candidates }?.let { return it }
-            "GEMINI" -> Provider.GEMINI.takeIf { it in candidates }?.let { return it }
+            // AARISH_AI_EXPLICIT_PROVIDER_V4
+            // AUTO may fail over. An explicit user choice must never silently switch brains.
+            "CHATGPT" -> return Provider.CHATGPT.takeIf { it in candidates }
+            "GEMINI" -> return Provider.GEMINI.takeIf { it in candidates }
         }
 
         val now = SystemClock.elapsedRealtime()
