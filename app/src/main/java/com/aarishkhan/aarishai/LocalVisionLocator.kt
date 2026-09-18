@@ -99,7 +99,13 @@ object LocalVisionLocator {
         if (!isStrictLoopbackUrl(endpoint)) return null
 
         val encoded = encodeScreenshot(bitmap) ?: return null
-        val prompt = buildPrompt(gesture, encoded.width, encoded.height)
+        val referenceEncoded = loadReferenceScreenshot(gesture)
+        val prompt = buildPrompt(
+            gesture = gesture,
+            imageW = encoded.width,
+            imageH = encoded.height,
+            hasReferenceImage = referenceEncoded != null
+        )
         val request = JSONObject().apply {
             put("model", model)
             put("temperature", 0)
@@ -112,6 +118,15 @@ object LocalVisionLocator {
                             put("type", "text")
                             put("text", prompt)
                         })
+                        if (referenceEncoded != null) {
+                            put(JSONObject().apply {
+                                put("type", "image_url")
+                                put("image_url", JSONObject().put(
+                                    "url",
+                                    "data:image/jpeg;base64,${referenceEncoded.base64}"
+                                ))
+                            })
+                        }
                         put(JSONObject().apply {
                             put("type", "image_url")
                             put("image_url", JSONObject().put(
@@ -138,6 +153,30 @@ object LocalVisionLocator {
         val width: Int,
         val height: Int
     )
+
+    // AARISH_LOCAL_VISION_REFERENCE_PAIR_V1
+    // Recording evidence stays private on-device and is only sent to the already
+    // loopback-restricted local VLM endpoint.
+    private fun loadReferenceScreenshot(gesture: RecordedGesture): EncodedScreenshot? {
+        val path = gesture.recordingEvidencePath?.trim().orEmpty()
+        if (path.isBlank()) return null
+
+        val file = try { java.io.File(path) } catch (_: Throwable) { return null }
+        if (!file.exists() || !file.isFile) return null
+        if (file.length() <= 0L || file.length() > 8L * 1024L * 1024L) return null
+
+        val reference = try {
+            android.graphics.BitmapFactory.decodeFile(file.absolutePath)
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+
+        return try {
+            encodeScreenshot(reference)
+        } finally {
+            try { reference.recycle() } catch (_: Throwable) {}
+        }
+    }
 
     private fun encodeScreenshot(bitmap: Bitmap): EncodedScreenshot? {
         if (bitmap.width <= 0 || bitmap.height <= 0) return null
