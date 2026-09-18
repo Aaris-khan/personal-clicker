@@ -5,6 +5,7 @@ on:
     branches: [ main ]
     paths:
       - '.github/workflows/frontier-autonomy-exact-compile.yml'
+      - 'app/**'
 
 permissions:
   contents: write
