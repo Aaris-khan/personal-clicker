@@ -3571,6 +3571,121 @@ private fun aarishAiWaitForNextRecordedTarget(
         )
     }
 
+    // AARISH_UNIVERSAL_OCR_RESCUE_V1
+    // A normal semantic recording can still be recovered by OCR when a later app
+    // version stops exposing accessibility nodes. OCR is used only after stronger
+    // semantic/visual evidence fails.
+    private fun aarishUniversalOcrRescueBox(
+        gesture: RecordedGesture,
+        boxes: List<AarishOcrBox>
+    ): Pair<AarishOcrBox, Float>? {
+        if (boxes.isEmpty()) return null
+
+        val seeds = linkedSetOf<String>()
+
+        fun addSeed(raw: String?) {
+            val cleaned = raw.orEmpty()
+                .removePrefix("OCR:")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            val stable = aarishStableHumanActionLabel(cleaned) ?: return
+            val norm = aarishNormOcr(stable)
+            if (norm.length >= 2) seeds.add(norm)
+        }
+
+        addSeed(gesture.targetText)
+        addSeed(gesture.targetDesc)
+
+        gesture.targetChildText
+            ?.split("|", "•", ">", "\n")
+            ?.take(12)
+            ?.forEach { addSeed(it) }
+
+        gesture.targetContextText
+            ?.split("|", "•", ">", "\n")
+            ?.take(16)
+            ?.forEach { addSeed(it) }
+
+        if (seeds.isEmpty()) return null
+
+        val screenW = resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
+        val screenH = resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
+        val oldX = if (hasSavedPercentAnchor(gesture)) gesture.xPercent.coerceIn(0f, 1f) * screenW else -1f
+        val oldY = if (hasSavedPercentAnchor(gesture)) gesture.yPercent.coerceIn(0f, 1f) * screenH else -1f
+
+        fun rowPhrase(box: AarishOcrBox): String {
+            val base = box.bounds
+            val rowTol = kotlin.math.max(10f, base.height().toFloat() * 0.85f)
+            val near = boxes
+                .filter { other ->
+                    kotlin.math.abs(other.bounds.exactCenterY() - base.exactCenterY()) <= rowTol
+                }
+                .sortedBy { it.bounds.left }
+                .take(12)
+                .joinToString(" ") { it.text.trim() }
+            return aarishNormOcr(near)
+        }
+
+        data class Candidate(
+            val box: AarishOcrBox,
+            val semantic: Float,
+            val score: Float
+        )
+
+        var best: Candidate? = null
+        var second: Candidate? = null
+
+        for (box in boxes) {
+            val direct = aarishNormOcr(box.text)
+            if (direct.isBlank()) continue
+            val row = rowPhrase(box)
+
+            var semantic = 0f
+            for (seed in seeds) {
+                semantic = maxOf(
+                    semantic,
+                    tokenSimilarity(seed, direct),
+                    tokenSimilarity(seed, row) * 0.98f
+                )
+                if (seed == direct || seed == row) semantic = 1f
+            }
+            if (semantic < 0.82f) continue
+
+            val shape = aarishShapeSimilarity(box.bounds, gesture)
+            val distancePenalty = if (oldX >= 0f && oldY >= 0f) {
+                (
+                    kotlin.math.abs(box.bounds.exactCenterX() - oldX) / screenW +
+                        kotlin.math.abs(box.bounds.exactCenterY() - oldY) / screenH
+                    ).coerceIn(0f, 2f)
+            } else {
+                0f
+            }
+
+            // Position is deliberately only a tiny tie-breaker.
+            val score = semantic * 100f + shape * 4f - distancePenalty * 1.5f
+            val candidate = Candidate(box, semantic, score)
+
+            if (best == null || candidate.score > best!!.score) {
+                second = best
+                best = candidate
+            } else if (second == null || candidate.score > second!!.score) {
+                second = candidate
+            }
+        }
+
+        val winner = best ?: return null
+        val runner = second
+        val clear =
+            runner == null ||
+                winner.semantic - runner.semantic >= 0.055f ||
+                winner.score - runner.score >= 5.5f ||
+                winner.semantic >= 0.985f
+
+        if (winner.semantic < 0.90f || !clear) return null
+        return winner.box to winner.semantic
+    }
+
+
     private fun aarishRequestVisualFingerprintTarget(
         gesture: RecordedGesture,
         runId: Int,
