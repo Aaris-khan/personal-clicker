@@ -18,6 +18,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.Display
+import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
 import androidx.core.content.FileProvider
@@ -98,6 +99,27 @@ class AiSidecarController(private val service: AutoActionService) {
     private val providerFailureStreak = mutableMapOf<Provider, Int>()
     private val providerCooldownUntil = mutableMapOf<Provider, Long>()
     private var lastProviderAttempt: Provider? = null
+
+    // Provider UI mutation pulse. The response reader still has a timeout/poll fallback,
+    // but accessibility events let it react to streaming replies without depending on
+    // arbitrary fixed sleeps or a provider-specific "copy" affordance.
+    private val providerUiSerial = java.util.concurrent.atomic.AtomicLong(0L)
+    @Volatile private var providerUiEventAt = 0L
+
+    fun onAccessibilityEvent(event: AccessibilityEvent) {
+        val pkg = event.packageName?.toString().orEmpty()
+        if (Provider.values().none { it.packageName == pkg }) return
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                providerUiEventAt = SystemClock.elapsedRealtime()
+                providerUiSerial.incrementAndGet()
+            }
+        }
+    }
 
     // Same target state + same command repeated is a planner loop, not useful progress.
     private var lastPlannerSignature = ""
@@ -665,6 +687,14 @@ class AiSidecarController(private val service: AutoActionService) {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     if (Build.VERSION.SDK_INT >= 24) addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
                 }
+                // Explicit grant makes the handoff independent of implicit URI-grant behavior.
+                try {
+                    service.grantUriPermission(
+                        provider.packageName,
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Throwable) {}
                 service.startActivity(send)
                 true
             } catch (_: Throwable) {
@@ -720,6 +750,77 @@ class AiSidecarController(private val service: AutoActionService) {
         }
     }
 
+    // AARISH_AI_CAPABILITY_SUBMIT_V5
+    // Primary submit path does NOT hunt for a Send icon. We ask the focused editable
+    // node which actions it actually supports and prefer a native/custom Send action
+    // or ACTION_IME_ENTER. Provider-button discovery is only a verified fallback.
+    private fun nodeContainsRequest(node: AccessibilityNodeInfo?, requestMarker: String, prompt: String): Boolean {
+        val n = node ?: return false
+        val value = try { n.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+        if (value.isBlank()) return false
+        if (requestMarker.isNotBlank() && value.contains(requestMarker)) return true
+        val prefix = prompt.take(120)
+        return prefix.isNotBlank() && value.contains(prefix)
+    }
+
+    private fun requestMarkerOutsideComposer(root: AccessibilityNodeInfo, requestMarker: String): Boolean {
+        if (requestMarker.isBlank()) return false
+        var found = false
+        walk(root, 5000) { n ->
+            if (found) return@walk
+            val editable = try { n.isEditable } catch (_: Throwable) { false }
+            if (editable) return@walk
+            val value = buildString {
+                append(try { n.text?.toString().orEmpty() } catch (_: Throwable) { "" })
+                append(' ')
+                append(try { n.contentDescription?.toString().orEmpty() } catch (_: Throwable) { "" })
+            }
+            if (value.contains(requestMarker)) found = true
+        }
+        return found
+    }
+
+    private fun requestWasCommitted(
+        provider: Provider,
+        requestMarker: String,
+        prompt: String
+    ): Boolean {
+        val root = findRootForPackage(provider.packageName) ?: return false
+        if (hasGeneratingIndicator(root)) return true
+        val composer = findEditable(root)
+        val stillInComposer = nodeContainsRequest(composer, requestMarker, prompt)
+        return !stillInComposer && requestMarkerOutsideComposer(root, requestMarker)
+    }
+
+    private fun performComposerNativeSubmit(composer: AccessibilityNodeInfo): Boolean {
+        try { composer.performAction(AccessibilityNodeInfo.ACTION_FOCUS) } catch (_: Throwable) {}
+
+        // Some modern/custom composers expose their own named accessibility action.
+        val actions = try { composer.actionList.orEmpty() } catch (_: Throwable) { emptyList() }
+        val namedSend = actions.firstOrNull { action ->
+            val label = action.label?.toString().orEmpty().lowercase(Locale.US)
+            label.contains("send") || label.contains("submit")
+        }
+        if (namedSend != null) {
+            try {
+                if (composer.performAction(namedSend.id)) return true
+            } catch (_: Throwable) {}
+        }
+
+        // API 30+: let the focused editor execute its IME action directly.
+        // This avoids Send-button text/icon/coordinate discovery entirely.
+        if (Build.VERSION.SDK_INT >= 30) {
+            val imeActionId = AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id
+            val supportsImeEnter = actions.any { it.id == imeActionId }
+            if (supportsImeEnter) {
+                try {
+                    if (composer.performAction(imeActionId)) return true
+                } catch (_: Throwable) {}
+            }
+        }
+        return false
+    }
+
     private fun ensurePromptAndSend(run: Int, provider: Provider, root: AccessibilityNodeInfo, prompt: String, callback: (Boolean) -> Unit) {
         if (!alive(run)) return
         val composer = findEditable(root)
@@ -728,22 +829,10 @@ class AiSidecarController(private val service: AutoActionService) {
             return
         }
 
-        // AARISH_AI_COMPOSER_COMMIT_V4
-        // ACTION_SET_TEXT returning true is not proof that the provider actually owns the
-        // complete request. Verify the unique request marker before pressing Send.
         val requestMarker = prompt.lineSequence()
             .firstOrNull { it.startsWith("REQUEST IDENTIFIER:") }
             ?.trim()
             .orEmpty()
-
-        fun composerHasRequest(node: AccessibilityNodeInfo?): Boolean {
-            val n = node ?: return false
-            val value = try { n.text?.toString().orEmpty() } catch (_: Throwable) { "" }
-            if (value.isBlank()) return false
-            if (requestMarker.isNotBlank() && value.contains(requestMarker)) return true
-            val prefix = prompt.take(120)
-            return prefix.isNotBlank() && value.contains(prefix)
-        }
 
         fun writePrompt(node: AccessibilityNodeInfo): Boolean {
             val setOk = try {
@@ -754,8 +843,8 @@ class AiSidecarController(private val service: AutoActionService) {
             } catch (_: Throwable) {
                 false
             }
-            if (setOk) return true
-            if (composerHasRequest(node)) return true
+            if (setOk && nodeContainsRequest(node, requestMarker, prompt)) return true
+            if (nodeContainsRequest(node, requestMarker, prompt)) return true
             return pastePromptViaClipboard(node, prompt)
         }
 
@@ -764,35 +853,82 @@ class AiSidecarController(private val service: AutoActionService) {
             return
         }
 
-        fun clickVerifiedSend(repairAttempt: Int) {
+        fun verifyCommit(afterMs: Long, onVerified: () -> Unit, onMissing: () -> Unit) {
+            handler.postDelayed({
+                if (!alive(run)) return@postDelayed
+                if (requestWasCommitted(provider, requestMarker, prompt)) onVerified() else onMissing()
+            }, afterMs)
+        }
+
+        fun fallbackButtonSubmit(attempt: Int) {
             if (!alive(run)) return
             val latest = findRootForPackage(provider.packageName)
             val latestComposer = latest?.let(::findEditable) ?: composer
 
-            if (!composerHasRequest(latestComposer)) {
-                if (repairAttempt >= 1 || !pastePromptViaClipboard(latestComposer, prompt)) {
+            if (!nodeContainsRequest(latestComposer, requestMarker, prompt)) {
+                // If it disappeared because native submit already committed, accept only with evidence.
+                if (latest != null && requestWasCommitted(provider, requestMarker, prompt)) {
+                    callback(true)
+                    return
+                }
+                if (attempt >= 1 || !pastePromptViaClipboard(latestComposer, prompt)) {
                     callback(false)
                     return
                 }
-                handler.postDelayed({ clickVerifiedSend(repairAttempt + 1) }, 420L)
+                handler.postDelayed({ fallbackButtonSubmit(attempt + 1) }, 320L)
                 return
             }
 
             val send = latest?.let { findSendNode(it, latestComposer) }
-            val ok = send != null && clickNode(send)
-            if (ok) {
-                callback(true)
+            val clicked = send != null && clickNode(send)
+            if (!clicked) {
+                if (attempt >= 1) {
+                    callback(false)
+                } else {
+                    handler.postDelayed({ fallbackButtonSubmit(attempt + 1) }, 450L)
+                }
                 return
             }
 
-            if (repairAttempt >= 1) {
-                callback(false)
-                return
-            }
-            handler.postDelayed({ clickVerifiedSend(repairAttempt + 1) }, 750L)
+            // Never trust click=true. Prove the request left the composer / generation started.
+            verifyCommit(
+                afterMs = 380L,
+                onVerified = { callback(true) },
+                onMissing = {
+                    if (attempt >= 1) callback(false)
+                    else handler.postDelayed({ fallbackButtonSubmit(attempt + 1) }, 220L)
+                }
+            )
         }
 
-        handler.postDelayed({ clickVerifiedSend(0) }, 650L)
+        fun capabilitySubmit() {
+            if (!alive(run)) return
+            val latest = findRootForPackage(provider.packageName)
+            val latestComposer = latest?.let(::findEditable) ?: composer
+
+            if (!nodeContainsRequest(latestComposer, requestMarker, prompt)) {
+                if (!pastePromptViaClipboard(latestComposer, prompt)) {
+                    callback(false)
+                    return
+                }
+                handler.postDelayed({ capabilitySubmit() }, 300L)
+                return
+            }
+
+            val submitted = performComposerNativeSubmit(latestComposer)
+            if (!submitted) {
+                fallbackButtonSubmit(0)
+                return
+            }
+
+            verifyCommit(
+                afterMs = 420L,
+                onVerified = { callback(true) },
+                onMissing = { fallbackButtonSubmit(0) }
+            )
+        }
+
+        handler.postDelayed({ capabilitySubmit() }, 260L)
     }
 
     private fun waitForCompleteResponse(run: Int, provider: Provider, requestId: String, callback: (AiCommand?) -> Unit) {
@@ -862,33 +998,41 @@ class AiSidecarController(private val service: AutoActionService) {
                 }
                 return
             }
-            handler.postDelayed({ poll() }, 600L)
+            val recentUiMutation = SystemClock.elapsedRealtime() - providerUiEventAt < 900L
+            handler.postDelayed({ poll() }, if (recentUiMutation) 180L else 520L)
         }
-        handler.postDelayed({ poll() }, 750L)
+        handler.postDelayed({ poll() }, 420L)
     }
 
     private fun parseCommand(text: String, requestId: String): AiCommand? {
         val marker = "AARIS::$requestId::"
-        val line = text.lineSequence().map { it.trim() }.lastOrNull { it.contains(marker) } ?: return null
-        val start = line.indexOf(marker)
-        if (start < 0) return null
-        val raw = line.substring(start).take(5000)
-        val parts = raw.split("::", limit = 6)
-        if (parts.size < 4 || parts[0] != "AARIS" || parts[1] != requestId) return null
-        val action = parts[2].trim().uppercase(Locale.US)
-        val element = parts.getOrNull(3).orEmpty().trim()
-        val payload = parts.getOrNull(4).orEmpty().trim()
-        val expected = parts.getOrNull(5).orEmpty().trim()
-        if (action !in setOf("TAP", "TAP_XY", "LONG_TAP", "SET_TEXT", "SCROLL", "BACK", "HOME", "WAIT", "OPEN_APP", "DONE", "FAIL")) return null
 
-        // AARISH_AI_PROTOCOL_V4: old five-field responses still parse, but new
-        // providers get a dedicated EXPECTED field so payload and proof are not conflated.
-        return AiCommand(
-            action = action,
-            elementKey = element,
-            payload = payload,
-            expected = expected
-        )
+        fun decode(rawInput: String): AiCommand? {
+            val start = rawInput.indexOf(marker)
+            if (start < 0) return null
+            val raw = rawInput.substring(start).take(5000)
+            val parts = raw.split("::", limit = 6)
+            if (parts.size < 4 || parts[0].trim() != "AARIS" || parts[1].trim() != requestId) return null
+            val action = parts[2].trim().uppercase(Locale.US)
+            val element = parts.getOrNull(3).orEmpty().trim()
+            val payload = parts.getOrNull(4).orEmpty().trim()
+            val expected = parts.getOrNull(5).orEmpty()
+                .lineSequence()
+                .firstOrNull()
+                .orEmpty()
+                .trim()
+            if (action !in setOf("TAP", "TAP_XY", "LONG_TAP", "SET_TEXT", "SCROLL", "BACK", "HOME", "WAIT", "OPEN_APP", "DONE", "FAIL")) return null
+            return AiCommand(action = action, elementKey = element, payload = payload, expected = expected)
+        }
+
+        // Fast path: one accessibility text node/line owns the machine response.
+        val line = text.lineSequence().map { it.trim() }.lastOrNull { it.contains(marker) }
+        decode(line.orEmpty())?.let { return it }
+
+        // Custom-rendered/provider UIs can split one response across multiple text nodes.
+        // Collapse only whitespace and retry so "::" field separators stay intact.
+        val collapsed = text.replace(Regex("\\s+"), " ").trim()
+        return decode(collapsed)
     }
 
     private fun returnToTarget(run: Int, pkg: String, callback: () -> Unit) {
@@ -1776,6 +1920,16 @@ class AiSidecarController(private val service: AutoActionService) {
                 val dx = abs(b.centerX() - cb.right)
                 val dy = abs(b.centerY() - cb.centerY())
                 score += (240 - (dx + dy) / 4).coerceAtLeast(-100)
+
+                // Last-resort provider-agnostic geometry: when text is already in the
+                // composer, many chat apps replace the trailing mic with an unlabeled
+                // send icon. Only consider a small visible control on the same row and
+                // to the right side of the composer. Commit verification must still pass.
+                val sameRow = b.centerY() in (cb.top - 24)..(cb.bottom + 24)
+                val trailing = b.centerX() >= cb.centerX()
+                val maxSide = (96f * service.resources.displayMetrics.density).toInt().coerceAtLeast(96)
+                val compact = b.width() in 1..maxSide && b.height() in 1..maxSide
+                if (sameRow && trailing && compact && label.isBlank()) score += 105
             }
             if (score > bestScore) { bestScore = score; best = n }
         }
