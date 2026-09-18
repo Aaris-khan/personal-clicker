@@ -1417,11 +1417,101 @@ private fun aarishAiWaitForNextRecordedTarget(
         }
     }
 
+    // AARISH_DETERMINISTIC_VISUAL_FINGERPRINT_V1
+    // Tiny grayscale difference-hash. No model/network/OpenCV; 72 sampled pixels only.
+    private fun aarishVisualDHash(
+        bitmap: android.graphics.Bitmap,
+        screenBounds: Rect,
+        screenW: Float,
+        screenH: Float
+    ): String? {
+        if (screenBounds.width() < 8 || screenBounds.height() < 8) return null
+        if (screenW <= 1f || screenH <= 1f || bitmap.width <= 1 || bitmap.height <= 1) return null
+
+        val left = (screenBounds.left / screenW * bitmap.width).toInt().coerceIn(0, bitmap.width - 1)
+        val top = (screenBounds.top / screenH * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
+        val right = (screenBounds.right / screenW * bitmap.width).toInt().coerceIn(left + 1, bitmap.width)
+        val bottom = (screenBounds.bottom / screenH * bitmap.height).toInt().coerceIn(top + 1, bitmap.height)
+        val w = right - left
+        val h = bottom - top
+        if (w < 6 || h < 6) return null
+
+        val samples = Array(8) { IntArray(9) }
+        var minLum = 255
+        var maxLum = 0
+        for (yy in 0 until 8) {
+            val fy = (yy + 0.5f) / 8f
+            val py = (top + fy * h).toInt().coerceIn(top, bottom - 1)
+            for (xx in 0 until 9) {
+                val fx = (xx + 0.5f) / 9f
+                val px = (left + fx * w).toInt().coerceIn(left, right - 1)
+                val color = try { bitmap.getPixel(px, py) } catch (_: Throwable) { return null }
+                val lum = (
+                    android.graphics.Color.red(color) * 30 +
+                        android.graphics.Color.green(color) * 59 +
+                        android.graphics.Color.blue(color) * 11
+                    ) / 100
+                samples[yy][xx] = lum
+                if (lum < minLum) minLum = lum
+                if (lum > maxLum) maxLum = lum
+            }
+        }
+
+        // Near-uniform rectangles are not distinctive enough to trust visually.
+        if (maxLum - minLum < 16) return null
+
+        val bits = StringBuilder(64)
+        for (yy in 0 until 8) {
+            for (xx in 0 until 8) {
+                bits.append(if (samples[yy][xx] > samples[yy][xx + 1]) '1' else '0')
+            }
+        }
+        return bits.toString()
+    }
+
+    private fun aarishVisualFingerprintSimilarity(a: String?, b: String?): Float {
+        if (a == null || b == null || a.length != 64 || b.length != 64) return 0f
+        var same = 0
+        for (i in 0 until 64) if (a[i] == b[i]) same++
+        return same / 64f
+    }
+
+    private fun aarishVisualFingerprintSidecar(evidencePath: String): java.io.File =
+        java.io.File(evidencePath + ".vfp")
+
+    private fun aarishWriteVisualFingerprintSidecar(evidencePath: String, hash: String?) {
+        if (hash.isNullOrBlank()) return
+        try {
+            aarishVisualFingerprintSidecar(evidencePath).writeText("V1|BOUNDS|$hash", Charsets.UTF_8)
+        } catch (_: Throwable) {}
+    }
+
+    private fun aarishReadVisualFingerprint(gesture: RecordedGesture): String? {
+        val path = gesture.recordingEvidencePath.orEmpty()
+        if (path.isBlank()) return null
+        return try {
+            val file = aarishVisualFingerprintSidecar(path)
+            if (!file.exists() || !file.isFile || file.length() > 256L) return null
+            val parts = file.readText(Charsets.UTF_8).trim().split("|")
+            parts.getOrNull(2)?.takeIf {
+                parts.getOrNull(0) == "V1" &&
+                    parts.getOrNull(1) == "BOUNDS" &&
+                    it.length == 64 &&
+                    it.all { ch -> ch == '0' || ch == '1' }
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     // AARISH_RECORDING_EVIDENCE_V1_SAVE
     private fun aarishSaveRecordingEvidenceBitmap(
         source: android.graphics.Bitmap,
         tapX: Int,
-        tapY: Int
+        tapY: Int,
+        targetBounds: Rect?,
+        screenW: Float,
+        screenH: Float
     ): String? {
         return try {
             val srcW = source.width.coerceAtLeast(1)
@@ -1462,6 +1552,18 @@ private fun aarishAiWaitForNextRecordedTarget(
             val file = java.io.File(dir, "step_${System.currentTimeMillis()}_${java.util.UUID.randomUUID()}.jpg")
             java.io.FileOutputStream(file).use { stream ->
                 scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 72, stream)
+            }
+
+            val fingerprintBounds = targetBounds?.takeIf { b ->
+                b.width() >= 8 && b.height() >= 8 &&
+                    (b.width().toFloat() * b.height().toFloat()) /
+                    (screenW.coerceAtLeast(1f) * screenH.coerceAtLeast(1f)) <= 0.58f
+            }
+            if (fingerprintBounds != null) {
+                aarishWriteVisualFingerprintSidecar(
+                    file.absolutePath,
+                    aarishVisualDHash(source, fingerprintBounds, screenW, screenH)
+                )
             }
 
             // Bound private evidence storage so long-term recording use cannot grow forever.
@@ -1521,7 +1623,21 @@ private fun aarishAiWaitForNextRecordedTarget(
                         }
 
                         // Save the user's recording-time view before the app can change screens.
-                        val evidencePath = aarishSaveRecordingEvidenceBitmap(bitmap, x, y)
+                        // Also persist a tiny local visual fingerprint of the actual accessible
+                        // target bounds for icon-only/moved-control fallback.
+                        val magneticSnapshot = captureTargetSnapshotInternal(x, y, screenW, screenH)
+                        val visualBounds = magneticSnapshot?.let { snap ->
+                            Rect(snap.targetLeft, snap.targetTop, snap.targetRight, snap.targetBottom)
+                                .takeIf { it.width() > 0 && it.height() > 0 }
+                        }
+                        val evidencePath = aarishSaveRecordingEvidenceBitmap(
+                            bitmap,
+                            x,
+                            y,
+                            visualBounds,
+                            screenW,
+                            screenH
+                        )
                         aarishProcessOcrBoxesFromBitmapV29(
                             bitmap = bitmap,
                             onSuccess = { boxes ->
@@ -3149,6 +3265,126 @@ private fun aarishAiWaitForNextRecordedTarget(
     }
 
 
+    private fun aarishRequestVisualFingerprintTarget(
+        gesture: RecordedGesture,
+        runId: Int,
+        callback: (Rect?) -> Unit
+    ): Boolean {
+        if (!isSamePlaybackRun(runId)) return false
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return false
+        val recordedHash = aarishReadVisualFingerprint(gesture) ?: return false
+
+        val executor = java.util.concurrent.Executor { runnable -> handler.post(runnable) }
+        return try {
+            takeScreenshot(
+                android.view.Display.DEFAULT_DISPLAY,
+                executor,
+                object : android.accessibilityservice.AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(
+                        screenshot: android.accessibilityservice.AccessibilityService.ScreenshotResult
+                    ) {
+                        val bitmap = aarishBitmapFromScreenshot(screenshot)
+                        if (bitmap == null || !isSamePlaybackRun(runId)) {
+                            try { bitmap?.recycle() } catch (_: Throwable) {}
+                            callback(null)
+                            return
+                        }
+
+                        try {
+                            val screenW = resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
+                            val screenH = resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(1f)
+                            val anchorX = if (hasSavedPercentAnchor(gesture)) {
+                                gesture.xPercent.coerceIn(0f, 1f) * screenW
+                            } else screenW / 2f
+                            val anchorY = if (hasSavedPercentAnchor(gesture)) {
+                                gesture.yPercent.coerceIn(0f, 1f) * screenH
+                            } else screenH / 2f
+                            val roots = collectSmartSearchRoots(anchorX.toInt(), anchorY.toInt())
+                            val savedPkg = aarishSavedPackageFromId(gesture)
+
+                            data class VisualCandidate(
+                                val bounds: Rect,
+                                val visual: Float,
+                                val combined: Float
+                            )
+
+                            var best: VisualCandidate? = null
+                            var second: VisualCandidate? = null
+                            val seen = hashSetOf<String>()
+
+                            fun remember(candidate: VisualCandidate) {
+                                if (best == null || candidate.combined > best!!.combined) {
+                                    second = best
+                                    best = candidate
+                                } else if (second == null || candidate.combined > second!!.combined) {
+                                    second = candidate
+                                }
+                            }
+
+                            for (root in roots) {
+                                val stack = java.util.ArrayDeque<AccessibilityNodeInfo>()
+                                stack.add(root)
+                                var scanned = 0
+                                while (stack.isNotEmpty() && scanned++ < 5200) {
+                                    val node = stack.removeLast()
+                                    val count = safeChildCount(node)
+                                    for (i in count - 1 downTo 0) {
+                                        safeChild(node, i)?.let(stack::add)
+                                    }
+
+                                    if (!safeVisible(node) || !safeEnabled(node) || !safeClickable(node)) continue
+                                    val pkg = aarishNodePackage(node)
+                                    if (savedPkg.isNotBlank() && pkg.isNotBlank() && pkg != savedPkg) continue
+
+                                    val b = Rect()
+                                    if (!safeBounds(node, b) || b.width() < 8 || b.height() < 8) continue
+                                    val areaRatio = aarishAreaRatio(b)
+                                    if (areaRatio <= 0f || areaRatio > 0.58f) continue
+
+                                    val key = aarishBoundsKey(b) + ":" + safeClass(node).orEmpty()
+                                    if (!seen.add(key)) continue
+
+                                    val liveHash = aarishVisualDHash(bitmap, b, screenW, screenH) ?: continue
+                                    val visual = aarishVisualFingerprintSimilarity(recordedHash, liveHash)
+                                    if (visual < 0.76f) continue
+
+                                    val shape = aarishShapeSimilarity(b, gesture)
+                                    val role = roleSimilarity(gesture.targetRoleFlags, roleFlagsOf(node))
+                                    val combined = visual * 0.80f + shape * 0.12f + role * 0.08f
+                                    remember(VisualCandidate(Rect(b), visual, combined))
+                                }
+                            }
+
+                            val winner = best
+                            val runner = second
+                            val accepted = winner != null &&
+                                winner.visual >= 0.80f &&
+                                winner.combined >= 0.78f &&
+                                (
+                                    runner == null ||
+                                        winner.combined - runner.combined >= 0.045f ||
+                                        winner.visual - runner.visual >= 0.07f
+                                    )
+
+                            callback(if (accepted) Rect(winner!!.bounds) else null)
+                        } catch (_: Throwable) {
+                            callback(null)
+                        } finally {
+                            try { bitmap.recycle() } catch (_: Throwable) {}
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        callback(null)
+                    }
+                }
+            )
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
 private fun trySmartTargetAfterShortSettle(
         recordedGesture: RecordedGesture,
         runId: Int,
@@ -3187,8 +3423,32 @@ private fun trySmartTargetAfterShortSettle(
         }
 
         // AARISH_DETERMINISTIC_SHORT_SETTLE_V1
-        // Keep polling only the deterministic smart matcher. No model call is allowed
-        // from normal replay, even when the first semantic lookup misses.
+        // Keep polling the deterministic smart matcher. If semantics remain ambiguous,
+        // a tiny on-device visual fingerprint may resolve an icon-only moved control.
+        // This is pure local pixel comparison, not LocalVision/AI/model inference.
+        aarishRequestVisualFingerprintTarget(recordedGesture, runId) { visualBounds ->
+            if (!finished && visualBounds != null && isSamePlaybackRun(runId)) {
+                finished = true
+                currentTask?.let {
+                    try { scheduledTasks.remove(it) } catch (_: Throwable) {}
+                    try { handler.removeCallbacks(it) } catch (_: Throwable) {}
+                }
+
+                val x = visualBounds.left +
+                    recordedGesture.insideXPercent.coerceIn(0f, 1f) * visualBounds.width()
+                val y = visualBounds.top +
+                    recordedGesture.insideYPercent.coerceIn(0f, 1f) * visualBounds.height()
+                aarishDispatchTapWithToken(
+                    x = x,
+                    y = y,
+                    runId = runId,
+                    token = token,
+                    label = "Visual fingerprint click",
+                    tapDurationMs = 105L,
+                    postGapMs = 90L
+                )
+            }
+        }
 
         fun tryClickNow(): Boolean {
             if (!isSamePlaybackRun(runId)) return true
