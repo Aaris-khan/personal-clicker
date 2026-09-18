@@ -1910,7 +1910,9 @@ private fun aarishAiWaitForNextRecordedTarget(
         if (a.isBlank() || b.isBlank()) return false
         if (a == b) return true
         if (b.length <= 5) return a.split(" ").any { it == b }
-        return a.contains(b) || b.contains(a)
+        if (a.contains(b) || b.contains(a)) return true
+        // OCR may confuse one character; keep this conservative and only for longer labels.
+        return tokenSimilarity(a, b) >= 0.86f
     }
 
     private fun aarishOcrMetaValue(raw: String?, key: String): String {
@@ -2027,16 +2029,23 @@ private fun aarishAiWaitForNextRecordedTarget(
         val live = aarishOcrNeighborProfile(liveBox, liveBoxes)
         var score = 0
 
-        fun addExactScore(key: String, points: Int) {
+        fun addNeighborScore(key: String, points: Int) {
             val s = aarishOcrMetaValue(saved, key)
             val l = aarishOcrMetaValue(live, key)
-            if (s.isNotEmpty() && l.isNotEmpty() && s == l) score += points
+            if (s.isEmpty() || l.isEmpty()) return
+            if (s == l) {
+                score += points
+                return
+            }
+            val sim = tokenSimilarity(s, l)
+            if (sim >= 0.88f) score += (points * 0.75f).toInt().coerceAtLeast(1)
+            else if (sim >= 0.72f) score += (points * 0.4f).toInt().coerceAtLeast(1)
         }
 
-        addExactScore("ocr_left", 4)
-        addExactScore("ocr_right", 4)
-        addExactScore("ocr_up", 2)
-        addExactScore("ocr_down", 2)
+        addNeighborScore("ocr_left", 6)
+        addNeighborScore("ocr_right", 6)
+        addNeighborScore("ocr_up", 3)
+        addNeighborScore("ocr_down", 3)
 
         val savedRow = aarishOcrMetaValue(saved, "ocr_row")
         val liveRow = aarishOcrMetaValue(live, "ocr_row")
@@ -2091,13 +2100,21 @@ private fun aarishAiWaitForNextRecordedTarget(
             val live = aarishNormOcr(box.text)
             var best = 0
             for (n in needles) {
+                val sim = tokenSimilarity(live, n)
                 when {
                     live == n -> best = maxOf(best, 1000)
-                    live.split(" ").any { it == n } -> best = maxOf(best, 900)
-                    aarishOcrTextMatches(live, n) -> best = maxOf(best, 760)
+                    live.split(" ").any { it == n } -> best = maxOf(best, 920)
+                    live.contains(n) || n.contains(live) -> best = maxOf(best, 840)
+                    sim >= 0.92f -> best = maxOf(best, 820)
+                    sim >= 0.86f -> best = maxOf(best, 770)
+                    aarishOcrTextMatches(live, n) -> best = maxOf(best, 720)
                 }
             }
             return best
+        }
+
+        fun shapeStrength(box: AarishOcrBox): Int {
+            return (aarishShapeSimilarity(box.bounds, g) * 100f).toInt()
         }
 
         fun distance(box: AarishOcrBox): Float {
@@ -2113,8 +2130,9 @@ private fun aarishAiWaitForNextRecordedTarget(
             .sortedWith(
                 compareByDescending<AarishOcrBox> { box -> textStrength(box) }
                     .thenByDescending { box -> aarishOcrNeighborScore(g.targetSiblingText, box, boxes) }
-                    .thenBy { box -> box.bounds.width() * box.bounds.height() }
+                    .thenByDescending { box -> shapeStrength(box) }
                     .thenBy { box -> distance(box) }
+                    .thenBy { box -> box.bounds.width() * box.bounds.height() }
             )
             .firstOrNull()
     }
