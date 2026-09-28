@@ -120,6 +120,16 @@ class AiSidecarController(private val service: AutoActionService) {
     private var lastOutcome = "Mission started"
     private var lastTargetPackage = ""
 
+    // AARISH_PERSISTENT_VISION_RELAY_V1
+    // Optional mode only: normal Record/Play/local planner behavior stays unchanged.
+    // In this mode the same physical AI app/session is reused and EVERY verified phone
+    // action is followed by a fresh screenshot -> one AI action -> execute -> verify loop.
+    @Volatile private var persistentVisionMode = false
+    private var visionSessionId = ""
+    private var visionTurn = 0
+    private var lockedVisionProvider: Provider? = null
+    private var lockedVisionProviderTaskId: Int? = null
+
     // AARISH_AUTONOMY_PROGRESS_WATCHDOG_V1
     // A verified action is not automatically useful progress. Track the target state
     // across planning turns so repeated WAIT/no-op loops trigger failover instead of
@@ -191,7 +201,11 @@ class AiSidecarController(private val service: AutoActionService) {
         return if (duration >= 450L) "LONG_TAP" else "TAP"
     }
 
-    fun startMission(goal: String, provider: String = "AUTO"): Boolean {
+    fun startMission(
+        goal: String,
+        provider: String = "AUTO",
+        persistentVision: Boolean = false
+    ): Boolean {
         val clean = goal.replace(Regex("[\\u0000-\\u001F]+"), " ").trim().take(6000)
         if (clean.isBlank()) return false
         stop("restart")
@@ -202,6 +216,13 @@ class AiSidecarController(private val service: AutoActionService) {
         rescueEvidenceSteps = emptyList() // AARISH_AI_RESCUE_EVIDENCE_V2_START_CLEAR
         missionGoal = clean
         providerPreference = normalizeProviderPreference(provider)
+        persistentVisionMode = persistentVision
+        visionSessionId = if (persistentVision) {
+            "PV" + UUID.randomUUID().toString().replace("-", "").take(10).uppercase(Locale.US)
+        } else ""
+        visionTurn = 0
+        lockedVisionProvider = null
+        lockedVisionProviderTaskId = null
         missionStep = 0
         failureCount = 0
         lastOutcome = "Mission started"
@@ -286,6 +307,11 @@ class AiSidecarController(private val service: AutoActionService) {
         generation.incrementAndGet()
         missionRunning = false
         waitingForAi = false
+        persistentVisionMode = false
+        visionSessionId = ""
+        visionTurn = 0
+        lockedVisionProvider = null
+        lockedVisionProviderTaskId = null
         rescueMode = false
         rescueExpectedAction = ""
         rescueCallback = null
@@ -311,7 +337,7 @@ class AiSidecarController(private val service: AutoActionService) {
             if (rescueMode) finishRescue(false) else finishMission(false, "retry/step limit")
             return
         }
-        captureTargetScreen(run) { state ->
+        captureTargetScreen(run, forceVisual = persistentVisionMode) { state ->
             if (!alive(run)) return@captureTargetScreen
             if (state == null || state.packageName.isBlank()) {
                 failTurn(run, "Target screen not readable")
@@ -351,9 +377,17 @@ class AiSidecarController(private val service: AutoActionService) {
             // AARISH_LOCAL_FIRST_PLANNER_V1
             // AUTO first tries a conservative on-device plan. Only novel/ambiguous states
             // pay the cost and UI disruption of opening an external AI application.
-            if (tryLocalPlannerTurn(run, state)) return@captureTargetScreen
+            // Persistent Vision deliberately asks the selected physical AI after every
+            // phone action. The normal/local-first path remains exactly as before.
+            if (!persistentVisionMode && tryLocalPlannerTurn(run, state)) return@captureTargetScreen
 
-            val provider = selectProvider(state.packageName)
+            val provider = if (persistentVisionMode) {
+                lockedVisionProvider ?: selectProvider(state.packageName)?.also {
+                    lockedVisionProvider = it
+                }
+            } else {
+                selectProvider(state.packageName)
+            }
             if (provider == null) {
                 val targetAi = Provider.values().firstOrNull { it.packageName == state.packageName }
                 val reason = when {
@@ -369,7 +403,11 @@ class AiSidecarController(private val service: AutoActionService) {
             }
             // AARISH_AI_REQUEST_ID_V4: collision-resistant correlation id for pseudo-API turns.
             val requestId = "A" + UUID.randomUUID().toString().replace("-", "").take(12)
-            val prompt = buildPlannerPrompt(requestId, state)
+            val prompt = if (persistentVisionMode) {
+                buildPersistentVisionPrompt(requestId, state)
+            } else {
+                buildPlannerPrompt(requestId, state)
+            }
             val aiAttachment = if (rescueMode) buildRescueEvidenceAttachment(state.screenshot) else state.screenshot
             askPhysicalAi(run, provider, requestId, prompt, aiAttachment) { command ->
                 if (!alive(run)) return@askPhysicalAi
@@ -490,16 +528,45 @@ class AiSidecarController(private val service: AutoActionService) {
                                 when {
                                     reproduced -> finishRescue(true)
                                     failureCount >= 3 || missionStep >= 6 -> finishRescue(false)
-                                    else -> handler.postDelayed({ nextMissionTurn(run) }, 450L)
+                                    else -> scheduleNextMissionTurn(run)
                                 }
                             } else {
-                                handler.postDelayed({ nextMissionTurn(run) }, 450L)
+                                visionTurn++
+                                scheduleNextMissionTurn(run)
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    private fun scheduleNextMissionTurn(run: Int) {
+        if (!alive(run)) return
+        if (!persistentVisionMode) {
+            handler.postDelayed({ nextMissionTurn(run) }, 450L)
+            return
+        }
+
+        // AARISH_PERSISTENT_VISION_SCREEN_SETTLER_V1
+        // Do not photograph a half-finished scroll/animation. Two matching semantic
+        // fingerprints are enough to release the next visual turn; bounded fallback
+        // prevents a permanently animated screen from deadlocking the mission.
+        var lastFingerprint = ""
+        var stableSamples = 0
+        fun poll(attempt: Int) {
+            if (!alive(run)) return
+            val live = captureStateWithoutScreenshot()
+            val fp = live?.let { "${it.packageName}|${it.fingerprint}" }.orEmpty()
+            if (fp.isNotBlank() && fp == lastFingerprint) stableSamples++ else stableSamples = 0
+            lastFingerprint = fp
+            if (stableSamples >= 2 || attempt >= 14) {
+                handler.postDelayed({ if (alive(run)) nextMissionTurn(run) }, 80L)
+                return
+            }
+            handler.postDelayed({ poll(attempt + 1) }, 120L)
+        }
+        handler.postDelayed({ poll(0) }, 120L)
     }
 
     private fun failTurn(run: Int, reason: String) {
@@ -513,7 +580,8 @@ class AiSidecarController(private val service: AutoActionService) {
         if (failureCount >= maxFailures || missionStep >= maxSteps) {
             if (rescueMode) finishRescue(false) else finishMission(false, reason)
         } else {
-            handler.postDelayed({ nextMissionTurn(run) }, 700L)
+            if (persistentVisionMode) scheduleNextMissionTurn(run)
+            else handler.postDelayed({ nextMissionTurn(run) }, 700L)
         }
     }
 
@@ -742,6 +810,72 @@ class AiSidecarController(private val service: AutoActionService) {
         return candidates.minByOrNull { providerCooldownUntil[it] ?: Long.MAX_VALUE }
     }
 
+    private fun buildPersistentVisionPrompt(requestId: String, state: ScreenState): String {
+        // AARISH_PERSISTENT_VISION_PROMPT_V1
+        // Turn 0 establishes the contract once. Later turns are intentionally tiny so
+        // the physical AI can continue the SAME conversation instead of receiving a
+        // repeated long system-style prompt on every screenshot.
+        val actionable = (
+            state.elements.filter { it.clickable || it.editable }.take(36) +
+                state.elements.filter { !it.clickable && !it.editable }.take(10)
+            ).distinctBy { it.key }.take(46)
+
+        val elementLines = actionable.joinToString("\n") { e ->
+            val label = listOf(e.text, e.desc)
+                .filter { it.isNotBlank() }
+                .joinToString(" / ")
+                .replace(Regex("\\s+"), " ")
+                .take(90)
+            val flags = buildString {
+                append(if (e.clickable) "C" else "-")
+                append(if (e.editable) "E" else "-")
+            }
+            "${e.key}|$flags|${e.className.substringAfterLast('.').take(28)}|${label.take(90)}"
+        }
+
+        val firstTurn = visionTurn == 0
+        return buildString {
+            if (firstTurn) {
+                appendLine("AARISH PERSISTENT VISION SESSION: $visionSessionId")
+                appendLine("Stay in this same conversation until the task is DONE.")
+                appendLine("USER GOAL: ${missionGoal.take(3200)}")
+                appendLine("CONTROL LOOP: You receive a fresh screenshot after EVERY single phone action.")
+                appendLine("Choose exactly ONE next action only. Never batch future clicks or swipes.")
+                appendLine("After TAP/SET_TEXT/SWIPE/BACK/WAIT you will receive the resulting fresh screen.")
+                appendLine("For SWIPE use normalized x1,y1,x2,y2,durationMs so you may request a small precise swipe.")
+                appendLine("Prefer small swipes; inspect the next screenshot before asking for another.")
+                appendLine("OUTPUT CONTRACT:")
+                appendLine("AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
+                appendLine("Allowed ACTION: TAP, TAP_XY, LONG_TAP, SET_TEXT, SWIPE, SCROLL, BACK, HOME, WAIT, OPEN_APP, DONE, FAIL.")
+                appendLine("TAP_XY PAYLOAD=x,y normalized 0..1.")
+                appendLine("SWIPE PAYLOAD=x1,y1,x2,y2,durationMs normalized 0..1; duration 80..1500.")
+                appendLine("SET_TEXT puts text in PAYLOAD and uses the supplied editable ELEMENT key.")
+                appendLine("EXPECTED is required for actions that should visibly change state.")
+                appendLine("VISUAL must echo the exact token visible inside the attached screenshot.")
+                appendLine("No markdown, no explanation, exactly one machine line.")
+            } else {
+                appendLine("AARISH VISION CONTINUE: $visionSessionId")
+                appendLine("TURN: $visionTurn")
+                appendLine("Continue the SAME goal and SAME conversation. Fresh screenshot attached.")
+                appendLine("GOAL REMINDER: ${missionGoal.take(900)}")
+                val checkpoint = actionHistory.takeLast(4).joinToString(" | ") { it.take(180) }
+                appendLine("RECENT CHECKPOINT: ${checkpoint.ifBlank { "none" }}")
+                appendLine("Choose exactly ONE next action; after it you will get another fresh screenshot.")
+                appendLine("Use small precise SWIPE when scrolling is needed.")
+                appendLine("Return exactly: AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
+                appendLine("Allowed: TAP, TAP_XY, LONG_TAP, SET_TEXT, SWIPE, SCROLL, BACK, HOME, WAIT, OPEN_APP, DONE, FAIL.")
+                appendLine("TAP_XY=x,y; SWIPE=x1,y1,x2,y2,durationMs; coordinates normalized 0..1.")
+                appendLine("VISUAL must echo the exact token visible in this fresh screenshot.")
+            }
+            appendLine("REQUEST IDENTIFIER: $requestId")
+            appendLine("CURRENT PACKAGE: ${state.packageName}")
+            appendLine("LAST OUTCOME: ${lastOutcome.take(500)}")
+            appendLine("VISIBLE ELEMENT HINTS (screenshot is authoritative):")
+            appendLine(elementLines.ifBlank { "- none" })
+            appendLine("FINAL RESPONSE must use request id $requestId and end with ::END")
+        }.take(15000)
+    }
+
     private fun buildPlannerPrompt(requestId: String, state: ScreenState): String {
         // AARISH_AI_PROMPT_BUDGET_V7
         // Never truncate the machine contract. Dense UI context is the expendable part.
@@ -948,19 +1082,8 @@ class AiSidecarController(private val service: AutoActionService) {
     ) {
         if (!alive(run)) return
         waitingForAi = true
-        val opened = openProviderWithPayload(provider, prompt, screenshot)
-        if (!opened) {
-            waitingForAi = false
-            callback(null)
-            return
-        }
-        waitForProviderReadyComposer(run, provider, 0, 0) { root ->
-            if (!alive(run)) return@waitForProviderReadyComposer
-            if (root == null) {
-                waitingForAi = false
-                callback(null)
-                return@waitForProviderReadyComposer
-            }
+
+        fun sendFromReadyRoot(root: AccessibilityNodeInfo) {
             ensurePromptAndSend(run, provider, root, prompt) { sent ->
                 if (!alive(run)) return@ensurePromptAndSend
                 if (!sent) {
@@ -971,6 +1094,157 @@ class AiSidecarController(private val service: AutoActionService) {
                 waitForCompleteResponse(run, provider, requestId, callback)
             }
         }
+
+        fun fallbackDirectShare() {
+            val opened = openProviderWithPayload(provider, prompt, screenshot)
+            if (!opened) {
+                waitingForAi = false
+                callback(null)
+                return
+            }
+            waitForProviderReadyComposer(run, provider, 0, 0) { root ->
+                if (!alive(run)) return@waitForProviderReadyComposer
+                if (root == null) {
+                    waitingForAi = false
+                    callback(null)
+                } else {
+                    sendFromReadyRoot(root)
+                }
+            }
+        }
+
+        // AARISH_PERSISTENT_VISION_SESSION_V1
+        // First try to resume the already-running provider task and paste the screenshot
+        // directly into its current composer. This preserves one conversation across turns.
+        // If a provider build refuses rich clipboard paste, the old ACTION_SEND handoff
+        // remains a compatibility fallback instead of breaking normal sidecar behavior.
+        if (persistentVisionMode && screenshot != null && screenshot.exists()) {
+            if (!openProviderSession(provider)) {
+                fallbackDirectShare()
+                return
+            }
+            waitForProviderReadyComposer(run, provider, 0, 0) { root ->
+                if (!alive(run)) return@waitForProviderReadyComposer
+                val composer = root?.let(::findEditable)
+                if (root == null || composer == null) {
+                    fallbackDirectShare()
+                    return@waitForProviderReadyComposer
+                }
+                injectScreenshotViaClipboard(run, provider, composer, screenshot) { injected ->
+                    if (!alive(run)) return@injectScreenshotViaClipboard
+                    if (injected) sendFromReadyRoot(root) else fallbackDirectShare()
+                }
+            }
+            return
+        }
+
+        fallbackDirectShare()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun openProviderSession(provider: Provider): Boolean {
+        // AARISH_PERSISTENT_VISION_TASK_LOCK_V1
+        // Prefer the exact already-running Android task. That preserves the current AI
+        // conversation far better than repeatedly firing the provider's launcher activity.
+        try {
+            val am = service.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+            val remembered = lockedVisionProviderTaskId
+            if (am != null && remembered != null) {
+                try {
+                    am.moveTaskToFront(remembered, 0)
+                    return true
+                } catch (_: Throwable) {
+                    lockedVisionProviderTaskId = null
+                }
+            }
+
+            val tasks = am?.getRecentTasks(
+                50,
+                android.app.ActivityManager.RECENT_IGNORE_UNAVAILABLE
+            ).orEmpty()
+            val hit = tasks.firstOrNull { info ->
+                info.baseIntent?.component?.packageName == provider.packageName ||
+                    info.origActivity?.packageName == provider.packageName
+            }
+            if (hit != null && am != null) {
+                try {
+                    am.moveTaskToFront(hit.id, 0)
+                    lockedVisionProviderTaskId = hit.id
+                    return true
+                } catch (_: Throwable) {}
+            }
+        } catch (_: Throwable) {}
+
+        return try {
+            val launch = service.packageManager.getLaunchIntentForPackage(provider.packageName) ?: return false
+            launch.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            )
+            if (Build.VERSION.SDK_INT >= 24) launch.addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
+            service.startActivity(launch)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun injectScreenshotViaClipboard(
+        run: Int,
+        provider: Provider,
+        composer: AccessibilityNodeInfo,
+        screenshot: File,
+        callback: (Boolean) -> Unit
+    ) {
+        if (!alive(run)) return
+        val cm = try {
+            service.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+        } catch (_: Throwable) { null }
+        if (cm == null) {
+            callback(false)
+            return
+        }
+
+        val uri = try {
+            FileProvider.getUriForFile(service, "${service.packageName}.ai-files", screenshot)
+        } catch (_: Throwable) {
+            callback(false)
+            return
+        }
+        try {
+            service.grantUriPermission(provider.packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (_: Throwable) {}
+
+        val previous = try { cm.primaryClip } catch (_: Throwable) { null }
+        try { composer.performAction(AccessibilityNodeInfo.ACTION_FOCUS) } catch (_: Throwable) {}
+        val baselineSerial = providerUiSerial.get()
+        val accepted = try {
+            cm.setPrimaryClip(ClipData.newUri(service.contentResolver, "Aarish vision frame", uri))
+            composer.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        } catch (_: Throwable) {
+            false
+        }
+
+        if (!accepted) {
+            try {
+                if (previous != null) cm.setPrimaryClip(previous)
+            } catch (_: Throwable) {}
+            callback(false)
+            return
+        }
+
+        // Give rich editors a short attachment-hydration window. A provider UI mutation
+        // is a stronger signal than ACTION_PASTE's boolean alone.
+        handler.postDelayed({
+            if (!alive(run)) return@postDelayed
+            val mutated = providerUiSerial.get() > baselineSerial
+            try {
+                if (previous != null) cm.setPrimaryClip(previous)
+                else cm.setPrimaryClip(ClipData.newPlainText("", ""))
+            } catch (_: Throwable) {}
+            callback(mutated)
+        }, 520L)
     }
 
     private fun openProviderWithPayload(provider: Provider, prompt: String, screenshot: File?): Boolean {
@@ -989,7 +1263,11 @@ class AiSidecarController(private val service: AutoActionService) {
                     // by the verified composer transaction after the provider is ready.
                     clipData = ClipData.newUri(service.contentResolver, "Aarish AI visual evidence", uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    )
                     if (Build.VERSION.SDK_INT >= 24) addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
                 }
                 // Explicit grant makes the handoff independent of implicit URI-grant behavior.
@@ -1386,7 +1664,9 @@ class AiSidecarController(private val service: AutoActionService) {
             // One extra stability sample after generation, two when the app never exposes
             // a generating affordance. This is much faster than waiting for all UI text to freeze.
             val requiredStableSamples = if (sawGenerating) 2 else 3
-            val complete = parsed != null && !generating && stableCommandCount >= requiredStableSamples
+            val complete = parsed != null &&
+                stableCommandCount >= requiredStableSamples &&
+                (!generating || (persistentVisionMode && stableCommandCount >= 2))
             if (complete) {
                 waitingForAi = false
                 callback(parsed)
@@ -1450,7 +1730,7 @@ class AiSidecarController(private val service: AutoActionService) {
             val payload = parts[4].trim()
             val expected = parts[5].trim()
             val visual = parts[6].trim()
-            if (action !in setOf("TAP", "TAP_XY", "LONG_TAP", "SET_TEXT", "SCROLL", "BACK", "HOME", "WAIT", "OPEN_APP", "DONE", "FAIL")) return null
+            if (action !in setOf("TAP", "TAP_XY", "LONG_TAP", "SET_TEXT", "SWIPE", "SCROLL", "BACK", "HOME", "WAIT", "OPEN_APP", "DONE", "FAIL")) return null
             if (element.length > 200 || payload.length > 2400 || expected.length > 1400 || visual.length > 80) return null
 
             return AiCommand(
@@ -1566,6 +1846,45 @@ class AiSidecarController(private val service: AutoActionService) {
         handler.postDelayed({ waitForTargetWindow(run, pkg, attempt + 1, callback) }, 250L)
     }
 
+    private fun performNormalizedSwipe(payloadRaw: String, captureBounds: Rect?): Boolean {
+        if (Build.VERSION.SDK_INT < 24) return false
+        val nums = payloadRaw.split(',').mapNotNull { it.trim().toFloatOrNull() }
+        if (nums.size < 4) return false
+        val x1 = nums[0].coerceIn(0f, 1f)
+        val y1 = nums[1].coerceIn(0f, 1f)
+        val x2 = nums[2].coerceIn(0f, 1f)
+        val y2 = nums[3].coerceIn(0f, 1f)
+        val duration = (nums.getOrNull(4)?.toLong() ?: 260L).coerceIn(80L, 1500L)
+
+        val bounds = captureBounds?.takeIf { it.width() > 1 && it.height() > 1 }
+            ?: Rect(
+                0,
+                0,
+                service.resources.displayMetrics.widthPixels.coerceAtLeast(2),
+                service.resources.displayMetrics.heightPixels.coerceAtLeast(2)
+            )
+        val sx = bounds.left + bounds.width() * x1
+        val sy = bounds.top + bounds.height() * y1
+        val ex = bounds.left + bounds.width() * x2
+        val ey = bounds.top + bounds.height() * y2
+
+        val path = Path().apply {
+            moveTo(sx, sy)
+            lineTo(ex, ey)
+        }
+        return try {
+            service.dispatchGesture(
+                GestureDescription.Builder()
+                    .addStroke(GestureDescription.StrokeDescription(path, 0L, duration))
+                    .build(),
+                null,
+                null
+            )
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     private fun performDirectionalSwipe(directionRaw: String): Boolean {
         if (Build.VERSION.SDK_INT < 24) return false
         val direction = directionRaw.trim().uppercase(Locale.US)
@@ -1642,6 +1961,12 @@ class AiSidecarController(private val service: AutoActionService) {
                 } else {
                     callback(clickNode(live), "Tapped ${saved.key}")
                 }
+            }
+            "SWIPE" -> {
+                callback(
+                    performNormalizedSwipe(command.payload, state.captureBounds),
+                    "Precise visual swipe ${command.payload.take(80)}"
+                )
             }
             "SCROLL" -> {
                 val direction = command.payload.trim().uppercase(Locale.US)
@@ -1787,7 +2112,7 @@ class AiSidecarController(private val service: AutoActionService) {
                     wantedPkg != null && now?.packageName == wantedPkg &&
                         (before.packageName != wantedPkg || changed)
                 }
-                "TAP", "TAP_XY", "LONG_TAP", "SCROLL" -> when {
+                "TAP", "TAP_XY", "LONG_TAP", "SWIPE", "SCROLL" -> when {
                     expected.startsWith("PACKAGE=", ignoreCase = true) -> expectedTransition
                     expected.equals("CLIPBOARD_CHANGE", ignoreCase = true) -> clipChanged
                     expected.equals("STATE_CHANGE", ignoreCase = true) -> changed
@@ -1818,7 +2143,7 @@ class AiSidecarController(private val service: AutoActionService) {
 
             if (attempt >= 16 || SystemClock.elapsedRealtime() - started > 5200L) {
                 val reason = when {
-                    command.action in setOf("TAP", "TAP_XY", "LONG_TAP", "SCROLL") && expected.isBlank() && !rescueMode ->
+                    command.action in setOf("TAP", "TAP_XY", "LONG_TAP", "SWIPE", "SCROLL") && expected.isBlank() && !rescueMode ->
                         "planner supplied no observable post-condition"
                     expected.isNotBlank() -> "expected post-condition not observed: ${expected.take(120)}"
                     else -> "no action-specific proof observed"
@@ -1877,6 +2202,7 @@ class AiSidecarController(private val service: AutoActionService) {
     private fun captureTargetScreen(
         run: Int,
         attempt: Int = 0,
+        forceVisual: Boolean = false,
         callback: (ScreenState?) -> Unit
     ) {
         if (!alive(run)) return
@@ -1887,7 +2213,7 @@ class AiSidecarController(private val service: AutoActionService) {
         val captureBounds = windowBounds?.let(::Rect)
 
         // Semantic-first: no bitmap, no temp file, no provider image attachment.
-        if (!shouldCaptureVisualForPlanner(base)) {
+        if (!forceVisual && !shouldCaptureVisualForPlanner(base)) {
             rememberHistory("SEMANTIC-FIRST: visual capture skipped for ${base.packageName}")
             callback(base.copy(screenshot = null, captureBounds = captureBounds))
             return
@@ -1922,9 +2248,21 @@ class AiSidecarController(private val service: AutoActionService) {
                 if (!stable) {
                     try { file?.delete() } catch (_: Throwable) {}
                     if (attempt < 3) {
-                        handler.postDelayed({ captureTargetScreen(run, attempt + 1, callback) }, 180L)
+                        handler.postDelayed({ captureTargetScreen(run, attempt + 1, forceVisual, callback) }, 180L)
                     } else {
                         rememberHistory("CAPTURE REJECTED: target state kept changing")
+                        callback(null)
+                    }
+                    return@captureScreenshot
+                }
+
+                if (forceVisual && file == null) {
+                    if (attempt < 3) {
+                        handler.postDelayed({
+                            captureTargetScreen(run, attempt + 1, forceVisual, callback)
+                        }, 180L)
+                    } else {
+                        rememberHistory("PERSISTENT VISION: screenshot unavailable")
                         callback(null)
                     }
                     return@captureScreenshot
@@ -2801,7 +3139,7 @@ class AiSidecarController(private val service: AutoActionService) {
         val commitLike = commitTerms.any(local::contains)
 
         return when (command.action) {
-            "WAIT", "BACK", "HOME", "OPEN_APP", "SCROLL" -> false
+            "WAIT", "BACK", "HOME", "OPEN_APP", "SWIPE", "SCROLL" -> false
             "SET_TEXT" -> localSecret || localHighRisk
             "TAP", "LONG_TAP" -> localHighRisk || (missionHighRisk && commitLike)
             "TAP_XY" -> {

@@ -5421,6 +5421,14 @@ private fun showAiMissionDialogV1() {
         setHintTextColor(android.graphics.Color.LTGRAY)
     }
 
+    val persistentVisionCheck = android.widget.CheckBox(this).apply {
+        text = "📸 Persistent Vision Relay — har action ke baad fresh screenshot, same AI chat"
+        setTextColor(android.graphics.Color.WHITE)
+        textSize = 12f
+        isChecked = false
+        setPadding(0, dp(6), 0, dp(6))
+    }
+
     val providerGroup = android.widget.RadioGroup(this).apply {
         orientation = android.widget.RadioGroup.HORIZONTAL
         gravity = android.view.Gravity.CENTER
@@ -5439,7 +5447,7 @@ private fun showAiMissionDialogV1() {
         orientation = android.widget.LinearLayout.VERTICAL
         setPadding(dp(12), dp(8), dp(12), dp(8))
         addView(android.widget.TextView(this@FloatingControlService).apply {
-            text = "Prompt-only autonomous mode • recording ki zaroorat nahi.\nAI sirf next bounded action choose karega; app execute + verify karega."
+            text = "Normal mode: local-first planner + AI fallback.\nPersistent Vision Relay optional hai: har single action ke baad fresh screenshot same AI conversation me bheja jayega."
             setTextColor(android.graphics.Color.LTGRAY)
             textSize = 12f
             setPadding(0, 0, 0, dp(8))
@@ -5448,6 +5456,7 @@ private fun showAiMissionDialogV1() {
             android.view.ViewGroup.LayoutParams.MATCH_PARENT,
             android.view.ViewGroup.LayoutParams.WRAP_CONTENT
         ))
+        addView(persistentVisionCheck)
         addView(providerGroup)
     }
 
@@ -5470,10 +5479,16 @@ private fun showAiMissionDialogV1() {
                 return@setOnClickListener
             }
 
-            val started = AutoActionService.startAutonomousMission(this, goal, provider)
+            val started = AutoActionService.startAutonomousMission(
+                context = this,
+                goal = goal,
+                provider = provider,
+                persistentVision = persistentVisionCheck.isChecked
+            )
             if (started) {
                 dialog.dismiss()
-                Toast.makeText(this, "🤖 Mission started • $provider", Toast.LENGTH_SHORT).show()
+                val mode = if (persistentVisionCheck.isChecked) "VISION" else "NORMAL"
+                Toast.makeText(this, "🤖 Mission started • $provider • $mode", Toast.LENGTH_SHORT).show()
             }
         }
     }

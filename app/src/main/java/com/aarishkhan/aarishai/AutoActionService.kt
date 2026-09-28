@@ -240,7 +240,12 @@ class AutoActionService : AccessibilityService() {
 
 
         // AARISH_AI_SIDECAR_BRIDGE_V1
-        fun startAutonomousMission(context: Context, goal: String, provider: String = "AUTO"): Boolean {
+        fun startAutonomousMission(
+            context: Context,
+            goal: String,
+            provider: String = "AUTO",
+            persistentVision: Boolean = false
+        ): Boolean {
             val service = instance
             if (service == null) {
                 Toast.makeText(context, "Accessibility Service ready nahi hai", Toast.LENGTH_SHORT).show()
@@ -256,7 +261,11 @@ class AutoActionService : AccessibilityService() {
             }
 
             if (service.isPlayingInternal) service.stopPlaybackInternal()
-            return service.aiSidecarController.startMission(goal, provider)
+            return service.aiSidecarController.startMission(
+                goal = goal,
+                provider = provider,
+                persistentVision = persistentVision
+            )
         }
 
         fun stopAiAgent(context: Context): Boolean {
