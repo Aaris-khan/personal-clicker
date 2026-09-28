@@ -857,6 +857,9 @@ class AiSidecarController(private val service: AutoActionService) {
                 appendLine("AARISH VISION CONTINUE: $visionSessionId")
                 appendLine("TURN: $visionTurn")
                 appendLine("Continue the SAME goal and SAME conversation. Fresh screenshot attached.")
+                appendLine("GOAL REMINDER: ${missionGoal.take(900)}")
+                val checkpoint = actionHistory.takeLast(4).joinToString(" | ") { it.take(180) }
+                appendLine("RECENT CHECKPOINT: ${checkpoint.ifBlank { "none" }}")
                 appendLine("Choose exactly ONE next action; after it you will get another fresh screenshot.")
                 appendLine("Use small precise SWIPE when scrolling is needed.")
                 appendLine("Return exactly: AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
