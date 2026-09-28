@@ -128,6 +128,7 @@ class AiSidecarController(private val service: AutoActionService) {
     private var visionSessionId = ""
     private var visionTurn = 0
     private var lockedVisionProvider: Provider? = null
+    private var lockedVisionProviderTaskId: Int? = null
 
     // AARISH_AUTONOMY_PROGRESS_WATCHDOG_V1
     // A verified action is not automatically useful progress. Track the target state
@@ -221,6 +222,7 @@ class AiSidecarController(private val service: AutoActionService) {
         } else ""
         visionTurn = 0
         lockedVisionProvider = null
+        lockedVisionProviderTaskId = null
         missionStep = 0
         failureCount = 0
         lastOutcome = "Mission started"
@@ -309,6 +311,7 @@ class AiSidecarController(private val service: AutoActionService) {
         visionSessionId = ""
         visionTurn = 0
         lockedVisionProvider = null
+        lockedVisionProviderTaskId = null
         rescueMode = false
         rescueExpectedAction = ""
         rescueCallback = null
@@ -891,8 +894,7 @@ class AiSidecarController(private val service: AutoActionService) {
             appendLine("Return exactly ONE plain-text machine line, no markdown and no prose:")
             appendLine("AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
             appendLine("Replace <request-id> with the exact REQUEST IDENTIFIER value shown in this request.")
-            appendLine("Allowed ACTION values only: TAP, TAP_XY, LONG_TAP, SET_TEXT, SWIPE, SCROLL, BACK, HOME, WAIT, OPEN_APP, DONE, FAIL.")
-            appendLine("SWIPE: PAYLOAD=x1,y1,x2,y2,durationMs with normalized coordinates 0..1.")
+            appendLine("Allowed ACTION values only: TAP, TAP_XY, LONG_TAP, SET_TEXT, SCROLL, BACK, HOME, WAIT, OPEN_APP, DONE, FAIL.")
             appendLine("Never place the delimiter sequence :: inside ELEMENT, PAYLOAD, EXPECTED, or VISUAL.")
             appendLine("VISUAL = exact pixel token from the attached image; NONE if no image is attached; MISSING only if an expected image cannot be read. Never invent a token.")
             appendLine("END must be the final literal field. Do not emit the machine line until every preceding field is complete.")
@@ -1136,7 +1138,40 @@ class AiSidecarController(private val service: AutoActionService) {
         fallbackDirectShare()
     }
 
+    @Suppress("DEPRECATION")
     private fun openProviderSession(provider: Provider): Boolean {
+        // AARISH_PERSISTENT_VISION_TASK_LOCK_V1
+        // Prefer the exact already-running Android task. That preserves the current AI
+        // conversation far better than repeatedly firing the provider's launcher activity.
+        try {
+            val am = service.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+            val remembered = lockedVisionProviderTaskId
+            if (am != null && remembered != null) {
+                try {
+                    am.moveTaskToFront(remembered, 0)
+                    return true
+                } catch (_: Throwable) {
+                    lockedVisionProviderTaskId = null
+                }
+            }
+
+            val tasks = am?.getRecentTasks(
+                50,
+                android.app.ActivityManager.RECENT_IGNORE_UNAVAILABLE
+            ).orEmpty()
+            val hit = tasks.firstOrNull { info ->
+                info.baseIntent?.component?.packageName == provider.packageName ||
+                    info.origActivity?.packageName == provider.packageName
+            }
+            if (hit != null && am != null) {
+                try {
+                    am.moveTaskToFront(hit.id, 0)
+                    lockedVisionProviderTaskId = hit.id
+                    return true
+                } catch (_: Throwable) {}
+            }
+        } catch (_: Throwable) {}
+
         return try {
             val launch = service.packageManager.getLaunchIntentForPackage(provider.packageName) ?: return false
             launch.addFlags(
