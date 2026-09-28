@@ -1072,6 +1072,29 @@ class AiSidecarController(private val service: AutoActionService) {
         }
     }
 
+    private fun visionSessionMarkerVisible(root: AccessibilityNodeInfo): Boolean {
+        // AARISH_PERSISTENT_VISION_SESSION_GUARD_V2
+        // Turn 0 has no prior transcript marker yet. From turn 1 onward, refuse to
+        // submit anything unless the currently visible provider conversation proves
+        // it belongs to this mission. This prevents screenshots/prompts leaking into
+        // a different ChatGPT/Gemini chat if the user or Android switches threads.
+        if (!persistentVisionMode || visionTurn <= 0 || visionSessionId.isBlank()) return true
+
+        var found = false
+        walk(root, 6000) { node ->
+            if (found) return@walk
+            val editable = try { node.isEditable } catch (_: Throwable) { false }
+            if (editable) return@walk
+            val visible = buildString {
+                append(try { node.text?.toString().orEmpty() } catch (_: Throwable) { "" })
+                append(' ')
+                append(try { node.contentDescription?.toString().orEmpty() } catch (_: Throwable) { "" })
+            }
+            if (visible.contains(visionSessionId, ignoreCase = true)) found = true
+        }
+        return found
+    }
+
     private fun askPhysicalAi(
         run: Int,
         provider: Provider,
@@ -1084,6 +1107,14 @@ class AiSidecarController(private val service: AutoActionService) {
         waitingForAi = true
 
         fun sendFromReadyRoot(root: AccessibilityNodeInfo) {
+            if (persistentVisionMode && !visionSessionMarkerVisible(root)) {
+                // Fail closed: the provider app is open, but this is not provably the
+                // mission's existing conversation. Do not paste/send into an unknown chat.
+                rememberHistory("VISION SESSION GUARD: marker $visionSessionId missing on turn $visionTurn; send refused")
+                waitingForAi = false
+                callback(null)
+                return
+            }
             ensurePromptAndSend(run, provider, root, prompt) { sent ->
                 if (!alive(run)) return@ensurePromptAndSend
                 if (!sent) {
