@@ -25,3 +25,5 @@ jobs:
           gradle-version: '8.2'
       - name: Unit tests and debug compile
         run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+
+# trigger after workflow registration
