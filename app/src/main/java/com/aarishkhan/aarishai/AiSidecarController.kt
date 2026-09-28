@@ -859,6 +859,7 @@ class AiSidecarController(private val service: AutoActionService) {
                 appendLine("Return exactly: AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
                 appendLine("Allowed: TAP, TAP_XY, LONG_TAP, SET_TEXT, SWIPE, SCROLL, BACK, HOME, WAIT, OPEN_APP, DONE, FAIL.")
                 appendLine("TAP_XY=x,y; SWIPE=x1,y1,x2,y2,durationMs; coordinates normalized 0..1.")
+                appendLine("VISUAL must echo the exact token visible in this fresh screenshot.")
             }
             appendLine("REQUEST IDENTIFIER: $requestId")
             appendLine("CURRENT PACKAGE: ${state.packageName}")
@@ -3100,7 +3101,7 @@ class AiSidecarController(private val service: AutoActionService) {
         val commitLike = commitTerms.any(local::contains)
 
         return when (command.action) {
-            "WAIT", "BACK", "HOME", "OPEN_APP", "SCROLL" -> false
+            "WAIT", "BACK", "HOME", "OPEN_APP", "SWIPE", "SCROLL" -> false
             "SET_TEXT" -> localSecret || localHighRisk
             "TAP", "LONG_TAP" -> localHighRisk || (missionHighRisk && commitLike)
             "TAP_XY" -> {
