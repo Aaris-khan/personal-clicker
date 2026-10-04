@@ -45,10 +45,43 @@ jobs:
           PY
 
       - name: Apply source upgrades
+        shell: bash
         run: |
           set -euo pipefail
           python3 scripts/teach_ai_v2_patch.py
-          python3 scripts/remove_blocked_window_api.py
+          python3 - <<'PY'
+          from pathlib import Path
+          paths = [
+              Path('app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt'),
+              Path('app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt'),
+          ]
+          for path in paths:
+              lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+              hit = next((i for i, line in enumerate(lines) if '"setLaunchWindowingMode"' in line), None)
+              if hit is None:
+                  continue
+              start = hit
+              while start >= 0 and lines[start].strip() != 'try {':
+                  start -= 1
+              if start < 0:
+                  raise SystemExit(f'cannot find try block in {path}')
+              catch = hit
+              while catch < len(lines) and 'catch (_: Throwable)' not in lines[catch]:
+                  catch += 1
+              if catch >= len(lines):
+                  raise SystemExit(f'cannot find catch block in {path}')
+              end = catch + 1
+              while end < len(lines) and lines[end].strip() != '}':
+                  end += 1
+              if end >= len(lines):
+                  raise SystemExit(f'cannot find catch close in {path}')
+              del lines[start:end + 1]
+              if start < len(lines) and lines[start].strip() == '':
+                  del lines[start]
+              path.write_text(''.join(lines), encoding='utf-8')
+              if 'setLaunchWindowingMode' in path.read_text(encoding='utf-8'):
+                  raise SystemExit(f'blocked API still present in {path}')
+          PY
           git diff --check
 
       - name: Unit tests and APK compile
