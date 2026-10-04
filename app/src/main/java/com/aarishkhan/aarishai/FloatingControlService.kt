@@ -4672,16 +4672,6 @@ private fun aarishDesktopV4LaunchFromFloat(pkg: String, activity: String, mode: 
 
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
             try {
-                val m = android.app.ActivityOptions::class.java.getDeclaredMethod(
-                    "setLaunchWindowingMode",
-                    java.lang.Integer.TYPE
-                )
-                m.isAccessible = true
-                m.invoke(opts, if (floating) 5 else 1)
-            } catch (_: Throwable) {
-            }
-
-            try {
                 opts.setLaunchBounds(launchBounds())
             } catch (_: Throwable) {
             }
@@ -5409,55 +5399,128 @@ private fun showAarishAppLauncher() {
 
 
 // AARISH_AI_MISSION_DIALOG_V1
+// AARISH_TEACH_YOUR_AI_V2_DIALOG
+private data class AiProviderChoiceV2(val label: String, val packageName: String)
+
+private fun showAiProviderPickerV2(onSelected: (String, String) -> Unit) {
+    val base = android.content.Intent(android.content.Intent.ACTION_MAIN).apply {
+        addCategory(android.content.Intent.CATEGORY_LAUNCHER)
+    }
+    val likely = listOf("chatgpt", "gemini", "claude", "copilot", "perplexity", "deepseek", "grok", "assistant", " ai", "llm")
+    val apps = try {
+        packageManager.queryIntentActivities(base, 0)
+            .mapNotNull { info ->
+                val pkg = info.activityInfo?.packageName.orEmpty().trim()
+                val label = info.loadLabel(packageManager)?.toString().orEmpty().replace(Regex("\\s+"), " ").trim()
+                if (pkg.isBlank() || label.isBlank() || pkg == packageName) null
+                else AiProviderChoiceV2(label.take(80), pkg.take(220))
+            }
+            .distinctBy { it.packageName }
+            .sortedWith(compareBy<AiProviderChoiceV2>(
+                { item ->
+                    val hay = (item.label + " " + item.packageName).lowercase(java.util.Locale.US)
+                    if (likely.any(hay::contains)) 0 else 1
+                },
+                { it.label.lowercase(java.util.Locale.US) }
+            ))
+            .take(240)
+    } catch (_: Throwable) { emptyList() }
+
+    if (apps.isEmpty()) {
+        Toast.makeText(this, "Installed apps list nahi mili", Toast.LENGTH_SHORT).show()
+        return
+    }
+    val rows = apps.map { "${it.label}\n${it.packageName}" }.toTypedArray()
+    val dialog = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+        .setTitle("🧠 Teach / Choose AI app")
+        .setItems(rows) { _, which -> apps.getOrNull(which)?.let { onSelected(it.label, it.packageName) } }
+        .setNegativeButton("Cancel", null)
+        .create()
+    showOverlayDialogSafely(dialog)
+}
+
 private fun showAiMissionDialogV1() {
+    val prefs = getSharedPreferences("aarish_ai_provider_v2", Context.MODE_PRIVATE)
+    var customPkg = prefs.getString("custom_pkg", "").orEmpty().trim()
+    var customLabel = prefs.getString("custom_label", "Other AI").orEmpty().trim().ifBlank { "Other AI" }
     var provider = "AUTO"
 
     val input = android.widget.EditText(this).apply {
-        hint = "Kya kaam karwana hai? Example: ChatGPT kholo, latest photo attach karo aur answer Notes me save karo"
+        hint = "Kya kaam karwana hai? Example: WhatsApp kholo aur Guided Rails ko Hi bhejo"
         minLines = 3
         maxLines = 8
         setPadding(dp(12), dp(10), dp(12), dp(10))
         setTextColor(android.graphics.Color.WHITE)
         setHintTextColor(android.graphics.Color.LTGRAY)
     }
-
-    val persistentVisionCheck = android.widget.CheckBox(this).apply {
-        text = "📸 Persistent Vision Relay — har action ke baad fresh screenshot, same AI chat"
+    val vision = android.widget.CheckBox(this).apply {
+        text = "📸 Teach Your AI — same chat + fresh screenshot after every action"
         setTextColor(android.graphics.Color.WHITE)
         textSize = 12f
-        isChecked = false
-        setPadding(0, dp(6), 0, dp(6))
+        isChecked = true
     }
-
-    val providerGroup = android.widget.RadioGroup(this).apply {
+    val selected = android.widget.TextView(this).apply {
+        text = "AI brain: AUTO"
+        setTextColor(android.graphics.Color.rgb(125, 211, 252))
+        textSize = 12f
+    }
+    val group = android.widget.RadioGroup(this).apply {
         orientation = android.widget.RadioGroup.HORIZONTAL
         gravity = android.view.Gravity.CENTER
     }
     listOf("AUTO", "CHATGPT", "GEMINI").forEachIndexed { index, name ->
-        providerGroup.addView(android.widget.RadioButton(this).apply {
+        group.addView(android.widget.RadioButton(this).apply {
             id = 7100 + index
             text = name
             setTextColor(android.graphics.Color.WHITE)
             isChecked = name == "AUTO"
-            setOnCheckedChangeListener { _, checked -> if (checked) provider = name }
+            setOnCheckedChangeListener { _, checked ->
+                if (checked) {
+                    provider = name
+                    selected.text = "AI brain: $name"
+                }
+            }
         })
     }
+    val choose = android.widget.Button(this).apply {
+        isAllCaps = false
+        text = if (customPkg.isBlank()) "🧠 Choose another AI app" else "🧠 Other AI: $customLabel"
+        setOnClickListener {
+            showAiProviderPickerV2 { label, pkg ->
+                customLabel = label
+                customPkg = pkg
+                prefs.edit().putString("custom_pkg", pkg).putString("custom_label", label).apply()
+                group.clearCheck()
+                provider = "PKG:$pkg"
+                selected.text = "AI brain: $label"
+                text = "🧠 Other AI: $label"
+            }
+        }
+    }
+    val useSaved = if (customPkg.isNotBlank()) android.widget.Button(this).apply {
+        isAllCaps = false
+        text = "Use saved: $customLabel"
+        setOnClickListener {
+            group.clearCheck()
+            provider = "PKG:$customPkg"
+            selected.text = "AI brain: $customLabel"
+        }
+    } else null
 
     val box = android.widget.LinearLayout(this).apply {
         orientation = android.widget.LinearLayout.VERTICAL
         setPadding(dp(12), dp(8), dp(12), dp(8))
         addView(android.widget.TextView(this@FloatingControlService).apply {
-            text = "Normal mode: local-first planner + AI fallback.\nPersistent Vision Relay optional hai: har single action ke baad fresh screenshot same AI conversation me bheja jayega."
+            text = "No fixed button coordinates: AI composer/send/reply are rediscovered each turn. UI badle to engine re-detect karta hai."
             setTextColor(android.graphics.Color.LTGRAY)
             textSize = 12f
-            setPadding(0, 0, 0, dp(8))
         })
-        addView(input, android.widget.LinearLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-        ))
-        addView(persistentVisionCheck)
-        addView(providerGroup)
+        addView(input)
+        addView(vision)
+        addView(group)
+        addView(selected)
+        addView(choose)
+        useSaved?.let { addView(it) }
     }
 
     val dialog = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
@@ -5466,7 +5529,6 @@ private fun showAiMissionDialogV1() {
         .setPositiveButton("START", null)
         .setNegativeButton("Cancel", null)
         .create()
-
     dialog.setOnShowListener {
         dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
             val goal = input.text?.toString().orEmpty().trim()
@@ -5475,24 +5537,22 @@ private fun showAiMissionDialogV1() {
                 return@setOnClickListener
             }
             if (!parkRecordingForAutonomousMission()) {
-                Toast.makeText(this, "Recording glass safely park nahi hua; mission start roka gaya", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Recording safely park nahi hua; mission start roka gaya", Toast.LENGTH_LONG).show()
                 return@setOnClickListener
             }
-
             val started = AutoActionService.startAutonomousMission(
                 context = this,
                 goal = goal,
                 provider = provider,
-                persistentVision = persistentVisionCheck.isChecked
+                persistentVision = vision.isChecked
             )
             if (started) {
                 dialog.dismiss()
-                val mode = if (persistentVisionCheck.isChecked) "VISION" else "NORMAL"
-                Toast.makeText(this, "🤖 Mission started • $provider • $mode", Toast.LENGTH_SHORT).show()
+                val brain = if (provider.startsWith("PKG:", true)) customLabel else provider
+                Toast.makeText(this, "🤖 Mission launching • $brain", Toast.LENGTH_SHORT).show()
             }
         }
     }
-
     showOverlayDialogSafely(dialog)
 }
 
