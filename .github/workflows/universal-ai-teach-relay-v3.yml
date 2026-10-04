@@ -53,6 +53,7 @@ jobs:
           # Earlier v3/v3.1/v3.2/v3.3 logic is already committed in source. Re-running
           # historical shape-dependent patchers is intentionally forbidden here.
           python3 scripts/universal_ai_teach_relay_v3_4_copy_latest.py
+          python3 scripts/universal_ai_teach_relay_v3_6_verify_teaching.py
           git diff --check
 
       - name: Unit tests and APK compile
@@ -105,6 +106,8 @@ jobs:
 
           git config user.name 'Aaris-khan'
           git config user.email 'hhakmuddin8@gmail.com'
-          git add app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
-          git commit -m 'Finalize safe latest-response AI relay [skip ci]'
+          git add \
+            app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt \
+            app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt
+          git commit -m 'Finalize verified AI Teach Relay [skip ci]'
           git push origin HEAD:upgrade/universal-ai-teach-relay-v3
