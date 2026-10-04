@@ -452,6 +452,54 @@ class AutoActionService : AccessibilityService() {
         return pasted
     }
 
+    // AARISH_AI_TEACH_VERIFIED_CALIBRATION_V36
+    private fun aiTeachLiteralOutsideComposerV36(
+        root: AccessibilityNodeInfo,
+        literal: String
+    ): Boolean {
+        if (literal.isBlank()) return false
+        var found = false
+        walkAiTeachV3(root) { node ->
+            if (found) return@walkAiTeachV3
+            val editable = try { node.isEditable } catch (_: Throwable) { false }
+            if (editable) return@walkAiTeachV3
+            val value = buildString {
+                append(try { node.text?.toString().orEmpty() } catch (_: Throwable) { "" })
+                append(' ')
+                append(try { node.contentDescription?.toString().orEmpty() } catch (_: Throwable) { "" })
+            }
+            if (value.contains(literal)) found = true
+        }
+        return found
+    }
+
+    private fun aiTeachComposerContainsV36(
+        root: AccessibilityNodeInfo,
+        literal: String
+    ): Boolean {
+        if (literal.isBlank()) return false
+        val composer = findAiTeachComposerV3(root) ?: return false
+        val value = buildString {
+            append(try { composer.text?.toString().orEmpty() } catch (_: Throwable) { "" })
+            append(' ')
+            append(try { composer.contentDescription?.toString().orEmpty() } catch (_: Throwable) { "" })
+        }
+        return value.contains(literal)
+    }
+
+    private fun aiTeachClipboardTextV36(): String {
+        val cm = try {
+            getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+        } catch (_: Throwable) { null } ?: return ""
+        return try {
+            val clip = cm.primaryClip ?: return ""
+            if (clip.itemCount <= 0) return ""
+            clip.getItemAt(0).coerceToText(this)?.toString().orEmpty()
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
     private fun startAiRelayTeachingInternalV3(providerRaw: String) {
         val pkg = resolveAiTeachProviderPackageV3(providerRaw)
         if (pkg.isBlank()) {
@@ -489,41 +537,110 @@ class AutoActionService : AccessibilityService() {
                         Toast.makeText(this, "SEND learn nahi hua; dobara Teach chalao", Toast.LENGTH_LONG).show()
                         return@armAiTeachTapV3
                     }
-                    // AARISH_AI_TEACH_SAVE_SEND_EARLY_V31
-                    // SEND is the critical learned control. Save it immediately; COPY is optional.
-                    val sendSaved = AiTeachProfileStore.saveVerifiedRole(
-                        this,
-                        pkg,
-                        AiTeachProfileStore.ROLE_SEND,
-                        sendSnapshot
-                    )
-                    if (!sendSaved || !AiTeachProfileStore.isReady(this, pkg)) {
-                        Toast.makeText(this, "SEND profile save verify nahi hua", Toast.LENGTH_LONG).show()
-                        return@armAiTeachTapV3
-                    }
-                    Toast.makeText(this, "✅ SEND learned • reply complete ho to COPY tap karke fallback bhi sikhao", Toast.LENGTH_LONG).show()
+                    // AARISH_AI_TEACH_VERIFIED_CALIBRATION_V36
+                    // Do not persist a guessed SEND. The demonstrated tap has already been
+                    // replayed into the provider; now prove that the calibration prompt left
+                    // the composer and appeared in the conversation, or that the exact reply
+                    // token became visible. Wrong taps therefore fail closed instead of becoming
+                    // a long-lived provider profile.
+                    fun saveVerifiedSendAndArmCopy() {
+                        val sendSaved = AiTeachProfileStore.saveVerifiedRole(
+                            this,
+                            pkg,
+                            AiTeachProfileStore.ROLE_SEND,
+                            sendSnapshot
+                        )
+                        if (!sendSaved || !AiTeachProfileStore.isReady(this, pkg)) {
+                            Toast.makeText(this, "SEND profile save verify nahi hua", Toast.LENGTH_LONG).show()
+                            return
+                        }
+                        Toast.makeText(
+                            this,
+                            "✅ SEND verified • reply complete ho to COPY tap karke fallback bhi sikhao",
+                            Toast.LENGTH_LONG
+                        ).show()
 
-                    // Do not use a fixed AI wait. The teaching layer waits for the user's next tap,
-                    // so slow/fast providers are both supported without recording a brittle delay.
-                    handler.postDelayed({
-                        fcs.armAiTeachTapV3(AiTeachProfileStore.ROLE_COPY, pkg) { copySnapshot ->
-                            if (copySnapshot == null) {
-                                Toast.makeText(this, "✅ SEND saved • COPY optional training skipped", Toast.LENGTH_LONG).show()
-                                return@armAiTeachTapV3
+                        val cm = try {
+                            getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                        } catch (_: Throwable) { null }
+                        val previousClip = try { cm?.primaryClip } catch (_: Throwable) { null }
+
+                        fun restoreTeachClipboard() {
+                            try {
+                                if (cm != null) {
+                                    if (previousClip != null) cm.setPrimaryClip(previousClip)
+                                    else cm.setPrimaryClip(android.content.ClipData.newPlainText("", ""))
+                                }
+                            } catch (_: Throwable) {}
+                        }
+
+                        // No fixed AI-generation delay is recorded. The transparent teaching layer
+                        // can stay armed while the user waits/scrolls to the final reply action row.
+                        handler.postDelayed({
+                            fcs.armAiTeachTapV3(AiTeachProfileStore.ROLE_COPY, pkg) { copySnapshot ->
+                                if (copySnapshot == null) {
+                                    restoreTeachClipboard()
+                                    Toast.makeText(this, "✅ SEND saved • COPY optional training skipped", Toast.LENGTH_LONG).show()
+                                    return@armAiTeachTapV3
+                                }
+
+                                // The calibration response is exactly `token`. A visually similar
+                                // old COPY button cannot be trusted unless it copied this turn's token.
+                                handler.postDelayed({
+                                    val copied = aiTeachClipboardTextV36()
+                                    restoreTeachClipboard()
+                                    if (!copied.contains(token)) {
+                                        Toast.makeText(
+                                            this,
+                                            "COPY verify nahi hua • SEND safe hai, COPY dobara Teach karo",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                        return@postDelayed
+                                    }
+                                    val copySaved = AiTeachProfileStore.saveVerifiedRole(
+                                        this,
+                                        pkg,
+                                        AiTeachProfileStore.ROLE_COPY,
+                                        copySnapshot
+                                    )
+                                    Toast.makeText(
+                                        this,
+                                        if (copySaved) "✅ AI relay trained: verified SEND + COPY" else "✅ SEND saved • COPY save verify nahi hua",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }, 140L)
                             }
-                            val copySaved = AiTeachProfileStore.saveVerifiedRole(
-                                this,
-                                pkg,
-                                AiTeachProfileStore.ROLE_COPY,
-                                copySnapshot
-                            )
+                        }, 250L)
+                    }
+
+                    fun verifySendCommit(attempt: Int) {
+                        val afterRoot = findAiTeachRootV3(pkg)
+                        val composerStillOwnsPrompt = afterRoot?.let {
+                            aiTeachComposerContainsV36(it, calibrationPrompt)
+                        } ?: true
+                        val promptCommitted = afterRoot?.let {
+                            aiTeachLiteralOutsideComposerV36(it, calibrationPrompt)
+                        } == true
+                        val tokenVisible = afterRoot?.let {
+                            aiTeachLiteralOutsideComposerV36(it, token)
+                        } == true
+
+                        if (!composerStillOwnsPrompt && (promptCommitted || tokenVisible)) {
+                            saveVerifiedSendAndArmCopy()
+                            return
+                        }
+                        if (attempt >= 120) {
                             Toast.makeText(
                                 this,
-                                if (copySaved) "✅ AI relay trained: SEND + COPY learned" else "✅ SEND saved • COPY save verify nahi hua",
+                                "SEND tap verify nahi hua • profile save nahi kiya; dobara Teach chalao",
                                 Toast.LENGTH_LONG
                             ).show()
+                            return
                         }
-                    }, 450L)
+                        handler.postDelayed({ verifySendCommit(attempt + 1) }, 250L)
+                    }
+
+                    verifySendCommit(0)
                 }
                 if (!armed) Toast.makeText(this, "Teach tap layer open nahi hui", Toast.LENGTH_LONG).show()
                 return
