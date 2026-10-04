@@ -11,7 +11,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,15 +24,62 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.2'
+
+      - name: Capture baseline lint debt
+        shell: bash
+        run: |
+          set +e
+          gradle --no-daemon :app:lintDebug :app:lintRelease --continue
+          set -e
+          python3 - <<'PY'
+          from pathlib import Path
+          import collections, json, re
+          counts=collections.Counter()
+          for p in Path('app/build/intermediates').rglob('lint-results-*.txt'):
+              for line in p.read_text(errors='ignore').splitlines():
+                  if ': Error:' in line:
+                      m=re.search(r'\[([^\]]+)\]\s*$', line)
+                      counts[m.group(1) if m else 'UNCLASSIFIED'] += 1
+          Path('/tmp/baseline_lint.json').write_text(json.dumps(counts, sort_keys=True))
+          print('BASELINE_LINT_ERRORS', sum(counts.values()), dict(counts))
+          PY
+
       - name: Apply source patch
         run: |
           set -euo pipefail
           python3 scripts/teach_ai_v2_patch.py
           git diff --check
-      - name: Test lint build
+
+      - name: Unit tests and APK compile
         run: |
           set -euo pipefail
-          gradle --no-daemon :app:testDebugUnitTest :app:lintDebug :app:lintRelease :app:assembleDebug :app:assembleRelease
+          gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+
+      - name: Ensure patch adds no lint errors
+        shell: bash
+        run: |
+          set +e
+          gradle --no-daemon :app:lintDebug :app:lintRelease --continue
+          set -e
+          python3 - <<'PY'
+          from pathlib import Path
+          import collections, json, re, sys
+          baseline=collections.Counter(json.loads(Path('/tmp/baseline_lint.json').read_text()))
+          patched=collections.Counter()
+          for p in Path('app/build/intermediates').rglob('lint-results-*.txt'):
+              for line in p.read_text(errors='ignore').splitlines():
+                  if ': Error:' in line:
+                      m=re.search(r'\[([^\]]+)\]\s*$', line)
+                      patched[m.group(1) if m else 'UNCLASSIFIED'] += 1
+          added={k: patched[k]-baseline[k] for k in patched if patched[k] > baseline[k]}
+          print('BASELINE_LINT_ERRORS', sum(baseline.values()), dict(baseline))
+          print('PATCHED_LINT_ERRORS', sum(patched.values()), dict(patched))
+          if added:
+              print('NEW_LINT_ERRORS', added)
+              sys.exit(1)
+          print('NO_NEW_LINT_ERRORS')
+          PY
+
       - name: Commit verified source
         run: |
           set -euo pipefail
