@@ -1696,9 +1696,11 @@ class AiSidecarController(private val service: AutoActionService) {
                 }
             } == true
             val fallbackSubmitReady =
-                latest != null && composer != null &&
+                latest != null && composer != null && (
                     (findLearnedProviderControl(provider, latest, AiTeachProfileStore.ROLE_SEND)
-                        ?: findSendNode(latest, composer)) != null
+                        ?: findSendNode(latest, composer)) != null ||
+                        learnedProviderPoint(provider, AiTeachProfileStore.ROLE_SEND) != null
+                    )
             if (latest != null &&
                 !hasGeneratingIndicator(latest) &&
                 composer != null &&
@@ -1758,13 +1760,24 @@ class AiSidecarController(private val service: AutoActionService) {
                 findLearnedProviderControl(provider, rootNow, AiTeachProfileStore.ROLE_SEND)
                     ?: findSendNode(rootNow, freshComposer)
             }
-            if (send == null) {
+            val taughtPoint = learnedProviderPoint(provider, AiTeachProfileStore.ROLE_SEND)
+            if (send == null && taughtPoint == null) {
                 finish(false)
                 return
             }
 
             val baselineSerial = providerUiSerial.get()
-            val accepted = clickNode(send)
+            val accepted = if (send != null) {
+                clickNode(send)
+            } else {
+                // AARISH_AI_SEND_XY_RUNTIME_V32
+                // Coordinate fallback is allowed only after composerHasFullPrompt() above proved
+                // this exact provider transaction is ready. Commit evidence must still prove SEND.
+                val point = taughtPoint ?: return
+                val providerBounds = findWindowBoundsForPackage(providerPackage(provider))
+                rememberHistory("TEACH SEND: verified normalized fallback tap")
+                tapNormalizedPoint(point.first, point.second, providerBounds)
+            }
             if (!accepted) {
                 finish(false)
                 return
@@ -3057,6 +3070,15 @@ class AiSidecarController(private val service: AutoActionService) {
         return best.takeIf { bestScore >= 120 }
     }
 
+    // AARISH_AI_LEARNED_POINT_V32
+    private fun learnedProviderPoint(provider: Provider, role: String): Pair<Float, Float>? {
+        val fp = AiTeachProfileStore.role(service, providerPackage(provider), role) ?: return null
+        if (fp.xPercent.isNaN() || fp.yPercent.isNaN() ||
+            fp.xPercent.isInfinite() || fp.yPercent.isInfinite()
+        ) return null
+        return fp.xPercent.coerceIn(0f, 1f) to fp.yPercent.coerceIn(0f, 1f)
+    }
+
     // AARISH_UNIVERSAL_AI_TEACH_RUNTIME_V3
     // User-taught provider controls are a structural fallback, never a blind coordinate replay.
     // Native accessibility submit remains first choice; generic semantic discovery remains last choice.
@@ -3066,10 +3088,12 @@ class AiSidecarController(private val service: AutoActionService) {
         role: String
     ): AccessibilityNodeInfo? {
         val fp = AiTeachProfileStore.role(service, providerPackage(provider), role) ?: return null
+        val isCopyRole = role.equals(AiTeachProfileStore.ROLE_COPY, ignoreCase = true)
         val sw = service.resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(2f)
         val sh = service.resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(2f)
         var best: AccessibilityNodeInfo? = null
         var bestScore = Int.MIN_VALUE
+        var bestCenterY = -1
         walk(root, 4500) { n ->
             val usable = try { n.isClickable && n.isEnabled && n.isVisibleToUser } catch (_: Throwable) { false }
             if (!usable) return@walk
@@ -3084,16 +3108,29 @@ class AiSidecarController(private val service: AutoActionService) {
             if (fp.className.isNotBlank() && cls.equals(fp.className, ignoreCase = true)) score += 110
 
             val b = Rect(); try { n.getBoundsInScreen(b) } catch (_: Throwable) {}
-            if (!fp.xPercent.isNaN() && !fp.yPercent.isNaN() && b.width() > 0 && b.height() > 0) {
+            if (!fp.xPercent.isNaN() && b.width() > 0 && b.height() > 0) {
                 val dx = kotlin.math.abs((b.centerX() / sw) - fp.xPercent)
-                val dy = kotlin.math.abs((b.centerY() / sh) - fp.yPercent)
-                val distance = kotlin.math.sqrt(dx * dx + dy * dy)
-                when {
-                    distance <= 0.035f -> score += 280
-                    distance <= 0.08f -> score += 220
-                    distance <= 0.16f -> score += 140
-                    distance <= 0.28f -> score += 60
-                    else -> score -= 320
+                if (isCopyRole) {
+                    // AARISH_AI_COPY_LATEST_BIAS_V32
+                    // A copy action row moves vertically with reply length. Match its horizontal
+                    // lane/shape, then strongly prefer the lowest visible matching row (latest reply).
+                    when {
+                        dx <= 0.04f -> score += 220
+                        dx <= 0.10f -> score += 160
+                        dx <= 0.20f -> score += 80
+                        else -> score -= 180
+                    }
+                    score += ((b.centerY() / sh).coerceIn(0f, 1f) * 360f).toInt()
+                } else if (!fp.yPercent.isNaN()) {
+                    val dy = kotlin.math.abs((b.centerY() / sh) - fp.yPercent)
+                    val distance = kotlin.math.sqrt(dx * dx + dy * dy)
+                    when {
+                        distance <= 0.035f -> score += 280
+                        distance <= 0.08f -> score += 220
+                        distance <= 0.16f -> score += 140
+                        distance <= 0.28f -> score += 60
+                        else -> score -= 320
+                    }
                 }
                 if (fp.wPercent > 0f) {
                     val dw = kotlin.math.abs((b.width() / sw) - fp.wPercent)
@@ -3104,9 +3141,15 @@ class AiSidecarController(private val service: AutoActionService) {
                     if (dh <= 0.05f) score += 70
                 }
             }
-            if (score > bestScore) { bestScore = score; best = n }
+            val centerY = if (b.height() > 0) b.centerY() else -1
+            if (score > bestScore || (isCopyRole && score == bestScore && centerY > bestCenterY)) {
+                bestScore = score
+                bestCenterY = centerY
+                best = n
+            }
         }
-        return best.takeIf { bestScore >= 280 }
+        val threshold = if (isCopyRole) 320 else 280
+        return best.takeIf { bestScore >= threshold }
     }
 
     private fun findSendNode(root: AccessibilityNodeInfo, composer: AccessibilityNodeInfo?): AccessibilityNodeInfo? {

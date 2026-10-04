@@ -81,53 +81,13 @@ class FloatingControlService : Service() {
         val finished = java.util.concurrent.atomic.AtomicBoolean(false)
         val screenW = resources.displayMetrics.widthPixels.coerceAtLeast(2)
         val screenH = resources.displayMetrics.heightPixels.coerceAtLeast(2)
-        val overlay = android.view.View(this).apply {
-            setBackgroundColor(android.graphics.Color.TRANSPARENT)
-            setOnTouchListener { _, event ->
-                if (event.actionMasked != android.view.MotionEvent.ACTION_UP || !finished.compareAndSet(false, true)) {
-                    return@setOnTouchListener true
-                }
-                val x = event.x.coerceIn(1f, (screenW - 1).toFloat())
-                val y = event.y.coerceIn(1f, (screenH - 1).toFloat())
-                val snapshot = AutoActionService.captureTargetSnapshot(x.toInt(), y.toInt(), screenW.toFloat(), screenH.toFloat())
-                    ?.takeIf { it.targetPackage.orEmpty().equals(providerPackage, ignoreCase = true) }
-                cancelAiTeachTapV3()
+        val touchSlop = kotlin.math.max(12f, resources.displayMetrics.density * 10f)
+        var downX = 0f
+        var downY = 0f
+        var downAt = 0L
+        var maxTravel = 0f
+        var replayingSwipe = false
 
-                val gesture = RecordedGesture(
-                    delayFromStart = 0L,
-                    points = listOf(GesturePoint(x, y, 0L)),
-                    targetText = snapshot?.targetText,
-                    targetDesc = snapshot?.targetDesc,
-                    targetId = snapshot?.targetId,
-                    targetClass = snapshot?.targetClass,
-                    targetPackage = snapshot?.targetPackage ?: providerPackage,
-                    targetContextText = snapshot?.targetContextText,
-                    targetChildText = snapshot?.targetChildText,
-                    targetSiblingText = snapshot?.targetSiblingText,
-                    targetRoleFlags = snapshot?.targetRoleFlags,
-                    targetTreePath = snapshot?.targetTreePath,
-                    targetLeft = snapshot?.targetLeft ?: -1,
-                    targetTop = snapshot?.targetTop ?: -1,
-                    targetRight = snapshot?.targetRight ?: -1,
-                    targetBottom = snapshot?.targetBottom ?: -1,
-                    xPercent = snapshot?.xPercent ?: (x / screenW.toFloat()),
-                    yPercent = snapshot?.yPercent ?: (y / screenH.toFloat()),
-                    targetWPercent = snapshot?.targetWPercent ?: 0f,
-                    targetHPercent = snapshot?.targetHPercent ?: 0f,
-                    insideXPercent = snapshot?.insideXPercent ?: 0.5f,
-                    insideYPercent = snapshot?.insideYPercent ?: 0.5f,
-                    recordedScreenW = screenW,
-                    recordedScreenH = screenH
-                )
-                handler.postDelayed({
-                    AutoActionService.playSingleLiveGestureSafe(gesture) {
-                        callback(snapshot)
-                    }
-                }, 70L)
-                true
-            }
-        }
-        aiTeachTapOverlayV3 = overlay
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -141,11 +101,175 @@ class FloatingControlService : Service() {
             x = 0
             y = 0
         }
+
+        // AARISH_AI_TEACH_SCROLL_THROUGH_V32
+        // Teaching must work even when a long provider reply pushes COPY below the fold.
+        // Swipes are relayed through the transparent teaching glass and DO NOT complete
+        // the taught tap. Only a low-travel ACTION_UP is treated as SEND/COPY teaching.
+        val overlay = android.view.View(this).apply {
+            setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            setOnTouchListener { view, event ->
+                when (event.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN -> {
+                        if (replayingSwipe || finished.get()) return@setOnTouchListener true
+                        downX = event.x.coerceIn(1f, (screenW - 1).toFloat())
+                        downY = event.y.coerceIn(1f, (screenH - 1).toFloat())
+                        downAt = event.eventTime
+                        maxTravel = 0f
+                        true
+                    }
+
+                    android.view.MotionEvent.ACTION_MOVE -> {
+                        if (!replayingSwipe && !finished.get()) {
+                            maxTravel = kotlin.math.max(
+                                maxTravel,
+                                kotlin.math.max(
+                                    kotlin.math.abs(event.x - downX),
+                                    kotlin.math.abs(event.y - downY)
+                                )
+                            )
+                        }
+                        true
+                    }
+
+                    android.view.MotionEvent.ACTION_CANCEL -> {
+                        maxTravel = 0f
+                        true
+                    }
+
+                    android.view.MotionEvent.ACTION_UP -> {
+                        if (replayingSwipe || finished.get()) return@setOnTouchListener true
+                        val x = event.x.coerceIn(1f, (screenW - 1).toFloat())
+                        val y = event.y.coerceIn(1f, (screenH - 1).toFloat())
+                        val moved = kotlin.math.max(
+                            maxTravel,
+                            kotlin.math.max(kotlin.math.abs(x - downX), kotlin.math.abs(y - downY))
+                        ) > touchSlop
+
+                        if (moved) {
+                            replayingSwipe = true
+                            val duration = (event.eventTime - downAt).coerceIn(80L, 1500L)
+                            val swipe = RecordedGesture(
+                                delayFromStart = 0L,
+                                points = listOf(
+                                    GesturePoint(downX, downY, 0L),
+                                    GesturePoint(x, y, duration)
+                                ),
+                                targetPackage = providerPackage,
+                                recordedScreenW = screenW,
+                                recordedScreenH = screenH
+                            )
+
+                            // Make only this teaching glass untouchable while Accessibility
+                            // replays the user's swipe into the provider underneath it.
+                            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                            try { aarishAccessWmV13().updateViewLayout(view, params) } catch (_: Throwable) {}
+                            AutoActionService.playSingleLiveGestureSafe(swipe) {
+                                handler.postDelayed({
+                                    replayingSwipe = false
+                                    if (
+                                        aiTeachTapSerialV3 == serial &&
+                                        aiTeachTapOverlayV3 === view &&
+                                        !finished.get()
+                                    ) {
+                                        params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                                        try { aarishAccessWmV13().updateViewLayout(view, params) } catch (_: Throwable) {}
+                                        if (role.equals(AiTeachProfileStore.ROLE_COPY, ignoreCase = true)) {
+                                            Toast.makeText(this@FloatingControlService, "↕️ Scroll relayed • ab COPY tap karo", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }, 90L)
+                            }
+                            return@setOnTouchListener true
+                        }
+
+                        if (!finished.compareAndSet(false, true)) return@setOnTouchListener true
+                        val accessibleSnapshot = AutoActionService.captureTargetSnapshot(
+                            x.toInt(),
+                            y.toInt(),
+                            screenW.toFloat(),
+                            screenH.toFloat()
+                        )?.takeIf {
+                            it.targetPackage.orEmpty().equals(providerPackage, ignoreCase = true)
+                        }
+
+                        // AARISH_AI_TEACH_SEND_XY_SCROLL_RECONCILE_V33
+                        // If an icon-only SEND is invisible to Accessibility, retain the user's
+                        // demonstrated normalized point. This fallback is SEND-only because the
+                        // composer/send row is stable; a reply COPY row moves with response length.
+                        val learnedSnapshot = accessibleSnapshot ?: if (
+                            role.equals(AiTeachProfileStore.ROLE_SEND, ignoreCase = true)
+                        ) {
+                            TargetSnapshot(
+                                targetClass = "TAUGHT_SEND_XY",
+                                targetPackage = providerPackage,
+                                targetRoleFlags = "click|xy_fallback",
+                                targetTreePath = "TAUGHT_SEND_XY",
+                                xPercent = (x / screenW.toFloat()).coerceIn(0f, 1f),
+                                yPercent = (y / screenH.toFloat()).coerceIn(0f, 1f),
+                                insideXPercent = 0.5f,
+                                insideYPercent = 0.5f,
+                                recordedScreenW = screenW,
+                                recordedScreenH = screenH
+                            )
+                        } else null
+                        cancelAiTeachTapV3()
+
+                        val gesture = RecordedGesture(
+                            delayFromStart = 0L,
+                            points = listOf(GesturePoint(x, y, 0L)),
+                            targetText = learnedSnapshot?.targetText,
+                            targetDesc = learnedSnapshot?.targetDesc,
+                            targetId = learnedSnapshot?.targetId,
+                            targetClass = learnedSnapshot?.targetClass,
+                            targetPackage = learnedSnapshot?.targetPackage ?: providerPackage,
+                            targetContextText = learnedSnapshot?.targetContextText,
+                            targetChildText = learnedSnapshot?.targetChildText,
+                            targetSiblingText = learnedSnapshot?.targetSiblingText,
+                            targetRoleFlags = learnedSnapshot?.targetRoleFlags,
+                            targetTreePath = learnedSnapshot?.targetTreePath,
+                            targetLeft = learnedSnapshot?.targetLeft ?: -1,
+                            targetTop = learnedSnapshot?.targetTop ?: -1,
+                            targetRight = learnedSnapshot?.targetRight ?: -1,
+                            targetBottom = learnedSnapshot?.targetBottom ?: -1,
+                            xPercent = learnedSnapshot?.xPercent ?: (x / screenW.toFloat()),
+                            yPercent = learnedSnapshot?.yPercent ?: (y / screenH.toFloat()),
+                            targetWPercent = learnedSnapshot?.targetWPercent ?: 0f,
+                            targetHPercent = learnedSnapshot?.targetHPercent ?: 0f,
+                            insideXPercent = learnedSnapshot?.insideXPercent ?: 0.5f,
+                            insideYPercent = learnedSnapshot?.insideYPercent ?: 0.5f,
+                            recordedScreenW = screenW,
+                            recordedScreenH = screenH
+                        )
+                        handler.postDelayed({
+                            AutoActionService.playSingleLiveGestureSafe(gesture) {
+                                callback(learnedSnapshot)
+                            }
+                        }, 70L)
+                        true
+                    }
+
+                    else -> true
+                }
+            }
+        }
+        aiTeachTapOverlayV3 = overlay
         return try {
             aarishAccessWmV13().addView(overlay, params)
-            Toast.makeText(this, "🎓 $role tap karke sikhao", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                if (role.equals(AiTeachProfileStore.ROLE_COPY, ignoreCase = true))
+                    "🎓 COPY sikhao • zarurat ho to pehle scroll karo"
+                else
+                    "🎓 $role tap karke sikhao",
+                Toast.LENGTH_LONG
+            ).show()
             handler.postDelayed({
-                if (aiTeachTapSerialV3 == serial && aiTeachTapOverlayV3 === overlay && finished.compareAndSet(false, true)) {
+                if (
+                    aiTeachTapSerialV3 == serial &&
+                    aiTeachTapOverlayV3 === overlay &&
+                    finished.compareAndSet(false, true)
+                ) {
                     cancelAiTeachTapV3()
                     callback(null)
                 }
