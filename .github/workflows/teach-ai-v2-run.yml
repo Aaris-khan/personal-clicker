@@ -44,10 +44,11 @@ jobs:
           print('BASELINE_LINT_ERRORS', sum(counts.values()), dict(counts))
           PY
 
-      - name: Apply source patch
+      - name: Apply source upgrades
         run: |
           set -euo pipefail
           python3 scripts/teach_ai_v2_patch.py
+          python3 scripts/remove_blocked_window_api.py
           git diff --check
 
       - name: Unit tests and APK compile
@@ -86,6 +87,6 @@ jobs:
           if git diff --quiet; then exit 0; fi
           git config user.name 'Aaris-khan'
           git config user.email 'hhakmuddin8@gmail.com'
-          git add app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt app/src/main/java/com/aarishkhan/aarishai/AiProviderSpec.kt app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt app/src/test/java/com/aarishkhan/aarishai/AiProviderSpecTest.kt
-          git commit -m 'Teach Your AI: universal provider relay and preflight'
+          git add app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt app/src/main/java/com/aarishkhan/aarishai/AiProviderSpec.kt app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt app/src/test/java/com/aarishkhan/aarishai/AiProviderSpecTest.kt
+          git commit -m 'Teach Your AI: universal provider relay and full-screen preflight'
           git push origin HEAD:upgrade/teach-your-ai-v2
