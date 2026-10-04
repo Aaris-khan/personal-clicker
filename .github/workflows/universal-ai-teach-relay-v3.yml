@@ -52,7 +52,9 @@ jobs:
           set -euo pipefail
           python3 scripts/universal_ai_teach_relay_v3_patch.py
           python3 scripts/universal_ai_teach_relay_v3_1_hardening.py
+          python3 scripts/universal_ai_teach_relay_v3_2_hardening.py
           python3 scripts/universal_ai_teach_relay_v3_2_scroll_teach.py
+          python3 scripts/universal_ai_teach_relay_v3_3_reconcile.py
           git diff --check
 
       - name: Unit tests and APK compile
@@ -89,7 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           if git diff --quiet; then
-            echo 'Source already patched; nothing to commit.'
+            echo 'Source already fully patched; nothing to commit.'
             exit 0
           fi
           git config user.name 'Aaris-khan'
@@ -99,5 +101,5 @@ jobs:
             app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt \
             app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt \
             app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt
-          git commit -m 'Support scroll-through AI teaching for long replies'
+          git commit -m 'Finalize universal AI Teach Relay [skip ci]'
           git push origin HEAD:upgrade/universal-ai-teach-relay-v3
