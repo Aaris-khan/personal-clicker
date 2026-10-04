@@ -20,6 +20,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Gradle 8.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.2'
       - name: Apply source patch
         run: |
           set -euo pipefail
@@ -28,8 +32,7 @@ jobs:
       - name: Test lint build
         run: |
           set -euo pipefail
-          chmod +x gradlew
-          ./gradlew --no-daemon testDebugUnitTest lintDebug lintRelease assembleDebug assembleRelease
+          gradle --no-daemon :app:testDebugUnitTest :app:lintDebug :app:lintRelease :app:assembleDebug :app:assembleRelease
       - name: Commit verified source
         run: |
           set -euo pipefail
