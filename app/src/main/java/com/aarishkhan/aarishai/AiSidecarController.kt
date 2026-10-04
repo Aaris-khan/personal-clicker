@@ -443,7 +443,21 @@ class AiSidecarController(private val service: AutoActionService) {
                 if (command == null) {
                     markProviderFailure(provider, "open/send/response failure")
                     returnToTarget(run, lastTargetPackage) {
-                        if (alive(run)) failTurn(run, "AI response parse/timeout")
+                        if (!alive(run)) return@returnToTarget
+                        if (persistentVisionMode) {
+                            // AARISH_AI_NO_DUPLICATE_REATTACH_V31
+                            // A Persistent Vision turn has already staged its screenshot. Re-entering
+                            // nextMissionTurn here would attach the same visual evidence again and can
+                            // create the exact photo/photo/photo loop seen in real-device testing.
+                            // The send/read transaction already has readiness, commit, Accessibility,
+                            // learned-COPY and OCR waits, so an unverified result is terminal and safe.
+                            finishMission(
+                                false,
+                                "AI relay submit/reply verify nahi hua. Screenshot dobara attach nahi kiya. TEACH AI se SEND/COPY re-train karo."
+                            )
+                        } else {
+                            failTurn(run, "AI response parse/timeout")
+                        }
                     }
                     return@askPhysicalAi
                 }
@@ -935,6 +949,7 @@ class AiSidecarController(private val service: AutoActionService) {
                 appendLine("For SWIPE use normalized x1,y1,x2,y2,durationMs so you may request a small precise swipe.")
                 appendLine("Prefer small swipes; inspect the next screenshot before asking for another.")
                 appendLine("OUTPUT CONTRACT:")
+                appendLine("Return exactly ONE compact machine line only. No markdown, prose, explanation, headings, or extra lines.")
                 appendLine("AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
                 appendLine("Allowed ACTION: TAP, TAP_XY, LONG_TAP, SET_TEXT, SWIPE, SCROLL, BACK, HOME, WAIT, OPEN_APP, DONE, FAIL.")
                 appendLine("TAP_XY PAYLOAD=x,y normalized 0..1.")
@@ -1681,7 +1696,11 @@ class AiSidecarController(private val service: AutoActionService) {
                 }
             } == true
             val fallbackSubmitReady =
-                latest != null && composer != null && findSendNode(latest, composer) != null
+                latest != null && composer != null && (
+                    (findLearnedProviderControl(provider, latest, AiTeachProfileStore.ROLE_SEND)
+                        ?: findSendNode(latest, composer)) != null ||
+                        learnedProviderPoint(provider, AiTeachProfileStore.ROLE_SEND) != null
+                    )
             if (latest != null &&
                 !hasGeneratingIndicator(latest) &&
                 composer != null &&
@@ -1737,14 +1756,28 @@ class AiSidecarController(private val service: AutoActionService) {
                 return
             }
 
-            val send = latest?.let { findSendNode(it, freshComposer) }
-            if (send == null) {
+            val send = latest?.let { rootNow ->
+                findLearnedProviderControl(provider, rootNow, AiTeachProfileStore.ROLE_SEND)
+                    ?: findSendNode(rootNow, freshComposer)
+            }
+            val taughtPoint = learnedProviderPoint(provider, AiTeachProfileStore.ROLE_SEND)
+            if (send == null && taughtPoint == null) {
                 finish(false)
                 return
             }
 
             val baselineSerial = providerUiSerial.get()
-            val accepted = clickNode(send)
+            val accepted = if (send != null) {
+                clickNode(send)
+            } else {
+                // AARISH_AI_SEND_XY_RUNTIME_V32
+                // Coordinate fallback is allowed only after composerHasFullPrompt() above proved
+                // this exact provider transaction is ready. Commit evidence must still prove SEND.
+                val point = taughtPoint ?: return
+                val providerBounds = findWindowBoundsForPackage(providerPackage(provider))
+                rememberHistory("TEACH SEND: verified normalized fallback tap")
+                tapNormalizedPoint(point.first, point.second, providerBounds)
+            }
             if (!accepted) {
                 finish(false)
                 return
@@ -1766,6 +1799,101 @@ class AiSidecarController(private val service: AutoActionService) {
                 buttonSubmitOnce(composer)
             }
         }
+    }
+
+    private fun findProviderScrollableForCopy(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = -1
+        walk(root, 4500) { n ->
+            val usable = try { n.isScrollable && n.isEnabled && n.isVisibleToUser } catch (_: Throwable) { false }
+            if (!usable) return@walk
+            val b = Rect(); try { n.getBoundsInScreen(b) } catch (_: Throwable) {}
+            val area = b.width().coerceAtLeast(0) * b.height().coerceAtLeast(0)
+            if (area > bestArea) { bestArea = area; best = n }
+        }
+        return best
+    }
+
+    private fun tryLearnedCopyResponse(
+        run: Int,
+        provider: Provider,
+        requestId: String,
+        callback: (AiCommand?) -> Unit
+    ) {
+        if (!alive(run)) return
+        if (AiTeachProfileStore.role(service, providerPackage(provider), AiTeachProfileStore.ROLE_COPY) == null) {
+            callback(null)
+            return
+        }
+        val cm = try { service.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager } catch (_: Throwable) { null }
+        val previous = try { cm?.primaryClip } catch (_: Throwable) { null }
+        var finished = false
+
+        fun restoreClipboard() {
+            try {
+                if (cm != null) {
+                    if (previous != null) cm.setPrimaryClip(previous)
+                    else cm.setPrimaryClip(ClipData.newPlainText("", ""))
+                }
+            } catch (_: Throwable) {}
+        }
+        fun finish(command: AiCommand?) {
+            if (finished) return
+            finished = true
+            restoreClipboard()
+            callback(command)
+        }
+        fun readClipboardCommand(): AiCommand? {
+            val text = try {
+                val clip = cm?.primaryClip ?: return null
+                if (clip.itemCount <= 0) return null
+                clip.getItemAt(0).coerceToText(service)?.toString().orEmpty()
+            } catch (_: Throwable) { "" }
+            return parseCommand(text, requestId)
+        }
+        fun pollClipboard(attempt: Int) {
+            if (!alive(run)) return
+            readClipboardCommand()?.let { finish(it); return }
+            if (attempt >= 14) { finish(null); return }
+            handler.postDelayed({ pollClipboard(attempt + 1) }, 120L)
+        }
+        // AARISH_AI_COPY_BOTTOM_FIRST_V34
+        // COPY repeats once per assistant message. A long newest reply can push its own action
+        // row below the viewport while an older COPY is still visible. Do not click that older
+        // control first: move the provider transcript toward its bounded end, then select the
+        // bottom-most learned COPY. The request-id parser below still proves that copied text
+        // belongs to this exact turn before any phone action can execute.
+        fun seekLatest(scrolls: Int) {
+            if (!alive(run)) return
+            val root = findRootForPackage(providerPackage(provider))
+            if (root == null) { finish(null); return }
+
+            val scrollable = findProviderScrollableForCopy(root)
+            if (scrolls < 5 && scrollable != null) {
+                val moved = try {
+                    scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+                } catch (_: Throwable) { false }
+                if (moved) {
+                    handler.postDelayed({ seekLatest(scrolls + 1) }, 240L)
+                    return
+                }
+            }
+
+            // We are at the bottom (or reached the strict scroll budget). The learned matcher
+            // already applies AARISH_AI_COPY_LATEST_BIAS_V32, so repeated COPY controls resolve
+            // to the lowest visible matching row rather than an old assistant message.
+            val latestRoot = findRootForPackage(providerPackage(provider)) ?: root
+            val copy = findLearnedProviderControl(
+                provider,
+                latestRoot,
+                AiTeachProfileStore.ROLE_COPY
+            )
+            if (copy == null) { finish(null); return }
+            val accepted = clickNode(copy)
+            if (!accepted) { finish(null); return }
+            handler.postDelayed({ pollClipboard(0) }, 100L)
+        }
+        seekLatest(0)
     }
 
     private fun waitForCompleteResponse(run: Int, provider: Provider, requestId: String, callback: (AiCommand?) -> Unit) {
@@ -1852,14 +1980,24 @@ class AiSidecarController(private val service: AutoActionService) {
                 (settledAfterGeneration || noGenerationSignalButSlow)
             ) {
                 earlyOcrAttempted = true
-                captureProviderOcr(provider) { ocr ->
-                    if (!alive(run)) return@captureProviderOcr
-                    val fromOcr = parseCommand(ocr, requestId)
-                    if (fromOcr != null) {
+                // Learned COPY is cheaper and more exact than OCR when a provider hides
+                // assistant text from Accessibility. Bounded scrolling handles a long reply.
+                tryLearnedCopyResponse(run, provider, requestId) { fromCopy ->
+                    if (!alive(run)) return@tryLearnedCopyResponse
+                    if (fromCopy != null) {
                         waitingForAi = false
-                        callback(fromOcr)
+                        callback(fromCopy)
                     } else {
-                        handler.postDelayed({ if (alive(run)) poll() }, 320L)
+                        captureProviderOcr(provider) { ocr ->
+                            if (!alive(run)) return@captureProviderOcr
+                            val fromOcr = parseCommand(ocr, requestId)
+                            if (fromOcr != null) {
+                                waitingForAi = false
+                                callback(fromOcr)
+                            } else {
+                                handler.postDelayed({ if (alive(run)) poll() }, 320L)
+                            }
+                        }
                     }
                 }
                 return
@@ -2949,6 +3087,100 @@ class AiSidecarController(private val service: AutoActionService) {
 
         // Fail closed instead of typing into an obviously unrelated editor.
         return best.takeIf { bestScore >= 120 }
+    }
+
+    // AARISH_AI_LEARNED_POINT_V32
+    private fun learnedProviderPoint(provider: Provider, role: String): Pair<Float, Float>? {
+        if (!role.equals(AiTeachProfileStore.ROLE_SEND, ignoreCase = true)) return null
+        val fp = AiTeachProfileStore.role(service, providerPackage(provider), role) ?: return null
+
+        // AARISH_AI_SEND_XY_SYNTHETIC_ONLY_V35
+        // Coordinate replay is allowed only for a SEND that was explicitly learned because
+        // Accessibility exposed no usable node. If a normal semantic fingerprint later stops
+        // matching after an app update, fail closed/re-teach instead of tapping its stale point.
+        val explicitXyFallback =
+            fp.className.equals("TAUGHT_SEND_XY", ignoreCase = true) ||
+                fp.treePath.equals("TAUGHT_SEND_XY", ignoreCase = true) ||
+                fp.roleFlags.split('|').any { it.equals("xy_fallback", ignoreCase = true) }
+        if (!explicitXyFallback) return null
+
+        if (fp.xPercent.isNaN() || fp.yPercent.isNaN() ||
+            fp.xPercent.isInfinite() || fp.yPercent.isInfinite()
+        ) return null
+        return fp.xPercent.coerceIn(0f, 1f) to fp.yPercent.coerceIn(0f, 1f)
+    }
+
+    // AARISH_UNIVERSAL_AI_TEACH_RUNTIME_V3
+    // User-taught provider controls are a structural fallback, never a blind coordinate replay.
+    // Native accessibility submit remains first choice; generic semantic discovery remains last choice.
+    private fun findLearnedProviderControl(
+        provider: Provider,
+        root: AccessibilityNodeInfo,
+        role: String
+    ): AccessibilityNodeInfo? {
+        val fp = AiTeachProfileStore.role(service, providerPackage(provider), role) ?: return null
+        val isCopyRole = role.equals(AiTeachProfileStore.ROLE_COPY, ignoreCase = true)
+        val sw = service.resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(2f)
+        val sh = service.resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(2f)
+        var best: AccessibilityNodeInfo? = null
+        var bestScore = Int.MIN_VALUE
+        var bestCenterY = -1
+        walk(root, 4500) { n ->
+            val usable = try { n.isClickable && n.isEnabled && n.isVisibleToUser } catch (_: Throwable) { false }
+            if (!usable) return@walk
+            val text = try { n.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+            val desc = try { n.contentDescription?.toString().orEmpty() } catch (_: Throwable) { "" }
+            val id = try { n.viewIdResourceName.orEmpty() } catch (_: Throwable) { "" }
+            val cls = try { n.className?.toString().orEmpty() } catch (_: Throwable) { "" }
+            var score = 0
+            if (fp.viewId.isNotBlank() && id.equals(fp.viewId, ignoreCase = true)) score += 900
+            if (fp.desc.isNotBlank() && normalizeUiText(desc) == normalizeUiText(fp.desc)) score += 700
+            if (fp.text.isNotBlank() && normalizeUiText(text) == normalizeUiText(fp.text)) score += 600
+            if (fp.className.isNotBlank() && cls.equals(fp.className, ignoreCase = true)) score += 110
+
+            val b = Rect(); try { n.getBoundsInScreen(b) } catch (_: Throwable) {}
+            if (!fp.xPercent.isNaN() && b.width() > 0 && b.height() > 0) {
+                val dx = kotlin.math.abs((b.centerX() / sw) - fp.xPercent)
+                if (isCopyRole) {
+                    // AARISH_AI_COPY_LATEST_BIAS_V32
+                    // A copy action row moves vertically with reply length. Match its horizontal
+                    // lane/shape, then strongly prefer the lowest visible matching row (latest reply).
+                    when {
+                        dx <= 0.04f -> score += 220
+                        dx <= 0.10f -> score += 160
+                        dx <= 0.20f -> score += 80
+                        else -> score -= 180
+                    }
+                    score += ((b.centerY() / sh).coerceIn(0f, 1f) * 360f).toInt()
+                } else if (!fp.yPercent.isNaN()) {
+                    val dy = kotlin.math.abs((b.centerY() / sh) - fp.yPercent)
+                    val distance = kotlin.math.sqrt(dx * dx + dy * dy)
+                    when {
+                        distance <= 0.035f -> score += 280
+                        distance <= 0.08f -> score += 220
+                        distance <= 0.16f -> score += 140
+                        distance <= 0.28f -> score += 60
+                        else -> score -= 320
+                    }
+                }
+                if (fp.wPercent > 0f) {
+                    val dw = kotlin.math.abs((b.width() / sw) - fp.wPercent)
+                    if (dw <= 0.05f) score += 70
+                }
+                if (fp.hPercent > 0f) {
+                    val dh = kotlin.math.abs((b.height() / sh) - fp.hPercent)
+                    if (dh <= 0.05f) score += 70
+                }
+            }
+            val centerY = if (b.height() > 0) b.centerY() else -1
+            if (score > bestScore || (isCopyRole && score == bestScore && centerY > bestCenterY)) {
+                bestScore = score
+                bestCenterY = centerY
+                best = n
+            }
+        }
+        val threshold = if (isCopyRole) 320 else 280
+        return best.takeIf { bestScore >= threshold }
     }
 
     private fun findSendNode(root: AccessibilityNodeInfo, composer: AccessibilityNodeInfo?): AccessibilityNodeInfo? {

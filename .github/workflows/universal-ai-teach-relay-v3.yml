@@ -1,0 +1,113 @@
+name: Universal AI Teach Relay v3
+
+on:
+  push:
+    branches:
+      - upgrade/universal-ai-teach-relay-v3
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-verify-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.2'
+
+      - name: Capture baseline lint debt
+        shell: bash
+        run: |
+          set +e
+          gradle --no-daemon :app:lintDebug :app:lintRelease --continue
+          set -e
+          python3 - <<'PY'
+          from pathlib import Path
+          import collections, json, re
+          counts=collections.Counter()
+          for p in Path('app/build/intermediates').rglob('lint-results-*.txt'):
+              for line in p.read_text(errors='ignore').splitlines():
+                  if ': Error:' in line:
+                      m=re.search(r'\[([^\]]+)\]\s*$', line)
+                      counts[m.group(1) if m else 'UNCLASSIFIED'] += 1
+          Path('/tmp/baseline_lint.json').write_text(json.dumps(counts, sort_keys=True))
+          print('BASELINE_LINT_ERRORS', sum(counts.values()), dict(counts))
+          PY
+
+      - name: Apply final relay delta
+        run: |
+          set -euo pipefail
+          # Earlier v3/v3.1/v3.2/v3.3 logic is already committed in source. Re-running
+          # historical shape-dependent patchers is intentionally forbidden here.
+          python3 scripts/universal_ai_teach_relay_v3_4_copy_latest.py
+          python3 scripts/universal_ai_teach_relay_v3_6_verify_teaching.py
+          git diff --check
+
+      - name: Unit tests and APK compile
+        run: |
+          set -euo pipefail
+          gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+
+      - name: No new lint categories
+        shell: bash
+        run: |
+          set +e
+          gradle --no-daemon :app:lintDebug :app:lintRelease --continue
+          set -e
+          python3 - <<'PY'
+          from pathlib import Path
+          import collections, json, re, sys
+          baseline=collections.Counter(json.loads(Path('/tmp/baseline_lint.json').read_text()))
+          patched=collections.Counter()
+          for p in Path('app/build/intermediates').rglob('lint-results-*.txt'):
+              for line in p.read_text(errors='ignore').splitlines():
+                  if ': Error:' in line:
+                      m=re.search(r'\[([^\]]+)\]\s*$', line)
+                      patched[m.group(1) if m else 'UNCLASSIFIED'] += 1
+          added={k: patched[k]-baseline[k] for k in patched if patched[k] > baseline[k]}
+          print('PATCHED_LINT_ERRORS', sum(patched.values()), dict(patched))
+          if added:
+              print('NEW_LINT_ERRORS', added)
+              sys.exit(1)
+          print('NO_NEW_LINT_ERRORS')
+          PY
+
+      - name: Commit verified source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo 'Source already fully patched; nothing to commit.'
+            exit 0
+          fi
+
+          # Never push a patch that was verified against an older branch head. If another
+          # commit landed while this job was compiling, exit green and let the newer push
+          # run its own full verification. This eliminates non-fast-forward CI races.
+          git fetch origin upgrade/universal-ai-teach-relay-v3
+          remote_head="$(git rev-parse origin/upgrade/universal-ai-teach-relay-v3)"
+          if [ "$remote_head" != "$GITHUB_SHA" ]; then
+            echo "Branch advanced during verification ($GITHUB_SHA -> $remote_head); newer run owns the patch."
+            exit 0
+          fi
+
+          git config user.name 'Aaris-khan'
+          git config user.email 'hhakmuddin8@gmail.com'
+          git add \
+            app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt \
+            app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt
+          git commit -m 'Finalize verified AI Teach Relay [skip ci]'
+          git push origin HEAD:upgrade/universal-ai-teach-relay-v3

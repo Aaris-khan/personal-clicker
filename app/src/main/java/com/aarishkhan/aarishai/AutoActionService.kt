@@ -276,6 +276,30 @@ class AutoActionService : AccessibilityService() {
 
         fun isAiAgentRunning(): Boolean = instance?.aiSidecarController?.isRunning() == true
 
+        // AARISH_UNIVERSAL_AI_TEACH_CALIBRATION_V3
+        // One-time provider calibration: app fills a harmless prompt, user demonstrates
+        // SEND and COPY, then only compact structural fingerprints are retained.
+        fun startAiRelayTeaching(context: Context, provider: String): Boolean {
+            val service = instance
+            if (service == null) {
+                Toast.makeText(context, "Accessibility Service ready nahi hai", Toast.LENGTH_SHORT).show()
+                return false
+            }
+            if (service.aiSidecarController.isRunning()) {
+                Toast.makeText(context, "AI mission chal rahi hai; pehle STOP karo", Toast.LENGTH_SHORT).show()
+                return false
+            }
+            if (service.isPlayingInternal) service.stopPlaybackInternal()
+            service.handler.post { service.startAiRelayTeachingInternalV3(provider) }
+            return true
+        }
+
+        fun isAiRelayTrained(context: Context, provider: String): Boolean {
+            val service = instance ?: return false
+            val pkg = service.resolveAiTeachProviderPackageV3(provider)
+            return pkg.isNotBlank() && AiTeachProfileStore.isReady(context, pkg)
+        }
+
         // 🔥 Recording ke time button ki kundali nikalne ke liye
 
         // AARISH_OCR_TEXT_CLICK_V4_COMPANION
@@ -327,6 +351,308 @@ class AutoActionService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     // AARISH_AI_SIDECAR_CONTROLLER_FIELD_V1
     private val aiSidecarController: AiSidecarController by lazy { AiSidecarController(this) }
+
+    // AARISH_UNIVERSAL_AI_TEACH_CALIBRATION_V3_IMPL
+    private fun resolveAiTeachProviderPackageV3(raw: String): String {
+        val clean = raw.trim()
+        if (clean.startsWith("PKG:", ignoreCase = true)) {
+            return clean.substringAfter(':').trim().take(220)
+        }
+        return when (clean.uppercase(java.util.Locale.US)) {
+            "CHATGPT" -> "com.openai.chatgpt"
+            "GEMINI" -> "com.google.android.apps.bard"
+            "AUTO", "" -> listOf("com.openai.chatgpt", "com.google.android.apps.bard")
+                .firstOrNull { pkg ->
+                    try { packageManager.getLaunchIntentForPackage(pkg) != null } catch (_: Throwable) { false }
+                }.orEmpty()
+            else -> ""
+        }
+    }
+
+    private fun findAiTeachRootV3(pkg: String): AccessibilityNodeInfo? {
+        if (pkg.isBlank()) return null
+        return try {
+            val focused = windows.firstOrNull { w ->
+                val root = w.root
+                root?.packageName?.toString() == pkg && (w.isFocused || w.isActive)
+            }?.root
+            focused ?: windows.firstOrNull { it.root?.packageName?.toString() == pkg }?.root
+                ?: rootInActiveWindow?.takeIf { it.packageName?.toString() == pkg }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun walkAiTeachV3(root: AccessibilityNodeInfo, limit: Int = 4500, visit: (AccessibilityNodeInfo) -> Unit) {
+        val queue = java.util.ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var seen = 0
+        while (queue.isNotEmpty() && seen < limit) {
+            val node = queue.removeFirst()
+            seen++
+            visit(node)
+            val count = try { node.childCount } catch (_: Throwable) { 0 }
+            for (i in 0 until count) {
+                try { node.getChild(i)?.let(queue::addLast) } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun findAiTeachComposerV3(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val h = resources.displayMetrics.heightPixels.coerceAtLeast(1)
+        var best: AccessibilityNodeInfo? = null
+        var bestScore = Int.MIN_VALUE
+        walkAiTeachV3(root) { node ->
+            val editable = try { node.isEditable } catch (_: Throwable) { false }
+            val actions = try { node.actionList.orEmpty() } catch (_: Throwable) { emptyList() }
+            val setText = actions.any { it.id == AccessibilityNodeInfo.ACTION_SET_TEXT }
+            val visible = try { node.isVisibleToUser && node.isEnabled } catch (_: Throwable) { false }
+            if (!visible || (!editable && !setText)) return@walkAiTeachV3
+            val b = Rect(); try { node.getBoundsInScreen(b) } catch (_: Throwable) {}
+            var score = 0
+            if (editable) score += 300
+            if (setText) score += 220
+            if (b.centerY() >= h * 0.45f) score += 180
+            if (b.width() >= resources.displayMetrics.widthPixels * 0.35f) score += 120
+            val hint = buildString {
+                append(try { node.text?.toString().orEmpty() } catch (_: Throwable) { "" })
+                append(' ')
+                append(try { node.contentDescription?.toString().orEmpty() } catch (_: Throwable) { "" })
+            }.lowercase(java.util.Locale.US)
+            if (listOf("message", "ask", "prompt", "type", "chat").any(hint::contains)) score += 100
+            if (score > bestScore) { bestScore = score; best = node }
+        }
+        return best.takeIf { bestScore >= 300 }
+    }
+
+    private fun setAiTeachComposerTextV3(node: AccessibilityNodeInfo, text: String): Boolean {
+        val args = android.os.Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        }
+        val direct = try {
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        } catch (_: Throwable) { false }
+        if (direct) return true
+
+        val cm = try { getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager } catch (_: Throwable) { null }
+            ?: return false
+        val previous = try { cm.primaryClip } catch (_: Throwable) { null }
+        val pasted = try {
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("Aaris AI calibration", text))
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        } catch (_: Throwable) { false }
+        handler.postDelayed({
+            try {
+                if (previous != null) cm.setPrimaryClip(previous)
+                else cm.setPrimaryClip(android.content.ClipData.newPlainText("", ""))
+            } catch (_: Throwable) {}
+        }, 900L)
+        return pasted
+    }
+
+    // AARISH_AI_TEACH_VERIFIED_CALIBRATION_V36
+    private fun aiTeachLiteralOutsideComposerV36(
+        root: AccessibilityNodeInfo,
+        literal: String
+    ): Boolean {
+        if (literal.isBlank()) return false
+        var found = false
+        walkAiTeachV3(root) { node ->
+            if (found) return@walkAiTeachV3
+            val editable = try { node.isEditable } catch (_: Throwable) { false }
+            if (editable) return@walkAiTeachV3
+            val value = buildString {
+                append(try { node.text?.toString().orEmpty() } catch (_: Throwable) { "" })
+                append(' ')
+                append(try { node.contentDescription?.toString().orEmpty() } catch (_: Throwable) { "" })
+            }
+            if (value.contains(literal)) found = true
+        }
+        return found
+    }
+
+    private fun aiTeachComposerContainsV36(
+        root: AccessibilityNodeInfo,
+        literal: String
+    ): Boolean {
+        if (literal.isBlank()) return false
+        val composer = findAiTeachComposerV3(root) ?: return false
+        val value = buildString {
+            append(try { composer.text?.toString().orEmpty() } catch (_: Throwable) { "" })
+            append(' ')
+            append(try { composer.contentDescription?.toString().orEmpty() } catch (_: Throwable) { "" })
+        }
+        return value.contains(literal)
+    }
+
+    private fun aiTeachClipboardTextV36(): String {
+        val cm = try {
+            getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+        } catch (_: Throwable) { null } ?: return ""
+        return try {
+            val clip = cm.primaryClip ?: return ""
+            if (clip.itemCount <= 0) return ""
+            clip.getItemAt(0).coerceToText(this)?.toString().orEmpty()
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    private fun startAiRelayTeachingInternalV3(providerRaw: String) {
+        val pkg = resolveAiTeachProviderPackageV3(providerRaw)
+        if (pkg.isBlank()) {
+            Toast.makeText(this, "Pehle usable AI provider select karo", Toast.LENGTH_LONG).show()
+            return
+        }
+        val launch = try { packageManager.getLaunchIntentForPackage(pkg) } catch (_: Throwable) { null }
+        if (launch == null) {
+            Toast.makeText(this, "Selected AI app installed nahi mili", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val token = "AARIS_TEACH_OK_" + java.util.UUID.randomUUID().toString().replace("-", "").take(8).uppercase(java.util.Locale.US)
+        val calibrationPrompt = "AARIS UI relay calibration. Reply with exactly $token and nothing else."
+        try {
+            launch.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            startActivity(launch)
+        } catch (_: Throwable) {
+            Toast.makeText(this, "AI app open nahi hui", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        fun waitComposer(attempt: Int) {
+            val root = findAiTeachRootV3(pkg)
+            val composer = root?.let(::findAiTeachComposerV3)
+            if (composer != null && setAiTeachComposerTextV3(composer, calibrationPrompt)) {
+                Toast.makeText(this, "🎓 Ab SEND button par ek baar tap karo", Toast.LENGTH_LONG).show()
+                val fcs = FloatingControlService.instance
+                if (fcs == null) {
+                    Toast.makeText(this, "Floating controller ready nahi hai", Toast.LENGTH_LONG).show()
+                    return
+                }
+                val armed = fcs.armAiTeachTapV3(AiTeachProfileStore.ROLE_SEND, pkg) { sendSnapshot ->
+                    if (sendSnapshot == null) {
+                        Toast.makeText(this, "SEND learn nahi hua; dobara Teach chalao", Toast.LENGTH_LONG).show()
+                        return@armAiTeachTapV3
+                    }
+                    // AARISH_AI_TEACH_VERIFIED_CALIBRATION_V36
+                    // Do not persist a guessed SEND. The demonstrated tap has already been
+                    // replayed into the provider; now prove that the calibration prompt left
+                    // the composer and appeared in the conversation, or that the exact reply
+                    // token became visible. Wrong taps therefore fail closed instead of becoming
+                    // a long-lived provider profile.
+                    fun saveVerifiedSendAndArmCopy() {
+                        val sendSaved = AiTeachProfileStore.saveVerifiedRole(
+                            this,
+                            pkg,
+                            AiTeachProfileStore.ROLE_SEND,
+                            sendSnapshot
+                        )
+                        if (!sendSaved || !AiTeachProfileStore.isReady(this, pkg)) {
+                            Toast.makeText(this, "SEND profile save verify nahi hua", Toast.LENGTH_LONG).show()
+                            return
+                        }
+                        Toast.makeText(
+                            this,
+                            "✅ SEND verified • reply complete ho to COPY tap karke fallback bhi sikhao",
+                            Toast.LENGTH_LONG
+                        ).show()
+
+                        val cm = try {
+                            getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                        } catch (_: Throwable) { null }
+                        val previousClip = try { cm?.primaryClip } catch (_: Throwable) { null }
+
+                        fun restoreTeachClipboard() {
+                            try {
+                                if (cm != null) {
+                                    if (previousClip != null) cm.setPrimaryClip(previousClip)
+                                    else cm.setPrimaryClip(android.content.ClipData.newPlainText("", ""))
+                                }
+                            } catch (_: Throwable) {}
+                        }
+
+                        // No fixed AI-generation delay is recorded. The transparent teaching layer
+                        // can stay armed while the user waits/scrolls to the final reply action row.
+                        handler.postDelayed({
+                            fcs.armAiTeachTapV3(AiTeachProfileStore.ROLE_COPY, pkg) { copySnapshot ->
+                                if (copySnapshot == null) {
+                                    restoreTeachClipboard()
+                                    Toast.makeText(this, "✅ SEND saved • COPY optional training skipped", Toast.LENGTH_LONG).show()
+                                    return@armAiTeachTapV3
+                                }
+
+                                // The calibration response is exactly `token`. A visually similar
+                                // old COPY button cannot be trusted unless it copied this turn's token.
+                                handler.postDelayed({
+                                    val copied = aiTeachClipboardTextV36()
+                                    restoreTeachClipboard()
+                                    if (!copied.contains(token)) {
+                                        Toast.makeText(
+                                            this,
+                                            "COPY verify nahi hua • SEND safe hai, COPY dobara Teach karo",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                        return@postDelayed
+                                    }
+                                    val copySaved = AiTeachProfileStore.saveVerifiedRole(
+                                        this,
+                                        pkg,
+                                        AiTeachProfileStore.ROLE_COPY,
+                                        copySnapshot
+                                    )
+                                    Toast.makeText(
+                                        this,
+                                        if (copySaved) "✅ AI relay trained: verified SEND + COPY" else "✅ SEND saved • COPY save verify nahi hua",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }, 140L)
+                            }
+                        }, 250L)
+                    }
+
+                    fun verifySendCommit(attempt: Int) {
+                        val afterRoot = findAiTeachRootV3(pkg)
+                        val composerStillOwnsPrompt = afterRoot?.let {
+                            aiTeachComposerContainsV36(it, calibrationPrompt)
+                        } ?: true
+                        val promptCommitted = afterRoot?.let {
+                            aiTeachLiteralOutsideComposerV36(it, calibrationPrompt)
+                        } == true
+                        val tokenVisible = afterRoot?.let {
+                            aiTeachLiteralOutsideComposerV36(it, token)
+                        } == true
+
+                        if (!composerStillOwnsPrompt && (promptCommitted || tokenVisible)) {
+                            saveVerifiedSendAndArmCopy()
+                            return
+                        }
+                        if (attempt >= 120) {
+                            Toast.makeText(
+                                this,
+                                "SEND tap verify nahi hua • profile save nahi kiya; dobara Teach chalao",
+                                Toast.LENGTH_LONG
+                            ).show()
+                            return
+                        }
+                        handler.postDelayed({ verifySendCommit(attempt + 1) }, 250L)
+                    }
+
+                    verifySendCommit(0)
+                }
+                if (!armed) Toast.makeText(this, "Teach tap layer open nahi hui", Toast.LENGTH_LONG).show()
+                return
+            }
+            if (attempt >= 60) {
+                Toast.makeText(this, "AI composer ready nahi mila", Toast.LENGTH_LONG).show()
+                return
+            }
+            handler.postDelayed({ waitComposer(attempt + 1) }, 200L)
+        }
+        handler.postDelayed({ waitComposer(0) }, 350L)
+    }
 
     private val scheduledTasks = mutableListOf<Runnable>()
 
