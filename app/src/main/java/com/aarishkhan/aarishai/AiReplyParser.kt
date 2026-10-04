@@ -32,7 +32,6 @@ internal object AiReplyParser {
             .mapNotNull { fields -> commandFromJson(fields, requestId) }
             .distinct()
 
-        // Conflicting correlated commands are unsafe. Do not silently pick first/last.
         if (jsonCommands.size > 1) return null
         if (jsonCommands.size == 1) return jsonCommands.first()
 
@@ -49,22 +48,23 @@ internal object AiReplyParser {
         val payload = fields["payload"].orEmpty().trim()
         val expected = fields["expected"].orEmpty().trim()
         val visual = fields["visual"].orEmpty().trim()
-        if (element.length > 200 || payload.length > 2400 || expected.length > 1400 || visual.length > 80) {
-            return null
-        }
+        if (element.length > 200 || payload.length > 2400 || expected.length > 1400 || visual.length > 80) return null
         return Command(action, element, payload, expected, visual)
     }
 
     private fun parseLegacy(text: String, requestId: String): Command? {
         val marker = "AARIS::$requestId::"
+        val terminator = "::END"
 
         fun decode(rawInput: String): Command? {
             val start = rawInput.indexOf(marker)
             if (start < 0) return null
-            val raw = rawInput.substring(start).take(5000)
+            val end = rawInput.indexOf(terminator, startIndex = start + marker.length)
+            if (end < 0) return null
+            val raw = rawInput.substring(start, (end + terminator.length).coerceAtMost(rawInput.length)).take(5000)
             val parts = raw.split("::", limit = 8)
             if (parts.size != 8 || parts[0].trim() != "AARIS" || parts[1].trim() != requestId) return null
-            if (parts[7].trim().lineSequence().firstOrNull().orEmpty() != "END") return null
+            if (parts[7].trim() != "END") return null
 
             val action = parts[2].trim().uppercase(Locale.US)
             if (action !in allowedActions) return null
@@ -77,13 +77,12 @@ internal object AiReplyParser {
         }
 
         val line = text.lineSequence().map { it.trim() }.lastOrNull {
-            it.contains(marker) && it.contains("::END")
+            it.contains(marker) && it.contains(terminator)
         }
         decode(line.orEmpty())?.let { return it }
         return decode(text.replace(Regex("\\s+"), " ").trim())
     }
 
-    /** Extract balanced JSON objects while respecting braces inside quoted strings. */
     private fun extractJsonObjects(text: String): List<String> {
         val out = ArrayList<String>()
         var start = -1
@@ -104,13 +103,9 @@ internal object AiReplyParser {
             }
 
             if (inString) {
-                if (escaped) {
-                    escaped = false
-                } else if (ch == '\\') {
-                    escaped = true
-                } else if (ch == '"') {
-                    inString = false
-                }
+                if (escaped) escaped = false
+                else if (ch == '\\') escaped = true
+                else if (ch == '"') inString = false
                 continue
             }
 
@@ -130,10 +125,6 @@ internal object AiReplyParser {
         return out
     }
 
-    /**
-     * Small strict parser for the flat command object. It supports JSON string escapes and
-     * scalar primitives; nested objects/arrays are rejected because the command schema is flat.
-     */
     private fun parseFlatJsonObject(raw: String): Map<String, String>? {
         var i = 0
         fun skipWs() { while (i < raw.length && raw[i].isWhitespace()) i++ }
