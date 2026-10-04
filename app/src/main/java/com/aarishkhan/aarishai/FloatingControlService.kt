@@ -5454,7 +5454,7 @@ private fun showAiMissionDialogV1() {
         setHintTextColor(android.graphics.Color.LTGRAY)
     }
     val vision = android.widget.CheckBox(this).apply {
-        text = "📸 UI Relay / Teach Your AI — no API, MQTT or MCP; same chat + fresh screenshot after every action"
+        text = "📸 UI Relay / Teach Your AI — no external API, MQTT or MCP connector; same chat + fresh screenshot after every action"
         setTextColor(android.graphics.Color.WHITE)
         textSize = 12f
         isChecked = true
@@ -5511,7 +5511,7 @@ private fun showAiMissionDialogV1() {
         orientation = android.widget.LinearLayout.VERTICAL
         setPadding(dp(12), dp(8), dp(12), dp(8))
         addView(android.widget.TextView(this@FloatingControlService).apply {
-            text = "UI Relay: API / MQTT / MCP ki zaroorat nahi. Accessibility + fresh screenshot se one-action-at-a-time control hota hai; fixed coordinates nahi, UI badle to engine re-detect karta hai."
+            text = "UI Relay: external API / MQTT / MCP connector ki zaroorat nahi. Accessibility + fresh screenshot se one-action-at-a-time control hota hai; AI app ka apna login/network alag ho sakta hai. Fixed coordinates nahi—UI badle to engine re-detect karta hai."
             setTextColor(android.graphics.Color.LTGRAY)
             textSize = 12f
         })
