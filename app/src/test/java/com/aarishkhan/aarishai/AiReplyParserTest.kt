@@ -33,7 +33,7 @@ class AiReplyParserTest {
     }
 
     @Test fun parsesEscapedTextPayload() {
-        val reply = """{"request_id":"$id","action":"SET_TEXT","element":"E2","payload":"Hello \\"Aaris\\"\\nLine2","expected":"text visible","visual":"NONE"}"""
+        val reply = """{"request_id":"$id","action":"SET_TEXT","element":"E2","payload":"Hello \"Aaris\"\nLine2","expected":"text visible","visual":"NONE"}"""
         val parsed = AiReplyParser.parse(reply, id)
         assertEquals("SET_TEXT", parsed?.action)
         assertEquals("Hello \"Aaris\"\nLine2", parsed?.payload)
