@@ -47,10 +47,11 @@ jobs:
           print('BASELINE_LINT_ERRORS', sum(counts.values()), dict(counts))
           PY
 
-      - name: Apply universal teach relay patch
+      - name: Apply universal teach relay patches
         run: |
           set -euo pipefail
           python3 scripts/universal_ai_teach_relay_v3_patch.py
+          python3 scripts/universal_ai_teach_relay_v3_1_hardening.py
           git diff --check
 
       - name: Unit tests and APK compile
@@ -93,8 +94,9 @@ jobs:
           git config user.name 'Aaris-khan'
           git config user.email 'hhakmuddin8@gmail.com'
           git add \
+            app/src/main/java/com/aarishkhan/aarishai/AiTeachProfileStore.kt \
             app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt \
             app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt \
             app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt
-          git commit -m 'Add universal taught Send/Copy AI relay'
+          git commit -m 'Harden universal AI relay against duplicate reattach'
           git push origin HEAD:upgrade/universal-ai-teach-relay-v3
