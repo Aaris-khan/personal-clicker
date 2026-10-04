@@ -1857,24 +1857,43 @@ class AiSidecarController(private val service: AutoActionService) {
             if (attempt >= 14) { finish(null); return }
             handler.postDelayed({ pollClipboard(attempt + 1) }, 120L)
         }
-        fun seek(scrolls: Int) {
+        // AARISH_AI_COPY_BOTTOM_FIRST_V34
+        // COPY repeats once per assistant message. A long newest reply can push its own action
+        // row below the viewport while an older COPY is still visible. Do not click that older
+        // control first: move the provider transcript toward its bounded end, then select the
+        // bottom-most learned COPY. The request-id parser below still proves that copied text
+        // belongs to this exact turn before any phone action can execute.
+        fun seekLatest(scrolls: Int) {
             if (!alive(run)) return
             val root = findRootForPackage(providerPackage(provider))
             if (root == null) { finish(null); return }
-            val copy = findLearnedProviderControl(provider, root, AiTeachProfileStore.ROLE_COPY)
-            if (copy != null) {
-                val accepted = clickNode(copy)
-                if (!accepted) { finish(null); return }
-                handler.postDelayed({ pollClipboard(0) }, 100L)
-                return
-            }
-            if (scrolls >= 4) { finish(null); return }
+
             val scrollable = findProviderScrollableForCopy(root)
-            val moved = try { scrollable?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) == true } catch (_: Throwable) { false }
-            if (!moved) { finish(null); return }
-            handler.postDelayed({ seek(scrolls + 1) }, 260L)
+            if (scrolls < 5 && scrollable != null) {
+                val moved = try {
+                    scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+                } catch (_: Throwable) { false }
+                if (moved) {
+                    handler.postDelayed({ seekLatest(scrolls + 1) }, 240L)
+                    return
+                }
+            }
+
+            // We are at the bottom (or reached the strict scroll budget). The learned matcher
+            // already applies AARISH_AI_COPY_LATEST_BIAS_V32, so repeated COPY controls resolve
+            // to the lowest visible matching row rather than an old assistant message.
+            val latestRoot = findRootForPackage(providerPackage(provider)) ?: root
+            val copy = findLearnedProviderControl(
+                provider,
+                latestRoot,
+                AiTeachProfileStore.ROLE_COPY
+            )
+            if (copy == null) { finish(null); return }
+            val accepted = clickNode(copy)
+            if (!accepted) { finish(null); return }
+            handler.postDelayed({ pollClipboard(0) }, 100L)
         }
-        seek(0)
+        seekLatest(0)
     }
 
     private fun waitForCompleteResponse(run: Int, provider: Provider, requestId: String, callback: (AiCommand?) -> Unit) {
@@ -3072,7 +3091,19 @@ class AiSidecarController(private val service: AutoActionService) {
 
     // AARISH_AI_LEARNED_POINT_V32
     private fun learnedProviderPoint(provider: Provider, role: String): Pair<Float, Float>? {
+        if (!role.equals(AiTeachProfileStore.ROLE_SEND, ignoreCase = true)) return null
         val fp = AiTeachProfileStore.role(service, providerPackage(provider), role) ?: return null
+
+        // AARISH_AI_SEND_XY_SYNTHETIC_ONLY_V35
+        // Coordinate replay is allowed only for a SEND that was explicitly learned because
+        // Accessibility exposed no usable node. If a normal semantic fingerprint later stops
+        // matching after an app update, fail closed/re-teach instead of tapping its stale point.
+        val explicitXyFallback =
+            fp.className.equals("TAUGHT_SEND_XY", ignoreCase = true) ||
+                fp.treePath.equals("TAUGHT_SEND_XY", ignoreCase = true) ||
+                fp.roleFlags.split('|').any { it.equals("xy_fallback", ignoreCase = true) }
+        if (!explicitXyFallback) return null
+
         if (fp.xPercent.isNaN() || fp.yPercent.isNaN() ||
             fp.xPercent.isInfinite() || fp.yPercent.isInfinite()
         ) return null
