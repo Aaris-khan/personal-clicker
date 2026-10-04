@@ -1,0 +1,62 @@
+name: Teach Your AI apply v2 temp
+
+on:
+  push:
+    branches:
+      - upgrade/teach-your-ai-v1
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Fix patcher escape and apply source upgrade
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/apply_teach_ai_patch.py')
+          s = p.read_text(encoding='utf-8')
+          old = "s2, count = start_pattern.subn(new_start, s, count=1)"
+          new = "s2, count = start_pattern.subn(lambda _m: new_start, s, count=1)"
+          if old in s:
+              s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+          python3 scripts/apply_teach_ai_patch.py
+          git diff --check
+      - name: Unit tests
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest
+      - name: Lint
+        run: ./gradlew --no-daemon lintDebug lintRelease
+      - name: Build APK variants
+        run: ./gradlew --no-daemon assembleDebug assembleRelease
+      - name: Commit only verified product changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Aaris-khan'
+          git config user.email 'hhakmuddin8@gmail.com'
+          git add app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt \
+                  app/src/main/java/com/aarishkhan/aarishai/AiProviderSpec.kt \
+                  app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt \
+                  app/src/test/java/com/aarishkhan/aarishai/AiProviderSpecTest.kt
+          if git diff --cached --quiet; then
+            echo 'No product changes to commit.'
+            exit 0
+          fi
+          git commit -m 'Teach Your AI: universal full-screen provider relay'
+          git push origin HEAD:upgrade/teach-your-ai-v1
