@@ -3512,16 +3512,6 @@ private fun aarishAiWaitForNextRecordedTarget(
 
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
                 try {
-                    val m = android.app.ActivityOptions::class.java.getDeclaredMethod(
-                        "setLaunchWindowingMode",
-                        java.lang.Integer.TYPE
-                    )
-                    m.isAccessible = true
-                    m.invoke(opts, if (floating) 5 else 1)
-                } catch (_: Throwable) {
-                }
-
-                try {
                     opts.setLaunchBounds(launchBounds())
                 } catch (_: Throwable) {
                 }

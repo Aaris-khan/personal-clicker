@@ -42,7 +42,8 @@ class AiSidecarController(private val service: AutoActionService) {
 
     enum class Provider(val packageName: String) {
         CHATGPT("com.openai.chatgpt"),
-        GEMINI("com.google.android.apps.bard")
+        GEMINI("com.google.android.apps.bard"),
+        CUSTOM("")
     }
 
     data class UiElement(
@@ -115,6 +116,8 @@ class AiSidecarController(private val service: AutoActionService) {
     @Volatile private var waitingForAi = false
     private var missionGoal = ""
     private var providerPreference = "AUTO"
+    // AARISH_TEACH_YOUR_AI_V2
+    private var customProviderPackage = ""
     private var missionStep = 0
     private var failureCount = 0
     private var lastOutcome = "Mission started"
@@ -162,7 +165,7 @@ class AiSidecarController(private val service: AutoActionService) {
 
     fun onAccessibilityEvent(event: AccessibilityEvent) {
         val pkg = event.packageName?.toString().orEmpty()
-        if (Provider.values().none { it.packageName == pkg }) return
+        if (Provider.values().none { providerPackage(it).isNotBlank() && providerPackage(it) == pkg }) return
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
             AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
@@ -206,16 +209,29 @@ class AiSidecarController(private val service: AutoActionService) {
         provider: String = "AUTO",
         persistentVision: Boolean = false
     ): Boolean {
-        val clean = goal.replace(Regex("[\\u0000-\\u001F]+"), " ").trim().take(6000)
+        val clean = goal.replace(Regex("[\u0000-\u001F]+"), " ").trim().take(6000)
         if (clean.isBlank()) return false
+
         stop("restart")
+        val requested = AiProviderSpec.parse(provider)
+        if (!requested.valid) {
+            toast("⚠️ Selected AI app invalid hai")
+            return false
+        }
+        customProviderPackage = requested.customPackage
+        providerPreference = requested.preference
+        val preflight = validateMissionPreflight(persistentVision)
+        if (!preflight.ok) {
+            toast("⚠️ ${preflight.reason}")
+            return false
+        }
+
         missionRunning = true
         acquireMissionWakeLock()
         rescueMode = false
         rescueExpectedAction = ""
-        rescueEvidenceSteps = emptyList() // AARISH_AI_RESCUE_EVIDENCE_V2_START_CLEAR
+        rescueEvidenceSteps = emptyList()
         missionGoal = clean
-        providerPreference = normalizeProviderPreference(provider)
         persistentVisionMode = persistentVision
         visionSessionId = if (persistentVision) {
             "PV" + UUID.randomUUID().toString().replace("-", "").take(10).uppercase(Locale.US)
@@ -225,15 +241,16 @@ class AiSidecarController(private val service: AutoActionService) {
         lockedVisionProviderTaskId = null
         missionStep = 0
         failureCount = 0
-        lastOutcome = "Mission started"
-        lastTargetPackage = "" // AARISH_AI_STATE_OWNERSHIP_V1_START
+        lastOutcome = "Mission preflight passed"
+        lastTargetPackage = preflight.targetPackage
         resetProviderHealth()
         resetMissionProgressWatchdog()
         localPlannerRejectedSignatures.clear()
         actionHistory.clear()
         rememberHistory("GOAL: $clean")
+        rememberHistory("PREFLIGHT: provider=$providerPreference target=${preflight.targetPackage.ifBlank { "auto-detect" }}")
         val run = generation.incrementAndGet()
-        toast("🤖 AI Mission started")
+        toast("🤖 AI Mission ready")
         handler.post { nextMissionTurn(run) }
         return true
     }
@@ -389,7 +406,7 @@ class AiSidecarController(private val service: AutoActionService) {
                 selectProvider(state.packageName)
             }
             if (provider == null) {
-                val targetAi = Provider.values().firstOrNull { it.packageName == state.packageName }
+                val targetAi = Provider.values().firstOrNull { providerPackage(it).isNotBlank() && providerPackage(it) == state.packageName }
                 val reason = when {
                     targetAi != null ->
                         "Target app ${targetAi.name} hai; agent brain ke liye doosra AI install/select karo"
@@ -617,9 +634,48 @@ class AiSidecarController(private val service: AutoActionService) {
 
     private fun alive(run: Int): Boolean = missionRunning && generation.get() == run
 
-    private fun normalizeProviderPreference(raw: String): String {
-        val normalized = raw.trim().uppercase(Locale.US)
-        return if (normalized in setOf("AUTO", "CHATGPT", "GEMINI")) normalized else "AUTO"
+    private fun normalizeProviderPreference(raw: String): String =
+        AiProviderSpec.parse(raw).preference
+
+    private fun providerPackage(provider: Provider): String = when (provider) {
+        Provider.CUSTOM -> customProviderPackage.trim()
+        else -> provider.packageName
+    }
+
+    private data class MissionPreflight(
+        val ok: Boolean,
+        val targetPackage: String = "",
+        val reason: String = ""
+    )
+
+    private fun validateMissionPreflight(persistentVision: Boolean): MissionPreflight {
+        if (persistentVision && Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return MissionPreflight(false, reason = "Persistent Vision ke liye Android 11+ chahiye")
+        }
+        val target = try {
+            findBestTargetRoot()?.packageName?.toString().orEmpty()
+        } catch (_: Throwable) { "" }
+        val installed = Provider.values().filter(::providerInstalled)
+        if (installed.isEmpty()) {
+            return MissionPreflight(false, target, "Koi usable AI app installed/select nahi mila")
+        }
+        val candidates = installed.filterNot {
+            target.isNotBlank() && providerPackage(it) == target
+        }
+        if (candidates.isEmpty()) {
+            return MissionPreflight(false, target, "Target app ko AI brain nahi bana sakte; doosra AI choose karo")
+        }
+        val explicit = when (providerPreference) {
+            "CHATGPT" -> Provider.CHATGPT
+            "GEMINI" -> Provider.GEMINI
+            "CUSTOM" -> Provider.CUSTOM
+            else -> null
+        }
+        if (explicit != null && explicit !in candidates) {
+            val label = if (explicit == Provider.CUSTOM) customProviderPackage.ifBlank { "Selected AI" } else explicit.name
+            return MissionPreflight(false, target, "$label available nahi hai ya target app se conflict kar raha hai")
+        }
+        return MissionPreflight(true, target)
     }
 
     private fun resetProviderHealth() {
@@ -637,7 +693,9 @@ class AiSidecarController(private val service: AutoActionService) {
     }
 
     private fun providerInstalled(provider: Provider): Boolean = try {
-        service.packageManager.getLaunchIntentForPackage(provider.packageName) != null
+        val pkg = providerPackage(provider)
+        pkg.isNotBlank() && pkg != service.packageName &&
+            service.packageManager.getLaunchIntentForPackage(pkg) != null
     } catch (_: Throwable) {
         false
     }
@@ -785,7 +843,7 @@ class AiSidecarController(private val service: AutoActionService) {
 
         // AARISH_PROVIDER_SELF_TARGET_GUARD_V2
         val candidates = installed.filterNot {
-            targetPackage.isNotBlank() && it.packageName == targetPackage
+            targetPackage.isNotBlank() && providerPackage(it) == targetPackage
         }
         if (candidates.isEmpty()) return null
 
@@ -794,6 +852,7 @@ class AiSidecarController(private val service: AutoActionService) {
             // AUTO may fail over. An explicit user choice must never silently switch brains.
             "CHATGPT" -> return Provider.CHATGPT.takeIf { it in candidates }
             "GEMINI" -> return Provider.GEMINI.takeIf { it in candidates }
+            "CUSTOM" -> return Provider.CUSTOM.takeIf { it in candidates }
         }
 
         val now = SystemClock.elapsedRealtime()
@@ -1194,8 +1253,8 @@ class AiSidecarController(private val service: AutoActionService) {
                 android.app.ActivityManager.RECENT_IGNORE_UNAVAILABLE
             ).orEmpty()
             val hit = tasks.firstOrNull { info ->
-                info.baseIntent?.component?.packageName == provider.packageName ||
-                    info.origActivity?.packageName == provider.packageName
+                info.baseIntent?.component?.packageName == providerPackage(provider) ||
+                    info.origActivity?.packageName == providerPackage(provider)
             }
             if (hit != null && am != null) {
                 try {
@@ -1207,13 +1266,12 @@ class AiSidecarController(private val service: AutoActionService) {
         } catch (_: Throwable) {}
 
         return try {
-            val launch = service.packageManager.getLaunchIntentForPackage(provider.packageName) ?: return false
+            val launch = service.packageManager.getLaunchIntentForPackage(providerPackage(provider)) ?: return false
             launch.addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK or
                     Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
                     Intent.FLAG_ACTIVITY_SINGLE_TOP
             )
-            if (Build.VERSION.SDK_INT >= 24) launch.addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
             service.startActivity(launch)
             true
         } catch (_: Throwable) {
@@ -1244,7 +1302,7 @@ class AiSidecarController(private val service: AutoActionService) {
             return
         }
         try {
-            service.grantUriPermission(provider.packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            service.grantUriPermission(providerPackage(provider), uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         } catch (_: Throwable) {}
 
         val previous = try { cm.primaryClip } catch (_: Throwable) { null }
@@ -1287,7 +1345,7 @@ class AiSidecarController(private val service: AutoActionService) {
                     // Android grants the provider a temporary content URI directly;
                     // no gallery save and no manual attach/paste/search sequence.
                     type = "image/png"
-                    setPackage(provider.packageName)
+                    setPackage(providerPackage(provider))
                     putExtra(Intent.EXTRA_STREAM, uri)
                     // AARISH_AI_SINGLE_TEXT_OWNER_V7:
                     // Share intent owns only the image. Prompt text is injected exactly once
@@ -1299,12 +1357,11 @@ class AiSidecarController(private val service: AutoActionService) {
                             Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
                             Intent.FLAG_ACTIVITY_SINGLE_TOP
                     )
-                    if (Build.VERSION.SDK_INT >= 24) addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
                 }
                 // Explicit grant makes the handoff independent of implicit URI-grant behavior.
                 try {
                     service.grantUriPermission(
-                        provider.packageName,
+                        providerPackage(provider),
                         uri,
                         Intent.FLAG_GRANT_READ_URI_PERMISSION
                     )
@@ -1318,9 +1375,8 @@ class AiSidecarController(private val service: AutoActionService) {
             }
         }
         return try {
-            val launch = service.packageManager.getLaunchIntentForPackage(provider.packageName) ?: return false
+            val launch = service.packageManager.getLaunchIntentForPackage(providerPackage(provider)) ?: return false
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-            if (Build.VERSION.SDK_INT >= 24) launch.addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
             service.startActivity(launch)
             true
         } catch (_: Throwable) { false }
@@ -1338,7 +1394,7 @@ class AiSidecarController(private val service: AutoActionService) {
         callback: (AccessibilityNodeInfo?) -> Unit
     ) {
         if (!alive(run)) return
-        val root = findRootForPackage(provider.packageName)
+        val root = findRootForPackage(providerPackage(provider))
         val composer = root?.let(::findEditable)
         val busy = root?.let(::hasGeneratingIndicator) == true
         val ready = root != null && composer != null && !busy
@@ -1428,7 +1484,7 @@ class AiSidecarController(private val service: AutoActionService) {
         prompt: String,
         baselineUiSerial: Long
     ): Boolean {
-        val root = findRootForPackage(provider.packageName) ?: return false
+        val root = findRootForPackage(providerPackage(provider)) ?: return false
         val composer = findEditable(root)
         val stillInComposer = nodeContainsRequest(composer, requestMarker, prompt)
 
@@ -1535,7 +1591,7 @@ class AiSidecarController(private val service: AutoActionService) {
 
         fun waitForFreshPrompt(attempt: Int, onReady: (AccessibilityNodeInfo) -> Unit) {
             if (!alive(run) || finished.get()) return
-            val latest = findRootForPackage(provider.packageName)
+            val latest = findRootForPackage(providerPackage(provider))
             val composer = latest?.let(::findEditable)
             val nativeSubmitReady = composer?.let { node ->
                 val actions = try { node.actionList.orEmpty() } catch (_: Throwable) { emptyList() }
@@ -1589,7 +1645,7 @@ class AiSidecarController(private val service: AutoActionService) {
 
         fun buttonSubmitOnce(composer: AccessibilityNodeInfo) {
             if (!alive(run) || finished.get()) return
-            val latest = findRootForPackage(provider.packageName)
+            val latest = findRootForPackage(providerPackage(provider))
             val freshComposer = latest?.let(::findEditable) ?: composer
             if (!composerHasFullPrompt(freshComposer)) {
                 finish(
@@ -1658,7 +1714,7 @@ class AiSidecarController(private val service: AutoActionService) {
             if (!alive(run)) return
             val nowElapsed = SystemClock.elapsedRealtime()
             val elapsed = nowElapsed - started
-            val root = findRootForPackage(provider.packageName)
+            val root = findRootForPackage(providerPackage(provider))
 
             if (root == null) {
                 if (providerMissingSince == 0L) providerMissingSince = nowElapsed
@@ -2480,7 +2536,7 @@ class AiSidecarController(private val service: AutoActionService) {
 
     private fun captureProviderOcr(provider: Provider, callback: (String) -> Unit) {
         if (Build.VERSION.SDK_INT < 30) { callback(""); return }
-        val windowId = findWindowIdForPackage(provider.packageName)
+        val windowId = findWindowIdForPackage(providerPackage(provider))
         val cb = object : AccessibilityService.TakeScreenshotCallback {
             override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
                 val buffer = screenshot.hardwareBuffer
@@ -2535,7 +2591,7 @@ class AiSidecarController(private val service: AutoActionService) {
                 val preferredPkg = lastTargetPackage.trim()
                 if (preferredPkg.isNotBlank() && pkg == preferredPkg) score += 15000
                 if (preferredPkg.isNotBlank() && pkg != preferredPkg &&
-                    Provider.values().any { it.packageName == pkg }
+                    Provider.values().any { providerPackage(it).isNotBlank() && providerPackage(it) == pkg }
                 ) score -= 14000
 
                 if (score > bestScore) {

@@ -1,0 +1,404 @@
+from pathlib import Path
+import re
+
+sidecar = Path('app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt')
+fcs = Path('app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt')
+spec = Path('app/src/main/java/com/aarishkhan/aarishai/AiProviderSpec.kt')
+test = Path('app/src/test/java/com/aarishkhan/aarishai/AiProviderSpecTest.kt')
+
+s = sidecar.read_text(encoding='utf-8')
+if 'AARISH_TEACH_YOUR_AI_V2' not in s:
+    old_enum = '''    enum class Provider(val packageName: String) {
+        CHATGPT("com.openai.chatgpt"),
+        GEMINI("com.google.android.apps.bard")
+    }'''
+    new_enum = '''    enum class Provider(val packageName: String) {
+        CHATGPT("com.openai.chatgpt"),
+        GEMINI("com.google.android.apps.bard"),
+        CUSTOM("")
+    }'''
+    if old_enum not in s:
+        raise SystemExit('Provider enum changed; refusing blind patch')
+    s = s.replace(old_enum, new_enum, 1)
+
+    marker = '    private var providerPreference = "AUTO"\n'
+    if marker not in s:
+        raise SystemExit('providerPreference marker missing')
+    s = s.replace(marker, marker + '    // AARISH_TEACH_YOUR_AI_V2\n    private var customProviderPackage = ""\n', 1)
+
+    s = s.replace('provider.packageName', 'providerPackage(provider)')
+    s = s.replace('Provider.values().none { it.packageName == pkg }', 'Provider.values().none { providerPackage(it).isNotBlank() && providerPackage(it) == pkg }')
+    s = s.replace('Provider.values().firstOrNull { it.packageName == state.packageName }', 'Provider.values().firstOrNull { providerPackage(it).isNotBlank() && providerPackage(it) == state.packageName }')
+    s = s.replace('targetPackage.isNotBlank() && it.packageName == targetPackage', 'targetPackage.isNotBlank() && providerPackage(it) == targetPackage')
+    s = s.replace('Provider.values().any { it.packageName == pkg }', 'Provider.values().any { providerPackage(it).isNotBlank() && providerPackage(it) == pkg }')
+
+    s = '\n'.join(line for line in s.splitlines() if 'FLAG_ACTIVITY_LAUNCH_ADJACENT' not in line) + '\n'
+
+    old_norm = '''    private fun normalizeProviderPreference(raw: String): String {
+        val normalized = raw.trim().uppercase(Locale.US)
+        return if (normalized in setOf("AUTO", "CHATGPT", "GEMINI")) normalized else "AUTO"
+    }
+'''
+    if old_norm not in s:
+        raise SystemExit('normalizeProviderPreference block changed')
+    new_norm = '''    private fun normalizeProviderPreference(raw: String): String =
+        AiProviderSpec.parse(raw).preference
+
+    private fun providerPackage(provider: Provider): String = when (provider) {
+        Provider.CUSTOM -> customProviderPackage.trim()
+        else -> provider.packageName
+    }
+
+    private data class MissionPreflight(
+        val ok: Boolean,
+        val targetPackage: String = "",
+        val reason: String = ""
+    )
+
+    private fun validateMissionPreflight(persistentVision: Boolean): MissionPreflight {
+        if (persistentVision && Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return MissionPreflight(false, reason = "Persistent Vision ke liye Android 11+ chahiye")
+        }
+        val target = try {
+            findBestTargetRoot()?.packageName?.toString().orEmpty()
+        } catch (_: Throwable) { "" }
+        val installed = Provider.values().filter(::providerInstalled)
+        if (installed.isEmpty()) {
+            return MissionPreflight(false, target, "Koi usable AI app installed/select nahi mila")
+        }
+        val candidates = installed.filterNot {
+            target.isNotBlank() && providerPackage(it) == target
+        }
+        if (candidates.isEmpty()) {
+            return MissionPreflight(false, target, "Target app ko AI brain nahi bana sakte; doosra AI choose karo")
+        }
+        val explicit = when (providerPreference) {
+            "CHATGPT" -> Provider.CHATGPT
+            "GEMINI" -> Provider.GEMINI
+            "CUSTOM" -> Provider.CUSTOM
+            else -> null
+        }
+        if (explicit != null && explicit !in candidates) {
+            val label = if (explicit == Provider.CUSTOM) customProviderPackage.ifBlank { "Selected AI" } else explicit.name
+            return MissionPreflight(false, target, "$label available nahi hai ya target app se conflict kar raha hai")
+        }
+        return MissionPreflight(true, target)
+    }
+'''
+    s = s.replace(old_norm, new_norm, 1)
+
+    old_installed = '''    private fun providerInstalled(provider: Provider): Boolean = try {
+        service.packageManager.getLaunchIntentForPackage(providerPackage(provider)) != null
+    } catch (_: Throwable) {
+        false
+    }
+'''
+    if old_installed not in s:
+        raise SystemExit('providerInstalled shape changed')
+    new_installed = '''    private fun providerInstalled(provider: Provider): Boolean = try {
+        val pkg = providerPackage(provider)
+        pkg.isNotBlank() && pkg != service.packageName &&
+            service.packageManager.getLaunchIntentForPackage(pkg) != null
+    } catch (_: Throwable) {
+        false
+    }
+'''
+    s = s.replace(old_installed, new_installed, 1)
+
+    gemini = '            "GEMINI" -> return Provider.GEMINI.takeIf { it in candidates }\n'
+    if gemini not in s:
+        raise SystemExit('explicit GEMINI branch missing')
+    s = s.replace(gemini, gemini + '            "CUSTOM" -> return Provider.CUSTOM.takeIf { it in candidates }\n', 1)
+
+    start_re = re.compile(r'''    fun startMission\(\n        goal: String,\n        provider: String = "AUTO",\n        persistentVision: Boolean = false\n    \): Boolean \{.*?\n    \}\n\n    fun rescueRecordedFailure''', re.S)
+    replacement = '''    fun startMission(
+        goal: String,
+        provider: String = "AUTO",
+        persistentVision: Boolean = false
+    ): Boolean {
+        val clean = goal.replace(Regex("[\\u0000-\\u001F]+"), " ").trim().take(6000)
+        if (clean.isBlank()) return false
+
+        stop("restart")
+        val requested = AiProviderSpec.parse(provider)
+        if (!requested.valid) {
+            toast("⚠️ Selected AI app invalid hai")
+            return false
+        }
+        customProviderPackage = requested.customPackage
+        providerPreference = requested.preference
+        val preflight = validateMissionPreflight(persistentVision)
+        if (!preflight.ok) {
+            toast("⚠️ ${preflight.reason}")
+            return false
+        }
+
+        missionRunning = true
+        acquireMissionWakeLock()
+        rescueMode = false
+        rescueExpectedAction = ""
+        rescueEvidenceSteps = emptyList()
+        missionGoal = clean
+        persistentVisionMode = persistentVision
+        visionSessionId = if (persistentVision) {
+            "PV" + UUID.randomUUID().toString().replace("-", "").take(10).uppercase(Locale.US)
+        } else ""
+        visionTurn = 0
+        lockedVisionProvider = null
+        lockedVisionProviderTaskId = null
+        missionStep = 0
+        failureCount = 0
+        lastOutcome = "Mission preflight passed"
+        lastTargetPackage = preflight.targetPackage
+        resetProviderHealth()
+        resetMissionProgressWatchdog()
+        localPlannerRejectedSignatures.clear()
+        actionHistory.clear()
+        rememberHistory("GOAL: $clean")
+        rememberHistory("PREFLIGHT: provider=$providerPreference target=${preflight.targetPackage.ifBlank { "auto-detect" }}")
+        val run = generation.incrementAndGet()
+        toast("🤖 AI Mission ready")
+        handler.post { nextMissionTurn(run) }
+        return true
+    }
+
+    fun rescueRecordedFailure'''
+    s2, count = start_re.subn(lambda _m: replacement, s, count=1)
+    if count != 1:
+        raise SystemExit(f'startMission replacement count={count}')
+    s = s2
+    sidecar.write_text(s, encoding='utf-8')
+
+if not spec.exists():
+    spec.write_text('''package com.aarishkhan.aarishai
+
+import java.util.Locale
+
+internal data class AiProviderSpec(
+    val preference: String,
+    val customPackage: String = "",
+    val valid: Boolean = true
+) {
+    companion object {
+        private val packagePattern = Regex("^[A-Za-z][A-Za-z0-9_]*(\\\\.[A-Za-z][A-Za-z0-9_]*)+$")
+
+        fun parse(raw: String): AiProviderSpec {
+            val clean = raw.trim()
+            if (clean.isBlank()) return AiProviderSpec("AUTO")
+            val upper = clean.uppercase(Locale.US)
+            if (upper in setOf("AUTO", "CHATGPT", "GEMINI")) return AiProviderSpec(upper)
+            if (clean.startsWith("PKG:", ignoreCase = true)) {
+                val pkg = clean.substringAfter(':').trim().take(220)
+                return if (pkg.matches(packagePattern)) AiProviderSpec("CUSTOM", pkg)
+                else AiProviderSpec("AUTO", valid = false)
+            }
+            return AiProviderSpec("AUTO", valid = false)
+        }
+    }
+}
+''', encoding='utf-8')
+
+fs = fcs.read_text(encoding='utf-8')
+if 'AARISH_TEACH_YOUR_AI_V2_DIALOG' not in fs:
+    start = fs.find('// AARISH_AI_MISSION_DIALOG_V1')
+    end = fs.find('private fun recordWaitAiAction()', start)
+    if start < 0 or end < 0:
+        raise SystemExit('mission dialog markers missing')
+    new_dialog = r'''// AARISH_AI_MISSION_DIALOG_V1
+// AARISH_TEACH_YOUR_AI_V2_DIALOG
+private data class AiProviderChoiceV2(val label: String, val packageName: String)
+
+private fun showAiProviderPickerV2(onSelected: (String, String) -> Unit) {
+    val base = android.content.Intent(android.content.Intent.ACTION_MAIN).apply {
+        addCategory(android.content.Intent.CATEGORY_LAUNCHER)
+    }
+    val likely = listOf("chatgpt", "gemini", "claude", "copilot", "perplexity", "deepseek", "grok", "assistant", " ai", "llm")
+    val apps = try {
+        packageManager.queryIntentActivities(base, 0)
+            .mapNotNull { info ->
+                val pkg = info.activityInfo?.packageName.orEmpty().trim()
+                val label = info.loadLabel(packageManager)?.toString().orEmpty().replace(Regex("\\s+"), " ").trim()
+                if (pkg.isBlank() || label.isBlank() || pkg == packageName) null
+                else AiProviderChoiceV2(label.take(80), pkg.take(220))
+            }
+            .distinctBy { it.packageName }
+            .sortedWith(compareBy<AiProviderChoiceV2>(
+                { item ->
+                    val hay = (item.label + " " + item.packageName).lowercase(java.util.Locale.US)
+                    if (likely.any(hay::contains)) 0 else 1
+                },
+                { it.label.lowercase(java.util.Locale.US) }
+            ))
+            .take(240)
+    } catch (_: Throwable) { emptyList() }
+
+    if (apps.isEmpty()) {
+        Toast.makeText(this, "Installed apps list nahi mili", Toast.LENGTH_SHORT).show()
+        return
+    }
+    val rows = apps.map { "${it.label}\n${it.packageName}" }.toTypedArray()
+    val dialog = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+        .setTitle("🧠 Teach / Choose AI app")
+        .setItems(rows) { _, which -> apps.getOrNull(which)?.let { onSelected(it.label, it.packageName) } }
+        .setNegativeButton("Cancel", null)
+        .create()
+    showOverlayDialogSafely(dialog)
+}
+
+private fun showAiMissionDialogV1() {
+    val prefs = getSharedPreferences("aarish_ai_provider_v2", Context.MODE_PRIVATE)
+    var customPkg = prefs.getString("custom_pkg", "").orEmpty().trim()
+    var customLabel = prefs.getString("custom_label", "Other AI").orEmpty().trim().ifBlank { "Other AI" }
+    var provider = "AUTO"
+
+    val input = android.widget.EditText(this).apply {
+        hint = "Kya kaam karwana hai? Example: WhatsApp kholo aur Guided Rails ko Hi bhejo"
+        minLines = 3
+        maxLines = 8
+        setPadding(dp(12), dp(10), dp(12), dp(10))
+        setTextColor(android.graphics.Color.WHITE)
+        setHintTextColor(android.graphics.Color.LTGRAY)
+    }
+    val vision = android.widget.CheckBox(this).apply {
+        text = "📸 Teach Your AI — same chat + fresh screenshot after every action"
+        setTextColor(android.graphics.Color.WHITE)
+        textSize = 12f
+        isChecked = true
+    }
+    val selected = android.widget.TextView(this).apply {
+        text = "AI brain: AUTO"
+        setTextColor(android.graphics.Color.rgb(125, 211, 252))
+        textSize = 12f
+    }
+    val group = android.widget.RadioGroup(this).apply {
+        orientation = android.widget.RadioGroup.HORIZONTAL
+        gravity = android.view.Gravity.CENTER
+    }
+    listOf("AUTO", "CHATGPT", "GEMINI").forEachIndexed { index, name ->
+        group.addView(android.widget.RadioButton(this).apply {
+            id = 7100 + index
+            text = name
+            setTextColor(android.graphics.Color.WHITE)
+            isChecked = name == "AUTO"
+            setOnCheckedChangeListener { _, checked ->
+                if (checked) {
+                    provider = name
+                    selected.text = "AI brain: $name"
+                }
+            }
+        })
+    }
+    val choose = android.widget.Button(this).apply {
+        isAllCaps = false
+        text = if (customPkg.isBlank()) "🧠 Choose another AI app" else "🧠 Other AI: $customLabel"
+        setOnClickListener {
+            showAiProviderPickerV2 { label, pkg ->
+                customLabel = label
+                customPkg = pkg
+                prefs.edit().putString("custom_pkg", pkg).putString("custom_label", label).apply()
+                group.clearCheck()
+                provider = "PKG:$pkg"
+                selected.text = "AI brain: $label"
+                text = "🧠 Other AI: $label"
+            }
+        }
+    }
+    val useSaved = if (customPkg.isNotBlank()) android.widget.Button(this).apply {
+        isAllCaps = false
+        text = "Use saved: $customLabel"
+        setOnClickListener {
+            group.clearCheck()
+            provider = "PKG:$customPkg"
+            selected.text = "AI brain: $customLabel"
+        }
+    } else null
+
+    val box = android.widget.LinearLayout(this).apply {
+        orientation = android.widget.LinearLayout.VERTICAL
+        setPadding(dp(12), dp(8), dp(12), dp(8))
+        addView(android.widget.TextView(this@FloatingControlService).apply {
+            text = "No fixed button coordinates: AI composer/send/reply are rediscovered each turn. UI badle to engine re-detect karta hai."
+            setTextColor(android.graphics.Color.LTGRAY)
+            textSize = 12f
+        })
+        addView(input)
+        addView(vision)
+        addView(group)
+        addView(selected)
+        addView(choose)
+        useSaved?.let { addView(it) }
+    }
+
+    val dialog = android.app.AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+        .setTitle("🤖 Autonomous Mission")
+        .setView(box)
+        .setPositiveButton("START", null)
+        .setNegativeButton("Cancel", null)
+        .create()
+    dialog.setOnShowListener {
+        dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+            val goal = input.text?.toString().orEmpty().trim()
+            if (goal.isBlank()) {
+                input.error = "Prompt likho"
+                return@setOnClickListener
+            }
+            if (!parkRecordingForAutonomousMission()) {
+                Toast.makeText(this, "Recording safely park nahi hua; mission start roka gaya", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            val started = AutoActionService.startAutonomousMission(
+                context = this,
+                goal = goal,
+                provider = provider,
+                persistentVision = vision.isChecked
+            )
+            if (started) {
+                dialog.dismiss()
+                val brain = if (provider.startsWith("PKG:", true)) customLabel else provider
+                Toast.makeText(this, "🤖 Mission launching • $brain", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+    showOverlayDialogSafely(dialog)
+}
+
+'''
+    fs = fs[:start] + new_dialog + fs[end:]
+    fcs.write_text(fs, encoding='utf-8')
+
+if not test.exists():
+    test.parent.mkdir(parents=True, exist_ok=True)
+    test.write_text('''package com.aarishkhan.aarishai
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class AiProviderSpecTest {
+    @Test fun knownProvidersNormalize() {
+        assertEquals("AUTO", AiProviderSpec.parse(" auto ").preference)
+        assertEquals("CHATGPT", AiProviderSpec.parse("chatgpt").preference)
+        assertEquals("GEMINI", AiProviderSpec.parse("GeMiNi").preference)
+    }
+
+    @Test fun customPackageIsPreserved() {
+        val spec = AiProviderSpec.parse("PKG:com.example.smart.ai")
+        assertTrue(spec.valid)
+        assertEquals("CUSTOM", spec.preference)
+        assertEquals("com.example.smart.ai", spec.customPackage)
+    }
+
+    @Test fun malformedAndUnknownProviderFailClosed() {
+        assertFalse(AiProviderSpec.parse("PKG:not a package").valid)
+        assertFalse(AiProviderSpec.parse("mystery-brain").valid)
+    }
+}
+''', encoding='utf-8')
+
+final = sidecar.read_text(encoding='utf-8')
+assert 'FLAG_ACTIVITY_LAUNCH_ADJACENT' not in final
+assert 'Provider.CUSTOM' in final
+assert 'validateMissionPreflight' in final
+assert 'AARISH_TEACH_YOUR_AI_V2' in final
+assert 'AARISH_TEACH_YOUR_AI_V2_DIALOG' in fcs.read_text(encoding='utf-8')
