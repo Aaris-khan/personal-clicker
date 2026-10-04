@@ -47,14 +47,11 @@ jobs:
           print('BASELINE_LINT_ERRORS', sum(counts.values()), dict(counts))
           PY
 
-      - name: Apply universal teach relay patches
+      - name: Apply final relay delta
         run: |
           set -euo pipefail
-          python3 scripts/universal_ai_teach_relay_v3_patch.py
-          python3 scripts/universal_ai_teach_relay_v3_1_hardening.py
-          python3 scripts/universal_ai_teach_relay_v3_2_hardening.py
-          python3 scripts/universal_ai_teach_relay_v3_2_scroll_teach.py
-          python3 scripts/universal_ai_teach_relay_v3_3_reconcile.py
+          # Earlier v3/v3.1/v3.2/v3.3 logic is already committed in source. Re-running
+          # historical shape-dependent patchers is intentionally forbidden here.
           python3 scripts/universal_ai_teach_relay_v3_4_copy_latest.py
           git diff --check
 
@@ -108,10 +105,6 @@ jobs:
 
           git config user.name 'Aaris-khan'
           git config user.email 'hhakmuddin8@gmail.com'
-          git add \
-            app/src/main/java/com/aarishkhan/aarishai/AiTeachProfileStore.kt \
-            app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt \
-            app/src/main/java/com/aarishkhan/aarishai/AutoActionService.kt \
-            app/src/main/java/com/aarishkhan/aarishai/FloatingControlService.kt
-          git commit -m 'Finalize universal AI Teach Relay [skip ci]'
+          git add app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
+          git commit -m 'Finalize safe latest-response AI relay [skip ci]'
           git push origin HEAD:upgrade/universal-ai-teach-relay-v3
