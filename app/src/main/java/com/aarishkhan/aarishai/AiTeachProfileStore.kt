@@ -37,7 +37,11 @@ object AiTeachProfileStore {
         val updatedAt: Long = 0L,
         val version: Int = VERSION
     ) {
-        val ready: Boolean get() = send != null && copy != null
+        // AARISH_AI_TEACH_SEND_SUFFICIENT_V31
+        // SEND is the only mandatory taught control. COPY is optional because the runtime
+        // reads Accessibility first and OCR last; this keeps providers without a Copy action usable.
+        val ready: Boolean get() = send != null
+        val copyReady: Boolean get() = copy != null
     }
 
     private fun prefs(context: Context) =

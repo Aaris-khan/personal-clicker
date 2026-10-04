@@ -489,21 +489,37 @@ class AutoActionService : AccessibilityService() {
                         Toast.makeText(this, "SEND learn nahi hua; dobara Teach chalao", Toast.LENGTH_LONG).show()
                         return@armAiTeachTapV3
                     }
-                    // Do not use a fixed AI wait. The transparent teaching layer simply waits
-                    // for the user's next tap, so the user can tap COPY whenever generation is done.
+                    // AARISH_AI_TEACH_SAVE_SEND_EARLY_V31
+                    // SEND is the critical learned control. Save it immediately; COPY is optional.
+                    val sendSaved = AiTeachProfileStore.saveVerifiedRole(
+                        this,
+                        pkg,
+                        AiTeachProfileStore.ROLE_SEND,
+                        sendSnapshot
+                    )
+                    if (!sendSaved || !AiTeachProfileStore.isReady(this, pkg)) {
+                        Toast.makeText(this, "SEND profile save verify nahi hua", Toast.LENGTH_LONG).show()
+                        return@armAiTeachTapV3
+                    }
+                    Toast.makeText(this, "✅ SEND learned • reply complete ho to COPY tap karke fallback bhi sikhao", Toast.LENGTH_LONG).show()
+
+                    // Do not use a fixed AI wait. The teaching layer waits for the user's next tap,
+                    // so slow/fast providers are both supported without recording a brittle delay.
                     handler.postDelayed({
-                        Toast.makeText(this, "⏳ Reply complete hone do, phir us reply ka COPY tap karo", Toast.LENGTH_LONG).show()
                         fcs.armAiTeachTapV3(AiTeachProfileStore.ROLE_COPY, pkg) { copySnapshot ->
                             if (copySnapshot == null) {
-                                Toast.makeText(this, "COPY learn nahi hua; dobara Teach chalao", Toast.LENGTH_LONG).show()
+                                Toast.makeText(this, "✅ SEND saved • COPY optional training skipped", Toast.LENGTH_LONG).show()
                                 return@armAiTeachTapV3
                             }
-                            val sendSaved = AiTeachProfileStore.saveVerifiedRole(this, pkg, AiTeachProfileStore.ROLE_SEND, sendSnapshot)
-                            val copySaved = AiTeachProfileStore.saveVerifiedRole(this, pkg, AiTeachProfileStore.ROLE_COPY, copySnapshot)
-                            val ready = sendSaved && copySaved && AiTeachProfileStore.isReady(this, pkg)
+                            val copySaved = AiTeachProfileStore.saveVerifiedRole(
+                                this,
+                                pkg,
+                                AiTeachProfileStore.ROLE_COPY,
+                                copySnapshot
+                            )
                             Toast.makeText(
                                 this,
-                                if (ready) "✅ AI relay trained: Send + Copy learned" else "⚠️ Training save verify nahi hua",
+                                if (copySaved) "✅ AI relay trained: SEND + COPY learned" else "✅ SEND saved • COPY save verify nahi hua",
                                 Toast.LENGTH_LONG
                             ).show()
                         }

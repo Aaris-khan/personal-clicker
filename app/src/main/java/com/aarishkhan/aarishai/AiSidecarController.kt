@@ -443,7 +443,21 @@ class AiSidecarController(private val service: AutoActionService) {
                 if (command == null) {
                     markProviderFailure(provider, "open/send/response failure")
                     returnToTarget(run, lastTargetPackage) {
-                        if (alive(run)) failTurn(run, "AI response parse/timeout")
+                        if (!alive(run)) return@returnToTarget
+                        if (persistentVisionMode) {
+                            // AARISH_AI_NO_DUPLICATE_REATTACH_V31
+                            // A Persistent Vision turn has already staged its screenshot. Re-entering
+                            // nextMissionTurn here would attach the same visual evidence again and can
+                            // create the exact photo/photo/photo loop seen in real-device testing.
+                            // The send/read transaction already has readiness, commit, Accessibility,
+                            // learned-COPY and OCR waits, so an unverified result is terminal and safe.
+                            finishMission(
+                                false,
+                                "AI relay submit/reply verify nahi hua. Screenshot dobara attach nahi kiya. TEACH AI se SEND/COPY re-train karo."
+                            )
+                        } else {
+                            failTurn(run, "AI response parse/timeout")
+                        }
                     }
                     return@askPhysicalAi
                 }
