@@ -1,0 +1,54 @@
+name: Teach AI v3 verify2 temp
+
+on:
+  push:
+    branches:
+      - upgrade/teach-your-ai-v3-reliable-relay
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Gradle 8.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.2'
+      - name: Apply reliability patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/teach_ai_v3_patch.py
+          git diff --check
+          ! grep -R "FLAG_ACTIVITY_LAUNCH_ADJACENT" -n app/src/main/java/com/aarishkhan/aarishai
+          grep -q "AARISH_TEACH_AI_V3_JSON_RELAY" app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
+          grep -q "AARISH_TEACH_AI_V3_PROVIDER_SCROLL" app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
+      - name: Unit tests
+        run: gradle --no-daemon :app:testDebugUnitTest
+      - name: Lint debug and release
+        run: gradle --no-daemon :app:lintDebug :app:lintRelease
+      - name: Build debug and release
+        run: gradle --no-daemon :app:assembleDebug :app:assembleRelease
+      - name: Commit verified controller patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Aaris-khan'
+          git config user.email 'hhakmuddin8@gmail.com'
+          git add app/src/main/java/com/aarishkhan/aarishai/AiSidecarController.kt
+          if git diff --cached --quiet; then
+            echo 'No controller patch to commit'
+            exit 0
+          fi
+          git commit -m 'Teach AI v3: harden JSON relay and provider scrolling [skip ci]'
+          git push origin HEAD:upgrade/teach-your-ai-v3-reliable-relay
