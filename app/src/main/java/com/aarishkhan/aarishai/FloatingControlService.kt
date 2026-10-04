@@ -5454,7 +5454,7 @@ private fun showAiMissionDialogV1() {
         setHintTextColor(android.graphics.Color.LTGRAY)
     }
     val vision = android.widget.CheckBox(this).apply {
-        text = "📸 Teach Your AI — same chat + fresh screenshot after every action"
+        text = "📸 UI Relay / Teach Your AI — no API, MQTT or MCP; same chat + fresh screenshot after every action"
         setTextColor(android.graphics.Color.WHITE)
         textSize = 12f
         isChecked = true

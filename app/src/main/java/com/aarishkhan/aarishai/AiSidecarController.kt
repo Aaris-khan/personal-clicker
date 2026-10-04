@@ -318,26 +318,29 @@ class AiSidecarController(private val service: AutoActionService) {
         return true
     }
 
+    // AARISH_UI_ONLY_EPHEMERAL_CLEANUP_V4
+    // Keep no cross-mission target/provider ownership and no temporary screenshot evidence.
+    private fun clearMissionEphemeralState() {
+        persistentVisionMode = false
+        visionSessionId = ""
+        visionTurn = 0
+        lockedVisionProvider = null
+        lockedVisionProviderTaskId = null
+        lastTargetPackage = ""
+        lastObservedTargetFingerprint = ""
+        stagnantTargetTurns = 0
+        try {
+            File(service.cacheDir, "ai_sidecar").listFiles()?.forEach { it.delete() }
+        } catch (_: Throwable) {}
+    }
+
     fun stop(reason: String = "stopped") {
         // AARISH_AI_RESCUE_STOP_RELEASE_V3: stopping rescue must release playback waiter too.
         val pendingRescue = if (rescueMode) rescueCallback else null
         generation.incrementAndGet()
         missionRunning = false
         waitingForAi = false
-        persistentVisionMode = false
-        visionSessionId = ""
-        visionTurn = 0
-        lockedVisionProvider = null
-        lockedVisionProviderTaskId = null
-        // AARISH_UI_ONLY_TARGET_OWNERSHIP_V3
-        // A new mission must discover the foreground target from scratch. Keeping the
-        // previous mission package biases findBestTargetRoot() toward a stale app.
-        lastTargetPackage = ""
-        lastObservedTargetFingerprint = ""
-        // Screenshots are cache-only evidence; remove them as soon as a mission stops.
-        try {
-            File(service.cacheDir, "ai_sidecar").listFiles()?.forEach { it.delete() }
-        } catch (_: Throwable) {}
+        clearMissionEphemeralState()
         rescueMode = false
         rescueExpectedAction = ""
         rescueCallback = null
@@ -618,6 +621,7 @@ class AiSidecarController(private val service: AutoActionService) {
         rescueCallback = null
         rescueMode = false
         rescueExpectedAction = ""
+        clearMissionEphemeralState()
         releaseMissionWakeLock()
         cb?.invoke(ok)
     }
@@ -629,6 +633,7 @@ class AiSidecarController(private val service: AutoActionService) {
         rescueExpectedAction = ""
         val cb = rescueCallback
         rescueCallback = null
+        clearMissionEphemeralState()
         releaseMissionWakeLock()
         toast(if (ok) "✅ $message" else "⚠️ $message")
         cb?.invoke(ok)
@@ -1175,6 +1180,34 @@ class AiSidecarController(private val service: AutoActionService) {
         return found
     }
 
+    // AARISH_UI_ONLY_SESSION_OCR_GUARD_V4
+    private fun verifyVisionSessionIdentity(
+        run: Int,
+        provider: Provider,
+        root: AccessibilityNodeInfo,
+        callback: (Boolean) -> Unit
+    ) {
+        if (!persistentVisionMode || visionTurn <= 0 || visionSessionId.isBlank()) {
+            callback(true)
+            return
+        }
+        if (visionSessionMarkerVisible(root)) {
+            callback(true)
+            return
+        }
+        val expectedMarker = visionSessionId
+        captureProviderOcr(provider) { ocr ->
+            if (!alive(run)) return@captureProviderOcr
+            val matched = expectedMarker.isNotBlank() &&
+                ocr.contains(expectedMarker, ignoreCase = true)
+            rememberHistory(
+                if (matched) "VISION SESSION GUARD: marker verified by OCR"
+                else "VISION SESSION GUARD: marker $expectedMarker absent in accessibility + OCR"
+            )
+            callback(matched)
+        }
+    }
+
     private fun askPhysicalAi(
         run: Int,
         provider: Provider,
@@ -1187,22 +1220,24 @@ class AiSidecarController(private val service: AutoActionService) {
         waitingForAi = true
 
         fun sendFromReadyRoot(root: AccessibilityNodeInfo) {
-            if (persistentVisionMode && !visionSessionMarkerVisible(root)) {
-                // Fail closed: the provider app is open, but this is not provably the
-                // mission's existing conversation. Do not paste/send into an unknown chat.
-                rememberHistory("VISION SESSION GUARD: marker $visionSessionId missing on turn $visionTurn; send refused")
-                waitingForAi = false
-                callback(null)
-                return
-            }
-            ensurePromptAndSend(run, provider, root, prompt) { sent ->
-                if (!alive(run)) return@ensurePromptAndSend
-                if (!sent) {
+            verifyVisionSessionIdentity(run, provider, root) { verified ->
+                if (!alive(run)) return@verifyVisionSessionIdentity
+                if (!verified) {
+                    // Fail closed: provider is open, but this is not provably the mission's
+                    // existing conversation. Never paste/send into an unknown chat.
                     waitingForAi = false
                     callback(null)
-                    return@ensurePromptAndSend
+                    return@verifyVisionSessionIdentity
                 }
-                waitForCompleteResponse(run, provider, requestId, callback)
+                ensurePromptAndSend(run, provider, root, prompt) { sent ->
+                    if (!alive(run)) return@ensurePromptAndSend
+                    if (!sent) {
+                        waitingForAi = false
+                        callback(null)
+                        return@ensurePromptAndSend
+                    }
+                    waitForCompleteResponse(run, provider, requestId, callback)
+                }
             }
         }
 
