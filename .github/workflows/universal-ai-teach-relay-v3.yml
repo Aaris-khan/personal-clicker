@@ -55,6 +55,7 @@ jobs:
           python3 scripts/universal_ai_teach_relay_v3_2_hardening.py
           python3 scripts/universal_ai_teach_relay_v3_2_scroll_teach.py
           python3 scripts/universal_ai_teach_relay_v3_3_reconcile.py
+          python3 scripts/universal_ai_teach_relay_v3_4_copy_latest.py
           git diff --check
 
       - name: Unit tests and APK compile
@@ -94,6 +95,17 @@ jobs:
             echo 'Source already fully patched; nothing to commit.'
             exit 0
           fi
+
+          # Never push a patch that was verified against an older branch head. If another
+          # commit landed while this job was compiling, exit green and let the newer push
+          # run its own full verification. This eliminates non-fast-forward CI races.
+          git fetch origin upgrade/universal-ai-teach-relay-v3
+          remote_head="$(git rev-parse origin/upgrade/universal-ai-teach-relay-v3)"
+          if [ "$remote_head" != "$GITHUB_SHA" ]; then
+            echo "Branch advanced during verification ($GITHUB_SHA -> $remote_head); newer run owns the patch."
+            exit 0
+          fi
+
           git config user.name 'Aaris-khan'
           git config user.email 'hhakmuddin8@gmail.com'
           git add \
