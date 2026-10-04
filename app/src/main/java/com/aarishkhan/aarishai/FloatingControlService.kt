@@ -47,6 +47,117 @@ class FloatingControlService : Service() {
 
     fun isRecordingActive(): Boolean = isRecording
 
+    // AARISH_UNIVERSAL_AI_TEACH_TAP_LAYER_V3
+    private var aiTeachTapOverlayV3: android.view.View? = null
+    private var aiTeachTapSerialV3: Int = 0
+
+    private fun cancelAiTeachTapV3() {
+        aiTeachTapSerialV3++
+        val view = aiTeachTapOverlayV3
+        aiTeachTapOverlayV3 = null
+        if (view != null) {
+            try { if (view.parent != null) aarishAccessWmV13().removeViewImmediate(view) } catch (_: Throwable) {
+                try { if (view.parent != null) windowManager.removeViewImmediate(view) } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    fun armAiTeachTapV3(
+        role: String,
+        providerPackage: String,
+        callback: (TargetSnapshot?) -> Unit
+    ): Boolean {
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+            handler.post { armAiTeachTapV3(role, providerPackage, callback) }
+            return true
+        }
+        if (isRecording) {
+            Toast.makeText(this, "Normal recording pehle DONE karo", Toast.LENGTH_LONG).show()
+            callback(null)
+            return false
+        }
+        cancelAiTeachTapV3()
+        val serial = aiTeachTapSerialV3
+        val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+        val screenW = resources.displayMetrics.widthPixels.coerceAtLeast(2)
+        val screenH = resources.displayMetrics.heightPixels.coerceAtLeast(2)
+        val overlay = android.view.View(this).apply {
+            setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            setOnTouchListener { _, event ->
+                if (event.actionMasked != android.view.MotionEvent.ACTION_UP || !finished.compareAndSet(false, true)) {
+                    return@setOnTouchListener true
+                }
+                val x = event.x.coerceIn(1f, (screenW - 1).toFloat())
+                val y = event.y.coerceIn(1f, (screenH - 1).toFloat())
+                val snapshot = AutoActionService.captureTargetSnapshot(x.toInt(), y.toInt(), screenW.toFloat(), screenH.toFloat())
+                    ?.takeIf { it.targetPackage.orEmpty().equals(providerPackage, ignoreCase = true) }
+                cancelAiTeachTapV3()
+
+                val gesture = RecordedGesture(
+                    delayFromStart = 0L,
+                    points = listOf(GesturePoint(x, y, 0L)),
+                    targetText = snapshot?.targetText,
+                    targetDesc = snapshot?.targetDesc,
+                    targetId = snapshot?.targetId,
+                    targetClass = snapshot?.targetClass,
+                    targetPackage = snapshot?.targetPackage ?: providerPackage,
+                    targetContextText = snapshot?.targetContextText,
+                    targetChildText = snapshot?.targetChildText,
+                    targetSiblingText = snapshot?.targetSiblingText,
+                    targetRoleFlags = snapshot?.targetRoleFlags,
+                    targetTreePath = snapshot?.targetTreePath,
+                    targetLeft = snapshot?.targetLeft ?: -1,
+                    targetTop = snapshot?.targetTop ?: -1,
+                    targetRight = snapshot?.targetRight ?: -1,
+                    targetBottom = snapshot?.targetBottom ?: -1,
+                    xPercent = snapshot?.xPercent ?: (x / screenW.toFloat()),
+                    yPercent = snapshot?.yPercent ?: (y / screenH.toFloat()),
+                    targetWPercent = snapshot?.targetWPercent ?: 0f,
+                    targetHPercent = snapshot?.targetHPercent ?: 0f,
+                    insideXPercent = snapshot?.insideXPercent ?: 0.5f,
+                    insideYPercent = snapshot?.insideYPercent ?: 0.5f,
+                    recordedScreenW = screenW,
+                    recordedScreenH = screenH
+                )
+                handler.postDelayed({
+                    AutoActionService.playSingleLiveGestureSafe(gesture) {
+                        callback(snapshot)
+                    }
+                }, 70L)
+                true
+            }
+        }
+        aiTeachTapOverlayV3 = overlay
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            aarishAccessOverlayTypeV13(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+        }
+        return try {
+            aarishAccessWmV13().addView(overlay, params)
+            Toast.makeText(this, "🎓 $role tap karke sikhao", Toast.LENGTH_LONG).show()
+            handler.postDelayed({
+                if (aiTeachTapSerialV3 == serial && aiTeachTapOverlayV3 === overlay && finished.compareAndSet(false, true)) {
+                    cancelAiTeachTapV3()
+                    callback(null)
+                }
+            }, 120_000L)
+            true
+        } catch (_: Throwable) {
+            aiTeachTapOverlayV3 = null
+            callback(null)
+            false
+        }
+    }
+
     // AARISH_AI_RECORDING_EXCLUSION_V4
     // Autonomous execution must never run underneath the full-screen recording glass.
     // Park the current segment exactly like DONE: keep all unsaved gestures in memory,
@@ -5511,7 +5622,7 @@ private fun showAiMissionDialogV1() {
         orientation = android.widget.LinearLayout.VERTICAL
         setPadding(dp(12), dp(8), dp(12), dp(8))
         addView(android.widget.TextView(this@FloatingControlService).apply {
-            text = "UI Relay: external API / MQTT / MCP connector ki zaroorat nahi. Accessibility + fresh screenshot se one-action-at-a-time control hota hai; AI app ka apna login/network alag ho sakta hai. Fixed coordinates nahi—UI badle to engine re-detect karta hai."
+            text = "UI Relay: external API / MQTT / MCP connector ki zaroorat nahi. Accessibility + fresh screenshot se one-action-at-a-time control hota hai; AI app ka apna login/network alag ho sakta hai. Fixed coordinates nahi—UI badle to engine re-detect karta hai. First time 🎓 TEACH AI dabao: app prompt bharega, aap SEND aur reply ke baad COPY ek-ek baar tap karke sikhao."
             setTextColor(android.graphics.Color.LTGRAY)
             textSize = 12f
         })
@@ -5527,9 +5638,18 @@ private fun showAiMissionDialogV1() {
         .setTitle("🤖 Autonomous Mission")
         .setView(box)
         .setPositiveButton("START", null)
+        .setNeutralButton("🎓 TEACH AI", null)
         .setNegativeButton("Cancel", null)
         .create()
     dialog.setOnShowListener {
+        dialog.getButton(android.app.AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+            if (!parkRecordingForAutonomousMission()) {
+                Toast.makeText(this, "Recording safely park nahi hua", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            val teaching = AutoActionService.startAiRelayTeaching(this, provider)
+            if (teaching) dialog.dismiss()
+        }
         dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
             val goal = input.text?.toString().orEmpty().trim()
             if (goal.isBlank()) {

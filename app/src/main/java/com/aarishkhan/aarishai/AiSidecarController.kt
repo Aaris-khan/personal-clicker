@@ -935,6 +935,7 @@ class AiSidecarController(private val service: AutoActionService) {
                 appendLine("For SWIPE use normalized x1,y1,x2,y2,durationMs so you may request a small precise swipe.")
                 appendLine("Prefer small swipes; inspect the next screenshot before asking for another.")
                 appendLine("OUTPUT CONTRACT:")
+                appendLine("Return exactly ONE compact machine line only. No markdown, prose, explanation, headings, or extra lines.")
                 appendLine("AARIS::<request-id>::<ACTION>::<ELEMENT>::<PAYLOAD>::<EXPECTED>::<VISUAL>::END")
                 appendLine("Allowed ACTION: TAP, TAP_XY, LONG_TAP, SET_TEXT, SWIPE, SCROLL, BACK, HOME, WAIT, OPEN_APP, DONE, FAIL.")
                 appendLine("TAP_XY PAYLOAD=x,y normalized 0..1.")
@@ -1681,7 +1682,9 @@ class AiSidecarController(private val service: AutoActionService) {
                 }
             } == true
             val fallbackSubmitReady =
-                latest != null && composer != null && findSendNode(latest, composer) != null
+                latest != null && composer != null &&
+                    (findLearnedProviderControl(provider, latest, AiTeachProfileStore.ROLE_SEND)
+                        ?: findSendNode(latest, composer)) != null
             if (latest != null &&
                 !hasGeneratingIndicator(latest) &&
                 composer != null &&
@@ -1737,7 +1740,10 @@ class AiSidecarController(private val service: AutoActionService) {
                 return
             }
 
-            val send = latest?.let { findSendNode(it, freshComposer) }
+            val send = latest?.let { rootNow ->
+                findLearnedProviderControl(provider, rootNow, AiTeachProfileStore.ROLE_SEND)
+                    ?: findSendNode(rootNow, freshComposer)
+            }
             if (send == null) {
                 finish(false)
                 return
@@ -1766,6 +1772,82 @@ class AiSidecarController(private val service: AutoActionService) {
                 buttonSubmitOnce(composer)
             }
         }
+    }
+
+    private fun findProviderScrollableForCopy(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = -1
+        walk(root, 4500) { n ->
+            val usable = try { n.isScrollable && n.isEnabled && n.isVisibleToUser } catch (_: Throwable) { false }
+            if (!usable) return@walk
+            val b = Rect(); try { n.getBoundsInScreen(b) } catch (_: Throwable) {}
+            val area = b.width().coerceAtLeast(0) * b.height().coerceAtLeast(0)
+            if (area > bestArea) { bestArea = area; best = n }
+        }
+        return best
+    }
+
+    private fun tryLearnedCopyResponse(
+        run: Int,
+        provider: Provider,
+        requestId: String,
+        callback: (AiCommand?) -> Unit
+    ) {
+        if (!alive(run)) return
+        if (AiTeachProfileStore.role(service, providerPackage(provider), AiTeachProfileStore.ROLE_COPY) == null) {
+            callback(null)
+            return
+        }
+        val cm = try { service.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager } catch (_: Throwable) { null }
+        val previous = try { cm?.primaryClip } catch (_: Throwable) { null }
+        var finished = false
+
+        fun restoreClipboard() {
+            try {
+                if (cm != null) {
+                    if (previous != null) cm.setPrimaryClip(previous)
+                    else cm.setPrimaryClip(ClipData.newPlainText("", ""))
+                }
+            } catch (_: Throwable) {}
+        }
+        fun finish(command: AiCommand?) {
+            if (finished) return
+            finished = true
+            restoreClipboard()
+            callback(command)
+        }
+        fun readClipboardCommand(): AiCommand? {
+            val text = try {
+                val clip = cm?.primaryClip ?: return null
+                if (clip.itemCount <= 0) return null
+                clip.getItemAt(0).coerceToText(service)?.toString().orEmpty()
+            } catch (_: Throwable) { "" }
+            return parseCommand(text, requestId)
+        }
+        fun pollClipboard(attempt: Int) {
+            if (!alive(run)) return
+            readClipboardCommand()?.let { finish(it); return }
+            if (attempt >= 14) { finish(null); return }
+            handler.postDelayed({ pollClipboard(attempt + 1) }, 120L)
+        }
+        fun seek(scrolls: Int) {
+            if (!alive(run)) return
+            val root = findRootForPackage(providerPackage(provider))
+            if (root == null) { finish(null); return }
+            val copy = findLearnedProviderControl(provider, root, AiTeachProfileStore.ROLE_COPY)
+            if (copy != null) {
+                val accepted = clickNode(copy)
+                if (!accepted) { finish(null); return }
+                handler.postDelayed({ pollClipboard(0) }, 100L)
+                return
+            }
+            if (scrolls >= 4) { finish(null); return }
+            val scrollable = findProviderScrollableForCopy(root)
+            val moved = try { scrollable?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) == true } catch (_: Throwable) { false }
+            if (!moved) { finish(null); return }
+            handler.postDelayed({ seek(scrolls + 1) }, 260L)
+        }
+        seek(0)
     }
 
     private fun waitForCompleteResponse(run: Int, provider: Provider, requestId: String, callback: (AiCommand?) -> Unit) {
@@ -1852,14 +1934,24 @@ class AiSidecarController(private val service: AutoActionService) {
                 (settledAfterGeneration || noGenerationSignalButSlow)
             ) {
                 earlyOcrAttempted = true
-                captureProviderOcr(provider) { ocr ->
-                    if (!alive(run)) return@captureProviderOcr
-                    val fromOcr = parseCommand(ocr, requestId)
-                    if (fromOcr != null) {
+                // Learned COPY is cheaper and more exact than OCR when a provider hides
+                // assistant text from Accessibility. Bounded scrolling handles a long reply.
+                tryLearnedCopyResponse(run, provider, requestId) { fromCopy ->
+                    if (!alive(run)) return@tryLearnedCopyResponse
+                    if (fromCopy != null) {
                         waitingForAi = false
-                        callback(fromOcr)
+                        callback(fromCopy)
                     } else {
-                        handler.postDelayed({ if (alive(run)) poll() }, 320L)
+                        captureProviderOcr(provider) { ocr ->
+                            if (!alive(run)) return@captureProviderOcr
+                            val fromOcr = parseCommand(ocr, requestId)
+                            if (fromOcr != null) {
+                                waitingForAi = false
+                                callback(fromOcr)
+                            } else {
+                                handler.postDelayed({ if (alive(run)) poll() }, 320L)
+                            }
+                        }
                     }
                 }
                 return
@@ -2949,6 +3041,58 @@ class AiSidecarController(private val service: AutoActionService) {
 
         // Fail closed instead of typing into an obviously unrelated editor.
         return best.takeIf { bestScore >= 120 }
+    }
+
+    // AARISH_UNIVERSAL_AI_TEACH_RUNTIME_V3
+    // User-taught provider controls are a structural fallback, never a blind coordinate replay.
+    // Native accessibility submit remains first choice; generic semantic discovery remains last choice.
+    private fun findLearnedProviderControl(
+        provider: Provider,
+        root: AccessibilityNodeInfo,
+        role: String
+    ): AccessibilityNodeInfo? {
+        val fp = AiTeachProfileStore.role(service, providerPackage(provider), role) ?: return null
+        val sw = service.resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(2f)
+        val sh = service.resources.displayMetrics.heightPixels.toFloat().coerceAtLeast(2f)
+        var best: AccessibilityNodeInfo? = null
+        var bestScore = Int.MIN_VALUE
+        walk(root, 4500) { n ->
+            val usable = try { n.isClickable && n.isEnabled && n.isVisibleToUser } catch (_: Throwable) { false }
+            if (!usable) return@walk
+            val text = try { n.text?.toString().orEmpty() } catch (_: Throwable) { "" }
+            val desc = try { n.contentDescription?.toString().orEmpty() } catch (_: Throwable) { "" }
+            val id = try { n.viewIdResourceName.orEmpty() } catch (_: Throwable) { "" }
+            val cls = try { n.className?.toString().orEmpty() } catch (_: Throwable) { "" }
+            var score = 0
+            if (fp.viewId.isNotBlank() && id.equals(fp.viewId, ignoreCase = true)) score += 900
+            if (fp.desc.isNotBlank() && normalizeUiText(desc) == normalizeUiText(fp.desc)) score += 700
+            if (fp.text.isNotBlank() && normalizeUiText(text) == normalizeUiText(fp.text)) score += 600
+            if (fp.className.isNotBlank() && cls.equals(fp.className, ignoreCase = true)) score += 110
+
+            val b = Rect(); try { n.getBoundsInScreen(b) } catch (_: Throwable) {}
+            if (!fp.xPercent.isNaN() && !fp.yPercent.isNaN() && b.width() > 0 && b.height() > 0) {
+                val dx = kotlin.math.abs((b.centerX() / sw) - fp.xPercent)
+                val dy = kotlin.math.abs((b.centerY() / sh) - fp.yPercent)
+                val distance = kotlin.math.sqrt(dx * dx + dy * dy)
+                when {
+                    distance <= 0.035f -> score += 280
+                    distance <= 0.08f -> score += 220
+                    distance <= 0.16f -> score += 140
+                    distance <= 0.28f -> score += 60
+                    else -> score -= 320
+                }
+                if (fp.wPercent > 0f) {
+                    val dw = kotlin.math.abs((b.width() / sw) - fp.wPercent)
+                    if (dw <= 0.05f) score += 70
+                }
+                if (fp.hPercent > 0f) {
+                    val dh = kotlin.math.abs((b.height() / sh) - fp.hPercent)
+                    if (dh <= 0.05f) score += 70
+                }
+            }
+            if (score > bestScore) { bestScore = score; best = n }
+        }
+        return best.takeIf { bestScore >= 280 }
     }
 
     private fun findSendNode(root: AccessibilityNodeInfo, composer: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
