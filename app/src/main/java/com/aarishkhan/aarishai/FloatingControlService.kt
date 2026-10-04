@@ -5511,7 +5511,7 @@ private fun showAiMissionDialogV1() {
         orientation = android.widget.LinearLayout.VERTICAL
         setPadding(dp(12), dp(8), dp(12), dp(8))
         addView(android.widget.TextView(this@FloatingControlService).apply {
-            text = "No fixed button coordinates: AI composer/send/reply are rediscovered each turn. UI badle to engine re-detect karta hai."
+            text = "UI Relay: API / MQTT / MCP ki zaroorat nahi. Accessibility + fresh screenshot se one-action-at-a-time control hota hai; fixed coordinates nahi, UI badle to engine re-detect karta hai."
             setTextColor(android.graphics.Color.LTGRAY)
             textSize = 12f
         })

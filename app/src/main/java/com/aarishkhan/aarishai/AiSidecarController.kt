@@ -329,6 +329,15 @@ class AiSidecarController(private val service: AutoActionService) {
         visionTurn = 0
         lockedVisionProvider = null
         lockedVisionProviderTaskId = null
+        // AARISH_UI_ONLY_TARGET_OWNERSHIP_V3
+        // A new mission must discover the foreground target from scratch. Keeping the
+        // previous mission package biases findBestTargetRoot() toward a stale app.
+        lastTargetPackage = ""
+        lastObservedTargetFingerprint = ""
+        // Screenshots are cache-only evidence; remove them as soon as a mission stops.
+        try {
+            File(service.cacheDir, "ai_sidecar").listFiles()?.forEach { it.delete() }
+        } catch (_: Throwable) {}
         rescueMode = false
         rescueExpectedAction = ""
         rescueCallback = null
@@ -708,6 +717,18 @@ class AiSidecarController(private val service: AutoActionService) {
         providerCooldownUntil[provider] = SystemClock.elapsedRealtime() + cooldown
         lastProviderAttempt = provider
         rememberHistory("PROVIDER ${provider.name} failed ($reason), failover armed")
+
+        // AARISH_UI_ONLY_PROVIDER_FAILOVER_V3
+        // Persistent Vision normally pins one AI app to preserve the same conversation.
+        // If AUTO sees repeated failures, keeping that lock defeats the cooldown/failover
+        // machinery. Rotate to a fresh session so the next turn can choose another AI.
+        if (persistentVisionMode && lockedVisionProvider == provider && streak >= 2) {
+            lockedVisionProvider = null
+            lockedVisionProviderTaskId = null
+            visionSessionId = "PV" + UUID.randomUUID().toString().replace("-", "").take(10).uppercase(Locale.US)
+            visionTurn = 0
+            rememberHistory("VISION AUTO FAILOVER: released ${provider.name} after $streak failures; new session=$visionSessionId")
+        }
     }
 
     private fun markProviderSuccess(provider: Provider) {
